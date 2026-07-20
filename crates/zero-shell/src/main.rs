@@ -22,7 +22,7 @@ use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
-use winit::keyboard::{Key, NamedKey};
+use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 use zero_engine::Engine;
 
@@ -197,8 +197,11 @@ fn run_window(engine: Engine, html: String, css: String, address: String) {
         engine,
         page_html: html,
         page_css: css,
-        address,
+        address: address.clone(),
         scroll_y: 0.0,
+        history: vec![address],
+        history_index: 0,
+        modifiers: ModifiersState::default(),
         page_canvas: None,
         links: Vec::new(),
         cursor: (0.0, 0.0),
@@ -216,6 +219,9 @@ struct App {
     page_css: String,
     address: String,
     scroll_y: f32,
+    history: Vec<String>,
+    history_index: usize,
+    modifiers: ModifiersState,
     // Cached full-height page render; re-rendered only on navigate/resize, not per scroll frame.
     page_canvas: Option<zero_engine::Canvas>,
     links: Vec<zero_engine::LinkArea>,
@@ -260,11 +266,16 @@ impl ApplicationHandler for App {
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x as f32, position.y as f32);
             }
-            WindowEvent::MouseInput {
-                state: ElementState::Pressed,
-                button: MouseButton::Left,
-                ..
-            } => self.handle_click(),
+            WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
+            WindowEvent::MouseInput { state: ElementState::Pressed, button, .. } => {
+                match button {
+                    MouseButton::Left => self.handle_click(),
+                    MouseButton::Back => self.back(),
+                    MouseButton::Forward => self.forward(),
+                    _ => {}
+                }
+                self.request_redraw();
+            }
             _ => {}
         }
     }
@@ -279,6 +290,8 @@ impl App {
 
     fn handle_key(&mut self, event: KeyEvent) {
         match event.logical_key {
+            Key::Named(NamedKey::ArrowLeft) if self.modifiers.alt_key() => self.back(),
+            Key::Named(NamedKey::ArrowRight) if self.modifiers.alt_key() => self.forward(),
             Key::Named(NamedKey::Enter) => self.navigate(),
             Key::Named(NamedKey::Backspace) => {
                 self.address.pop();
@@ -315,14 +328,44 @@ impl App {
             .find(|l| px >= l.x && px <= l.x + l.width && py >= l.y && py <= l.y + l.height)
             .map(|l| l.href.clone());
         if let Some(href) = href {
-            self.address = resolve_url(&self.address, &href);
-            self.navigate();
+            let target = resolve_url(&self.address, &href);
+            self.go_to(target);
             self.request_redraw();
         }
     }
 
+    /// Navigate to a target typed in the address bar (pushes onto history).
     fn navigate(&mut self) {
         let target = normalize_target(&self.address);
+        self.go_to(target);
+    }
+
+    /// Navigate to a new target and record it in history (dropping any forward entries).
+    fn go_to(&mut self, target: String) {
+        self.history.truncate(self.history_index + 1);
+        if self.history.last() != Some(&target) {
+            self.history.push(target.clone());
+            self.history_index = self.history.len() - 1;
+        }
+        self.load(target);
+    }
+
+    fn back(&mut self) {
+        if self.history_index > 0 {
+            self.history_index -= 1;
+            self.load(self.history[self.history_index].clone());
+        }
+    }
+
+    fn forward(&mut self) {
+        if self.history_index + 1 < self.history.len() {
+            self.history_index += 1;
+            self.load(self.history[self.history_index].clone());
+        }
+    }
+
+    /// Load a target into the page without touching history.
+    fn load(&mut self, target: String) {
         self.address = target.clone();
         self.page_html = load_target(&target);
         self.page_css = String::new(); // rely on the page's own <style>
