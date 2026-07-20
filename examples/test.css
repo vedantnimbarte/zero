@@ -1,0 +1,41 @@
+* { display: block; }
+
+body {
+    background: #0e0f12;
+    color: #f2f3f5;
+    font-size: 16px;
+    padding: 24px;
+}
+
+.outer {
+    background: #17181c;
+    padding: 20px;
+}
+
+.header {
+    background: #e5484d;
+    color: #ffffff;
+    font-size: 28px;
+    padding: 12px;
+    margin-bottom: 16px;
+}
+
+.middle {
+    background: #1f2127;
+    padding: 24px;
+    margin-bottom: 16px;
+}
+
+.inner {
+    background: #30a46c;
+    color: #f2f3f5;
+    width: 320px;
+    padding: 16px;
+}
+
+.footer {
+    background: #66ccff;
+    color: #0e0f12;
+    font-size: 14px;
+    padding: 12px;
+}
