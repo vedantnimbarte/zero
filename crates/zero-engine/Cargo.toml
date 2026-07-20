@@ -13,3 +13,6 @@ name = "zero_engine"
 # embedder's job). fontdue is a small pure-Rust TTF rasterizer. The embedder still
 # supplies the font *bytes* — the engine stays platform-agnostic.
 fontdue = "0.9"
+# Decoding content images (<img>) is core rendering too — like fonts. The embedder
+# still fetches the bytes; the engine decodes them. (Output PNG encoding stays in the shell.)
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"] }

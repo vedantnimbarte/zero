@@ -9,6 +9,7 @@
 
 use crate::css::{Color, Unit, Value};
 use crate::dom::NodeType;
+use crate::resource::ImageMap;
 use crate::style::{Display, StyledNode};
 use fontdue::Font;
 
@@ -101,22 +102,54 @@ impl<'a> LayoutBox<'a> {
         }
     }
 
-    fn layout(&mut self, containing_block: Dimensions, font: Option<&Font>) {
+    fn layout(&mut self, containing_block: Dimensions, font: Option<&Font>, images: &ImageMap) {
         match self.box_type {
-            BoxType::BlockNode(_) => self.layout_block(containing_block, font),
+            BoxType::BlockNode(_) => self.layout_block(containing_block, font, images),
             BoxType::AnonymousBlock => self.layout_inline(containing_block, font),
             // A bare inline node is laid out by its anonymous-block parent, not here.
             BoxType::InlineNode(_) => {}
         }
     }
 
-    fn layout_block(&mut self, containing_block: Dimensions, font: Option<&Font>) {
+    fn layout_block(&mut self, containing_block: Dimensions, font: Option<&Font>, images: &ImageMap) {
         // Width depends on the parent, so it's computed top-down first.
         self.calculate_block_width(containing_block);
         self.calculate_block_position(containing_block);
         // Then children are laid out to discover this box's height.
-        self.layout_block_children(font);
+        self.layout_block_children(font, images);
         self.calculate_block_height();
+        // A replaced element (<img>) overrides content size with its resolved dimensions.
+        if let Some((w, h)) = self.resolved_image_size(images) {
+            self.dimensions.content.width = w;
+            self.dimensions.content.height = h;
+        }
+    }
+
+    /// If this box is an `<img>`, resolve its display size from CSS width/height,
+    /// else the `width`/`height` attributes, else the image's intrinsic size.
+    fn resolved_image_size(&self, images: &ImageMap) -> Option<(f32, f32)> {
+        let styled = match self.box_type {
+            BoxType::BlockNode(n) | BoxType::InlineNode(n) => n,
+            BoxType::AnonymousBlock => return None,
+        };
+        let elem = match styled.node.node_type {
+            NodeType::Element(ref e) => e,
+            _ => return None,
+        };
+        if elem.tag_name != "img" {
+            return None;
+        }
+        let src = elem.attributes.get("src")?;
+        let img = images.get(src);
+        let css_px = |name: &str| styled.value(name).map(|v| v.to_px()).filter(|v| *v > 0.0);
+        let attr_px = |name: &str| elem.attributes.get(name).and_then(|s| s.trim().parse::<f32>().ok());
+
+        let w = css_px("width").or_else(|| attr_px("width")).or_else(|| img.map(|i| i.width as f32))?;
+        let h = css_px("height")
+            .or_else(|| attr_px("height"))
+            .or_else(|| img.map(|i| i.height as f32))
+            .unwrap_or(w);
+        Some((w, h))
     }
 
     /// Lay out inline children (text) as wrapped lines, producing text fragments
@@ -271,10 +304,10 @@ impl<'a> LayoutBox<'a> {
             + d.padding.top;
     }
 
-    fn layout_block_children(&mut self, font: Option<&Font>) {
+    fn layout_block_children(&mut self, font: Option<&Font>, images: &ImageMap) {
         let d = &mut self.dimensions;
         for child in &mut self.children {
-            child.layout(*d, font);
+            child.layout(*d, font, images);
             // Grow this box to contain each child's margin box.
             d.content.height += child.dimensions.margin_box().height;
         }
@@ -309,11 +342,12 @@ pub fn layout_tree<'a>(
     node: &'a StyledNode<'a>,
     mut containing_block: Dimensions,
     font: Option<&Font>,
+    images: &ImageMap,
 ) -> LayoutBox<'a> {
     // Height starts at 0 so children accumulate into it.
     containing_block.content.height = 0.0;
     let mut root_box = build_layout_tree(node);
-    root_box.layout(containing_block, font);
+    root_box.layout(containing_block, font, images);
     root_box
 }
 
@@ -374,7 +408,7 @@ mod tests {
         let mut viewport: Dimensions = Default::default();
         viewport.content.width = 800.0;
 
-        let root = layout_tree(&styled, viewport, None);
+        let root = layout_tree(&styled, viewport, None, &ImageMap::new());
         assert_eq!(root.dimensions.content.width, 200.0);
     }
 
@@ -388,7 +422,7 @@ mod tests {
         let mut viewport: Dimensions = Default::default();
         viewport.content.width = 800.0;
 
-        let root = layout_tree(&styled, viewport, None);
+        let root = layout_tree(&styled, viewport, None, &ImageMap::new());
         assert_eq!(root.dimensions.content.width, 800.0);
     }
 }

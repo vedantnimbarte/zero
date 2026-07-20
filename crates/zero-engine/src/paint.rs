@@ -1,11 +1,13 @@
 //! Paint: turn layout boxes into a display list, then rasterize to a pixel canvas.
 //!
-//! ponytail: solid-color backgrounds + borders + anti-aliased text. No images,
-//! gradients, shadows, border-radius, or GPU compositing yet
+//! ponytail: solid-color backgrounds + borders + anti-aliased text + nearest-neighbor
+//! images. No gradients, shadows, border-radius, or GPU compositing yet
 //! (docs/01-ARCHITECTURE.md §3 [6]-[7]).
 
 use crate::css::{Color, Value};
+use crate::dom::NodeType;
 use crate::layout::{BoxType, LayoutBox, Rect, TextFragment};
+use crate::resource::{DecodedImage, ImageMap};
 use fontdue::Font;
 
 pub struct Canvas {
@@ -17,6 +19,7 @@ pub struct Canvas {
 enum DisplayCommand {
     SolidColor(Color, Rect),
     Text(TextFragment),
+    Image(String, Rect), // image src, destination content box
 }
 
 type DisplayList = Vec<DisplayCommand>;
@@ -69,6 +72,34 @@ impl Canvas {
             pen_x += m.advance_width;
         }
     }
+
+    /// Blit a decoded image into `dest`, nearest-neighbor scaled and alpha-blended.
+    fn paint_image(&mut self, img: &DecodedImage, dest: Rect) {
+        let (dw, dh) = (dest.width as i32, dest.height as i32);
+        if dw <= 0 || dh <= 0 || img.width == 0 || img.height == 0 {
+            return;
+        }
+        let (x0, y0) = (dest.x as i32, dest.y as i32);
+        for dy in 0..dh {
+            let sy = ((dy as f32 / dh as f32) * img.height as f32) as usize;
+            let sy = sy.min(img.height - 1);
+            let py = y0 + dy;
+            if py < 0 || py >= self.height as i32 {
+                continue;
+            }
+            for dx in 0..dw {
+                let sx = ((dx as f32 / dw as f32) * img.width as f32) as usize;
+                let sx = sx.min(img.width - 1);
+                let px = x0 + dx;
+                if px < 0 || px >= self.width as i32 {
+                    continue;
+                }
+                let src = img.pixels[sy * img.width + sx];
+                let idx = py as usize * self.width + px as usize;
+                self.pixels[idx] = blend(self.pixels[idx], src, src.a);
+            }
+        }
+    }
 }
 
 /// Alpha-blend `src` (scaled by `coverage`) over `dst`.
@@ -78,7 +109,7 @@ fn blend(dst: Color, src: Color, coverage: u8) -> Color {
     Color { r: mix(dst.r, src.r), g: mix(dst.g, src.g), b: mix(dst.b, src.b), a: 255 }
 }
 
-pub fn paint(layout_root: &LayoutBox, bounds: Rect, font: Option<&Font>) -> Canvas {
+pub fn paint(layout_root: &LayoutBox, bounds: Rect, font: Option<&Font>, images: &ImageMap) -> Canvas {
     let display_list = build_display_list(layout_root);
     let mut canvas = Canvas::new(bounds.width as usize, bounds.height as usize);
     for item in &display_list {
@@ -87,6 +118,11 @@ pub fn paint(layout_root: &LayoutBox, bounds: Rect, font: Option<&Font>) -> Canv
             DisplayCommand::Text(frag) => {
                 if let Some(font) = font {
                     canvas.paint_text(frag, font);
+                }
+            }
+            DisplayCommand::Image(src, rect) => {
+                if let Some(img) = images.get(src) {
+                    canvas.paint_image(img, *rect);
                 }
             }
         }
@@ -103,12 +139,26 @@ fn build_display_list(layout_root: &LayoutBox) -> DisplayList {
 fn render_layout_box(list: &mut DisplayList, layout_box: &LayoutBox) {
     render_background(list, layout_box);
     render_borders(list, layout_box);
+    if let Some(src) = image_src(layout_box) {
+        list.push(DisplayCommand::Image(src, layout_box.dimensions.content));
+    }
     // Text sits above this box's background/borders.
     for frag in &layout_box.text_fragments {
         list.push(DisplayCommand::Text(frag.clone()));
     }
     for child in &layout_box.children {
         render_layout_box(list, child);
+    }
+}
+
+fn image_src(layout_box: &LayoutBox) -> Option<String> {
+    let style = match layout_box.box_type {
+        BoxType::BlockNode(s) | BoxType::InlineNode(s) => s,
+        BoxType::AnonymousBlock => return None,
+    };
+    match style.node.node_type {
+        NodeType::Element(ref e) if e.tag_name == "img" => e.attributes.get("src").cloned(),
+        _ => None,
     }
 }
 
