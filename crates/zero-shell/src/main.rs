@@ -20,7 +20,7 @@ use std::num::NonZeroU32;
 use std::rc::Rc;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, KeyEvent, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
@@ -183,7 +183,7 @@ fn main() {
 
 fn render_to_png(engine: &Engine, html: &str, css: &str, out_path: &str, base: &str) {
     let loader = ShellLoader { base: base.to_string() };
-    let canvas = engine.render_with_loader(html, css, 800.0, 600.0, &loader);
+    let canvas = engine.render_page(html, css, 800.0, 600.0, &loader).canvas;
     let buffer: Vec<u8> = canvas.pixels.iter().flat_map(|c| [c.r, c.g, c.b, c.a]).collect();
     let img = image::RgbaImage::from_raw(canvas.width as u32, canvas.height as u32, buffer)
         .expect("pixel buffer size mismatch");
@@ -200,6 +200,8 @@ fn run_window(engine: Engine, html: String, css: String, address: String) {
         address,
         scroll_y: 0.0,
         page_canvas: None,
+        links: Vec::new(),
+        cursor: (0.0, 0.0),
         cache_w: 0,
         cache_h: 0,
         window: None,
@@ -216,6 +218,8 @@ struct App {
     scroll_y: f32,
     // Cached full-height page render; re-rendered only on navigate/resize, not per scroll frame.
     page_canvas: Option<zero_engine::Canvas>,
+    links: Vec<zero_engine::LinkArea>,
+    cursor: (f32, f32),
     cache_w: u32,
     cache_h: u32,
     window: Option<Rc<Window>>,
@@ -253,6 +257,14 @@ impl ApplicationHandler for App {
                 self.scroll_y = (self.scroll_y - dy).max(0.0); // clamped to content in redraw
                 self.request_redraw();
             }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor = (position.x as f32, position.y as f32);
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Left,
+                ..
+            } => self.handle_click(),
             _ => {}
         }
     }
@@ -285,6 +297,27 @@ impl App {
                     }
                 }
             }
+        }
+    }
+
+    /// Hit-test the last click against the page's link rects and navigate if one matches.
+    fn handle_click(&mut self) {
+        let (cx, cy) = self.cursor;
+        let tb = TOOLBAR_H as f32;
+        if cy < tb {
+            return; // clicks in the toolbar don't navigate
+        }
+        // Window coords -> page coords (undo toolbar offset, add scroll).
+        let (px, py) = (cx, cy - tb + self.scroll_y);
+        let href = self
+            .links
+            .iter()
+            .find(|l| px >= l.x && px <= l.x + l.width && py >= l.y && py <= l.y + l.height)
+            .map(|l| l.href.clone());
+        if let Some(href) = href {
+            self.address = resolve_url(&self.address, &href);
+            self.navigate();
+            self.request_redraw();
         }
     }
 
@@ -325,13 +358,10 @@ impl App {
         // just re-blits the cached (full-height) canvas.
         if self.page_canvas.is_none() || self.cache_w != w || self.cache_h != page_vh {
             let loader = ShellLoader { base: self.address.clone() };
-            self.page_canvas = Some(self.engine.render_with_loader(
-                &self.page_html,
-                &self.page_css,
-                w as f32,
-                page_vh as f32,
-                &loader,
-            ));
+            let page =
+                self.engine.render_page(&self.page_html, &self.page_css, w as f32, page_vh as f32, &loader);
+            self.page_canvas = Some(page.canvas);
+            self.links = page.links;
             self.cache_w = w;
             self.cache_h = page_vh;
         }
