@@ -19,7 +19,7 @@ use std::num::NonZeroU32;
 use std::rc::Rc;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, KeyEvent, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
@@ -145,6 +145,10 @@ fn run_window(engine: Engine, html: String, css: String, address: String) {
         page_html: html,
         page_css: css,
         address,
+        scroll_y: 0.0,
+        page_canvas: None,
+        cache_w: 0,
+        cache_h: 0,
         window: None,
         surface: None,
     };
@@ -156,6 +160,11 @@ struct App {
     page_html: String,
     page_css: String,
     address: String,
+    scroll_y: f32,
+    // Cached full-height page render; re-rendered only on navigate/resize, not per scroll frame.
+    page_canvas: Option<zero_engine::Canvas>,
+    cache_w: u32,
+    cache_h: u32,
     window: Option<Rc<Window>>,
     surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
 }
@@ -183,6 +192,14 @@ impl ApplicationHandler for App {
                 self.handle_key(event);
                 self.request_redraw();
             }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let dy = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y * 48.0,
+                    MouseScrollDelta::PixelDelta(pos) => pos.y as f32,
+                };
+                self.scroll_y = (self.scroll_y - dy).max(0.0); // clamped to content in redraw
+                self.request_redraw();
+            }
             _ => {}
         }
     }
@@ -201,6 +218,11 @@ impl App {
             Key::Named(NamedKey::Backspace) => {
                 self.address.pop();
             }
+            Key::Named(NamedKey::ArrowDown) => self.scroll_y += 48.0,
+            Key::Named(NamedKey::ArrowUp) => self.scroll_y = (self.scroll_y - 48.0).max(0.0),
+            Key::Named(NamedKey::PageDown) => self.scroll_y += 400.0,
+            Key::Named(NamedKey::PageUp) => self.scroll_y = (self.scroll_y - 400.0).max(0.0),
+            Key::Named(NamedKey::Home) => self.scroll_y = 0.0,
             _ => {
                 if let Some(text) = &event.text {
                     for c in text.chars() {
@@ -218,6 +240,8 @@ impl App {
         self.address = target.clone();
         self.page_html = load_target(&target);
         self.page_css = String::new(); // rely on the page's own <style>
+        self.scroll_y = 0.0;
+        self.page_canvas = None; // force re-render of the new page
         if let Some(window) = &self.window {
             window.set_title(&format!("Zero Browser — {target}"));
         }
@@ -242,14 +266,28 @@ impl App {
             None => return,
         };
         let tb = TOOLBAR_H.min(h);
-        let page_h = h.saturating_sub(tb).max(1);
+        let page_vh = h.saturating_sub(tb).max(1);
 
-        // Render both docs before touching the surface (avoids a borrow conflict).
-        // ponytail: reparse+relayout every frame. Fine for now; cache if it stalls.
+        // Re-render the page only when the page or the layout size changed; scrolling
+        // just re-blits the cached (full-height) canvas.
+        if self.page_canvas.is_none() || self.cache_w != w || self.cache_h != page_vh {
+            self.page_canvas =
+                Some(self.engine.render(&self.page_html, &self.page_css, w as f32, page_vh as f32));
+            self.cache_w = w;
+            self.cache_h = page_vh;
+        }
+        // Clamp scroll to available overflow (read height into a local first).
+        let page_height = self.page_canvas.as_ref().unwrap().height;
+        let max_scroll = page_height.saturating_sub(page_vh as usize) as f32;
+        self.scroll_y = self.scroll_y.clamp(0.0, max_scroll);
+        let scroll = self.scroll_y as usize;
+
+        // Toolbar is cheap; render it fresh each frame (reflects typing).
         let toolbar = self.engine.render(&self.toolbar_html(), TOOLBAR_CSS, w as f32, tb as f32);
-        let page = self.engine.render(&self.page_html, &self.page_css, w as f32, page_h as f32);
 
-        let surface = match &mut self.surface {
+        // Disjoint field borrows: page_canvas (shared) + surface (mut).
+        let page = self.page_canvas.as_ref().unwrap();
+        let surface = match self.surface.as_mut() {
             Some(s) => s,
             None => return,
         };
@@ -263,7 +301,8 @@ impl App {
             let src = if y < tb {
                 &toolbar.pixels[y * toolbar.width..]
             } else {
-                &page.pixels[(y - tb) * page.width..]
+                let py = (y - tb) + scroll;
+                &page.pixels[py * page.width..]
             };
             for x in 0..w {
                 let px = src[x];
