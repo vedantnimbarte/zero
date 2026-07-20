@@ -1,0 +1,15 @@
+[package]
+name = "zero-engine"
+version = "0.1.0"
+edition = "2021"
+description = "Zero Browser rendering engine — embeddable, UI-agnostic. Build your own browser on it."
+license = "Apache-2.0"
+
+[lib]
+name = "zero_engine"
+
+[dependencies]
+# Font rasterization is core content rendering (unlike PNG/windowing, which are the
+# embedder's job). fontdue is a small pure-Rust TTF rasterizer. The embedder still
+# supplies the font *bytes* — the engine stays platform-agnostic.
+fontdue = "0.9"
