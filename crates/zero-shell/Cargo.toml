@@ -1,0 +1,19 @@
+[package]
+name = "zero-shell"
+version = "0.1.0"
+edition = "2021"
+description = "Reference browser shell built on the Zero engine. One consumer among many possible UIs."
+
+[[bin]]
+name = "zero"
+path = "src/main.rs"
+
+[dependencies]
+zero-engine = { path = "../zero-engine" }
+# Windowing + presenting pixels are shell concerns, not the engine's.
+winit = "0.30"
+softbuffer = "0.4"
+# PNG output (headless --png mode) is also a shell concern.
+image = { version = "0.25", default-features = false, features = ["png"] }
+# HTTP(S) fetching. ureq wraps rustls (TLS) + HTTP — infra, like fontdue for fonts.
+ureq = "2"
