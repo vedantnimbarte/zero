@@ -76,9 +76,12 @@ impl Engine {
         let mut viewport: layout::Dimensions = Default::default();
         viewport.content.width = width;
         viewport.content.height = height;
-        let bounds = viewport.content;
 
         let layout_root = layout::layout_tree(&style_root, viewport, self.font.as_ref());
+        // Canvas is at least the viewport, but grows to the full document height so
+        // the embedder can scroll through overflow.
+        let doc_height = layout_root.dimensions.margin_box().height.max(height);
+        let bounds = layout::Rect { x: 0.0, y: 0.0, width, height: doc_height };
         paint::paint(&layout_root, bounds, self.font.as_ref())
     }
 }
