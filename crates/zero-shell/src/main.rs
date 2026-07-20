@@ -15,6 +15,7 @@
 //!   zero --png [target] [css] [out]  # headless PNG
 
 use std::fs;
+use std::io::Read;
 use std::num::NonZeroU32;
 use std::rc::Rc;
 use winit::application::ApplicationHandler;
@@ -57,6 +58,57 @@ fn build_engine() -> Engine {
 
 fn is_url(s: &str) -> bool {
     s.starts_with("http://") || s.starts_with("https://")
+}
+
+/// Loads `<img>` bytes for the engine, resolving relative URLs against the page.
+/// Networking + filesystem are shell concerns; the engine only decodes bytes.
+struct ShellLoader {
+    base: String,
+}
+
+impl zero_engine::ResourceLoader for ShellLoader {
+    fn load(&self, url: &str) -> Option<Vec<u8>> {
+        let resolved = resolve_url(&self.base, url);
+        if resolved.starts_with("http://") || resolved.starts_with("https://") {
+            let mut buf = Vec::new();
+            ureq::get(&resolved).call().ok()?.into_reader().read_to_end(&mut buf).ok()?;
+            Some(buf)
+        } else if resolved.starts_with("data:") {
+            None // ponytail: data: URIs unsupported; add base64 decode when needed
+        } else {
+            fs::read(&resolved).ok()
+        }
+    }
+}
+
+/// Resolve a possibly-relative resource URL against a base page URL or file path.
+fn resolve_url(base: &str, src: &str) -> String {
+    let src = src.trim();
+    if is_url(src) || src.starts_with("data:") {
+        return src.to_string();
+    }
+    if let Some(rest) = src.strip_prefix("//") {
+        let scheme = base.split("://").next().unwrap_or("https");
+        return format!("{scheme}://{rest}");
+    }
+    if base.starts_with("http") {
+        let scheme = base.split("://").next().unwrap_or("https");
+        let host = base.split("://").nth(1).unwrap_or("").split('/').next().unwrap_or("");
+        let origin = format!("{scheme}://{host}");
+        if let Some(abs) = src.strip_prefix('/') {
+            return format!("{origin}/{abs}");
+        }
+        let path = &base[origin.len().min(base.len())..];
+        let dir = path.rfind('/').map(|i| &path[..=i]).unwrap_or("/");
+        return format!("{origin}{dir}{src}");
+    }
+    // Local file base: resolve relative to its directory.
+    std::path::Path::new(base)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join(src)
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// Turn address-bar text into something loadable: keep URLs/paths, else assume https.
@@ -123,14 +175,15 @@ fn main() {
 
     if png_mode {
         let out_path = args.next().unwrap_or_else(|| "output.png".into());
-        render_to_png(&engine, &html, &css, &out_path);
+        render_to_png(&engine, &html, &css, &out_path, &address);
     } else {
         run_window(engine, html, css, address);
     }
 }
 
-fn render_to_png(engine: &Engine, html: &str, css: &str, out_path: &str) {
-    let canvas = engine.render(html, css, 800.0, 600.0);
+fn render_to_png(engine: &Engine, html: &str, css: &str, out_path: &str, base: &str) {
+    let loader = ShellLoader { base: base.to_string() };
+    let canvas = engine.render_with_loader(html, css, 800.0, 600.0, &loader);
     let buffer: Vec<u8> = canvas.pixels.iter().flat_map(|c| [c.r, c.g, c.b, c.a]).collect();
     let img = image::RgbaImage::from_raw(canvas.width as u32, canvas.height as u32, buffer)
         .expect("pixel buffer size mismatch");
@@ -271,8 +324,14 @@ impl App {
         // Re-render the page only when the page or the layout size changed; scrolling
         // just re-blits the cached (full-height) canvas.
         if self.page_canvas.is_none() || self.cache_w != w || self.cache_h != page_vh {
-            self.page_canvas =
-                Some(self.engine.render(&self.page_html, &self.page_css, w as f32, page_vh as f32));
+            let loader = ShellLoader { base: self.address.clone() };
+            self.page_canvas = Some(self.engine.render_with_loader(
+                &self.page_html,
+                &self.page_css,
+                w as f32,
+                page_vh as f32,
+                &loader,
+            ));
             self.cache_w = w;
             self.cache_h = page_vh;
         }
