@@ -26,12 +26,19 @@ pub mod resource;
 pub mod style;
 
 pub use css::Color;
+pub use layout::LinkArea;
 pub use paint::Canvas;
 pub use resource::{DecodedImage, ResourceLoader};
 
 use dom::{Node, NodeType};
 use fontdue::Font;
 use resource::{ImageMap, NullLoader};
+
+/// The result of rendering: pixels plus clickable link regions (page coordinates).
+pub struct Page {
+    pub canvas: Canvas,
+    pub links: Vec<LinkArea>,
+}
 
 /// Minimal user-agent stylesheet: gives real documents sane default display
 /// (block for structural tags, none for head/script/style) so they lay out.
@@ -61,23 +68,24 @@ impl Engine {
     }
 
     /// Render an HTML + CSS document to a pixel [`Canvas`], without loading any
-    /// external resources (images render blank). See [`Engine::render_with_loader`].
+    /// external resources (images render blank). See [`Engine::render_page`].
     pub fn render(&self, html_source: &str, css_source: &str, width: f32, height: f32) -> Canvas {
-        self.render_with_loader(html_source, css_source, width, height, &NullLoader)
+        self.render_page(html_source, css_source, width, height, &NullLoader).canvas
     }
 
-    /// Render, using `loader` to fetch `<img>` and other subresources.
+    /// Render a full [`Page`] (pixels + clickable links), using `loader` to fetch
+    /// `<img>` and other subresources.
     ///
     /// The embedder owns everything else: windowing, input, chrome, networking, and
-    /// what to do with the returned pixels.
-    pub fn render_with_loader(
+    /// what to do with the returned pixels/links.
+    pub fn render_page(
         &self,
         html_source: &str,
         css_source: &str,
         width: f32,
         height: f32,
         loader: &dyn ResourceLoader,
-    ) -> Canvas {
+    ) -> Page {
         let root = html::parse(html_source.to_string());
 
         // Cascade order (later wins on ties): UA stylesheet < page <style> < caller CSS.
@@ -102,7 +110,11 @@ impl Engine {
         // the embedder can scroll through overflow.
         let doc_height = layout_root.dimensions.margin_box().height.max(height);
         let bounds = layout::Rect { x: 0.0, y: 0.0, width, height: doc_height };
-        paint::paint(&layout_root, bounds, self.font.as_ref(), &images)
+        let canvas = paint::paint(&layout_root, bounds, self.font.as_ref(), &images);
+
+        let mut links = Vec::new();
+        layout::collect_links(&layout_root, &mut links);
+        Page { canvas, links }
     }
 }
 

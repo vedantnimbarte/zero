@@ -24,6 +24,16 @@ pub struct TextFragment {
     pub color: Color,
 }
 
+/// A clickable region for an `<a href>`, in absolute page coordinates.
+#[derive(Clone)]
+pub struct LinkArea {
+    pub href: String,
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
 #[derive(Clone, Copy, Default)]
 pub struct Rect {
     pub x: f32,
@@ -77,6 +87,8 @@ pub struct LayoutBox<'a> {
     pub children: Vec<LayoutBox<'a>>,
     /// Text placed by inline layout (only non-empty on anonymous/inline boxes).
     pub text_fragments: Vec<TextFragment>,
+    /// Clickable link regions produced by inline layout.
+    pub link_areas: Vec<LinkArea>,
 }
 
 pub enum BoxType<'a> {
@@ -92,6 +104,7 @@ impl<'a> LayoutBox<'a> {
             dimensions: Default::default(),
             children: Vec::new(),
             text_fragments: Vec::new(),
+            link_areas: Vec::new(),
         }
     }
 
@@ -176,19 +189,22 @@ impl<'a> LayoutBox<'a> {
         let mut cursor_y = top;
         let mut line_height = 0.0_f32; // tallest word on the current line
         let mut fragments: Vec<TextFragment> = Vec::new();
+        let mut link_areas: Vec<LinkArea> = Vec::new();
 
-        // Flatten the inline subtree (text, plus <a>/<span>/... wrappers) into pieces.
-        let mut pieces: Vec<(String, f32, Color)> = Vec::new();
+        // Flatten the inline subtree (text, plus <a href>/<span>/... wrappers) into pieces,
+        // carrying the nearest ancestor link's href with each piece.
+        let mut pieces: Vec<TextPiece> = Vec::new();
         for child in &self.children {
-            collect_inline_text(child, default_size, &mut pieces);
+            collect_inline_text(child, default_size, None, &mut pieces);
         }
 
-        for (text, size, color) in &pieces {
-            let word_height = size * 1.25;
-            let space_w = font.metrics(' ', *size).advance_width;
+        for piece in &pieces {
+            let word_height = piece.size * 1.25;
+            let space_w = font.metrics(' ', piece.size).advance_width;
 
-            for word in text.split_whitespace() {
-                let word_w: f32 = word.chars().map(|c| font.metrics(c, *size).advance_width).sum();
+            for word in piece.text.split_whitespace() {
+                let word_w: f32 =
+                    word.chars().map(|c| font.metrics(c, piece.size).advance_width).sum();
                 // Wrap if this word overflows and we're not at line start.
                 if cursor_x > start_x && cursor_x + word_w > start_x + max_width {
                     cursor_y += line_height;
@@ -200,9 +216,18 @@ impl<'a> LayoutBox<'a> {
                     text: word.to_string(),
                     x: cursor_x,
                     y: cursor_y,
-                    size: *size,
-                    color: *color,
+                    size: piece.size,
+                    color: piece.color,
                 });
+                if let Some(href) = &piece.href {
+                    link_areas.push(LinkArea {
+                        href: href.clone(),
+                        x: cursor_x,
+                        y: cursor_y,
+                        width: word_w,
+                        height: word_height,
+                    });
+                }
                 cursor_x += word_w + space_w;
             }
         }
@@ -210,6 +235,7 @@ impl<'a> LayoutBox<'a> {
         self.dimensions.content.height =
             if fragments.is_empty() { 0.0 } else { (cursor_y - top) + line_height };
         self.text_fragments = fragments;
+        self.link_areas = link_areas;
     }
 
     fn calculate_block_width(&mut self, containing_block: Dimensions) {
@@ -351,10 +377,27 @@ pub fn layout_tree<'a>(
     root_box
 }
 
+struct TextPiece {
+    text: String,
+    size: f32,
+    color: Color,
+    href: Option<String>,
+}
+
 /// Walk an inline box subtree, collecting each text node with its (inherited)
-/// font size and color. This is what makes `<a>`/`<span>` text render.
-fn collect_inline_text(bx: &LayoutBox, default_size: f32, out: &mut Vec<(String, f32, Color)>) {
+/// font size, color, and nearest ancestor `<a href>`. This is what makes
+/// `<a>`/`<span>` text render and become clickable.
+fn collect_inline_text(bx: &LayoutBox, default_size: f32, href: Option<&str>, out: &mut Vec<TextPiece>) {
+    // If this inline box is an <a href>, it becomes the link context for its subtree.
+    let mut current_href = href.map(str::to_string);
     if let BoxType::InlineNode(styled) = bx.box_type {
+        if let NodeType::Element(ref e) = styled.node.node_type {
+            if e.tag_name == "a" {
+                if let Some(h) = e.attributes.get("href") {
+                    current_href = Some(h.clone());
+                }
+            }
+        }
         if let NodeType::Text(ref t) = styled.node.node_type {
             let size = styled
                 .value("font-size")
@@ -365,11 +408,19 @@ fn collect_inline_text(bx: &LayoutBox, default_size: f32, out: &mut Vec<(String,
                 Some(Value::ColorValue(c)) => c,
                 _ => Color { r: 0, g: 0, b: 0, a: 255 },
             };
-            out.push((t.clone(), size, color));
+            out.push(TextPiece { text: t.clone(), size, color, href: current_href.clone() });
         }
     }
     for child in &bx.children {
-        collect_inline_text(child, default_size, out);
+        collect_inline_text(child, default_size, current_href.as_deref(), out);
+    }
+}
+
+/// Gather every clickable link region from the laid-out tree (absolute coords).
+pub fn collect_links(bx: &LayoutBox, out: &mut Vec<LinkArea>) {
+    out.extend(bx.link_areas.iter().cloned());
+    for child in &bx.children {
+        collect_links(child, out);
     }
 }
 
