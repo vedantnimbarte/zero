@@ -149,7 +149,7 @@ impl<'a> LayoutBox<'a> {
         } else {
             self.layout_block_children(fonts, images);
         }
-        self.calculate_block_height();
+        self.calculate_block_height(containing_block);
         // A replaced element (<img>) overrides content size with its resolved dimensions.
         if let Some((w, h)) = self.resolved_image_size(images) {
             self.dimensions.content.width = w;
@@ -173,7 +173,7 @@ impl<'a> LayoutBox<'a> {
         }
         let src = elem.attributes.get("src")?;
         let img = images.get(src);
-        let css_px = |name: &str| styled.value(name).map(|v| v.to_px()).filter(|v| *v > 0.0);
+        let css_px = |name: &str| styled.px(name, 0.0).filter(|v| *v > 0.0);
         let attr_px = |name: &str| elem.attributes.get(name).and_then(|s| s.trim().parse::<f32>().ok());
 
         let w = css_px("width").or_else(|| attr_px("width")).or_else(|| img.map(|i| i.width as f32))?;
@@ -264,6 +264,8 @@ impl<'a> LayoutBox<'a> {
         let style = self.get_style_node();
         let auto = Value::Keyword("auto".to_string());
         let zero = Value::Length(0.0, Unit::Px);
+        // Percentages in the inline axis resolve against the containing block's width.
+        let ctx = style.length_context(containing_block.content.width);
 
         let mut width = style.value("width").unwrap_or_else(|| auto.clone());
         let mut margin_left = style.lookup("margin-left", "margin", &zero);
@@ -278,7 +280,7 @@ impl<'a> LayoutBox<'a> {
             &padding_right, &width,
         ]
         .iter()
-        .map(|v| v.to_px())
+        .map(|v| v.resolve(ctx))
         .sum();
 
         // If the box is too wide, auto margins collapse to zero.
@@ -295,7 +297,7 @@ impl<'a> LayoutBox<'a> {
         match (width == auto, margin_left == auto, margin_right == auto) {
             // Over-constrained: adjust the right margin.
             (false, false, false) => {
-                margin_right = Value::Length(margin_right.to_px() + underflow, Unit::Px);
+                margin_right = Value::Length(margin_right.resolve(ctx) + underflow, Unit::Px);
             }
             (false, false, true) => margin_right = Value::Length(underflow, Unit::Px),
             (false, true, false) => margin_left = Value::Length(underflow, Unit::Px),
@@ -311,7 +313,7 @@ impl<'a> LayoutBox<'a> {
                     width = Value::Length(underflow, Unit::Px);
                 } else {
                     width = zero.clone();
-                    margin_right = Value::Length(margin_right.to_px() + underflow, Unit::Px);
+                    margin_right = Value::Length(margin_right.resolve(ctx) + underflow, Unit::Px);
                 }
             }
             // Both margins auto: center the box.
@@ -322,26 +324,28 @@ impl<'a> LayoutBox<'a> {
         }
 
         let d = &mut self.dimensions;
-        d.content.width = width.to_px();
-        d.padding.left = padding_left.to_px();
-        d.padding.right = padding_right.to_px();
-        d.border.left = border_left.to_px();
-        d.border.right = border_right.to_px();
-        d.margin.left = margin_left.to_px();
-        d.margin.right = margin_right.to_px();
+        d.content.width = width.resolve(ctx);
+        d.padding.left = padding_left.resolve(ctx);
+        d.padding.right = padding_right.resolve(ctx);
+        d.border.left = border_left.resolve(ctx);
+        d.border.right = border_right.resolve(ctx);
+        d.margin.left = margin_left.resolve(ctx);
+        d.margin.right = margin_right.resolve(ctx);
     }
 
     fn calculate_block_position(&mut self, containing_block: Dimensions) {
         let style = self.get_style_node();
         let zero = Value::Length(0.0, Unit::Px);
+        // Per CSS, vertical padding/margin percentages also resolve against WIDTH.
+        let ctx = style.length_context(containing_block.content.width);
 
         let d = &mut self.dimensions;
-        d.margin.top = style.lookup("margin-top", "margin", &zero).to_px();
-        d.margin.bottom = style.lookup("margin-bottom", "margin", &zero).to_px();
-        d.border.top = style.lookup("border-top-width", "border-width", &zero).to_px();
-        d.border.bottom = style.lookup("border-bottom-width", "border-width", &zero).to_px();
-        d.padding.top = style.lookup("padding-top", "padding", &zero).to_px();
-        d.padding.bottom = style.lookup("padding-bottom", "padding", &zero).to_px();
+        d.margin.top = style.lookup("margin-top", "margin", &zero).resolve(ctx);
+        d.margin.bottom = style.lookup("margin-bottom", "margin", &zero).resolve(ctx);
+        d.border.top = style.lookup("border-top-width", "border-width", &zero).resolve(ctx);
+        d.border.bottom = style.lookup("border-bottom-width", "border-width", &zero).resolve(ctx);
+        d.padding.top = style.lookup("padding-top", "padding", &zero).resolve(ctx);
+        d.padding.bottom = style.lookup("padding-bottom", "padding", &zero).resolve(ctx);
 
         d.content.x = containing_block.content.x + d.margin.left + d.border.left + d.padding.left;
         // Stack below the content already placed in the containing block.
@@ -431,10 +435,14 @@ impl<'a> LayoutBox<'a> {
         self.dimensions.content.height = tallest;
     }
 
-    fn calculate_block_height(&mut self) {
+    fn calculate_block_height(&mut self, containing_block: Dimensions) {
         // An explicit height overrides the content-derived height.
-        if let Some(Value::Length(h, Unit::Px)) = self.get_style_node().value("height") {
-            self.dimensions.content.height = h;
+        let style = self.get_style_node();
+        let ctx = style.length_context(containing_block.content.height);
+        if let Some(value) = style.value("height") {
+            if matches!(value, Value::Length(..)) {
+                self.dimensions.content.height = value.resolve(ctx);
+            }
         }
     }
 
@@ -491,11 +499,7 @@ fn collect_inline_text(bx: &LayoutBox, default_size: f32, href: Option<&str>, ou
             }
         }
         if let NodeType::Text(ref t) = styled.node.node_type {
-            let size = styled
-                .value("font-size")
-                .map(|v| v.to_px())
-                .filter(|s| *s > 0.0)
-                .unwrap_or(default_size);
+            let size = if styled.font_size() > 0.0 { styled.font_size() } else { default_size };
             let color = match styled.value("color") {
                 Some(Value::ColorValue(c)) => c,
                 _ => Color { r: 0, g: 0, b: 0, a: 255 },
