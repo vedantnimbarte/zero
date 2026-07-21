@@ -8,6 +8,8 @@ use super::lexer::{Kw, Tok};
 
 #[derive(Debug, Clone)]
 pub enum Expr {
+    /// `a, b, c` — every part runs, the last one is the value.
+    Sequence(Vec<Expr>),
     Num(f64),
     Str(String),
     Bool(bool),
@@ -62,9 +64,10 @@ pub enum Expr {
 
 #[derive(Debug, Clone)]
 pub enum Stmt {
+    /// One `var`/`let`/`const` statement, which may declare several names:
+    /// `var a = 1, b;` is a single declaration with two declarators.
     VarDecl {
-        name: String,
-        init: Option<Expr>,
+        names: Vec<(String, Option<Expr>)>,
     },
     ExprStmt(Expr),
     If {
@@ -194,14 +197,21 @@ impl Parser {
             return Ok(Stmt::Block(body));
         }
         if self.eat_kw(Kw::Var) {
-            let name = self.expect_ident()?;
-            let init = if self.eat_op("=") {
-                Some(self.parse_expr()?)
-            } else {
-                None
-            };
+            let mut names = Vec::new();
+            loop {
+                let name = self.expect_ident()?;
+                let init = if self.eat_op("=") {
+                    Some(self.parse_expr()?)
+                } else {
+                    None
+                };
+                names.push((name, init));
+                if !self.eat_op(",") {
+                    break;
+                }
+            }
             self.eat_op(";");
-            return Ok(Stmt::VarDecl { name, init });
+            return Ok(Stmt::VarDecl { names });
         }
         if self.eat_kw(Kw::Function) {
             let name = self.expect_ident()?;
@@ -322,7 +332,7 @@ impl Parser {
             });
         }
 
-        let expr = self.parse_expr()?;
+        let expr = self.parse_sequence()?;
         self.eat_op(";");
         Ok(Stmt::ExprStmt(expr))
     }
@@ -356,8 +366,27 @@ impl Parser {
         Ok(body)
     }
 
+    /// A single expression, stopping at a comma.
+    ///
+    /// Arguments, array items and object values are all *assignment*
+    /// expressions in the grammar: `f(a, b)` is two arguments, not one comma
+    /// expression, so those callers must use this and not [`Self::parse_sequence`].
     fn parse_expr(&mut self) -> Result<Expr, String> {
         self.parse_assign()
+    }
+
+    /// A full expression, comma operator included. Valid where no comma has a
+    /// separating job: statements, parentheses and `for` clauses.
+    fn parse_sequence(&mut self) -> Result<Expr, String> {
+        let first = self.parse_expr()?;
+        if !matches!(self.peek(), Tok::Op(o) if o == ",") {
+            return Ok(first);
+        }
+        let mut parts = vec![first];
+        while self.eat_op(",") {
+            parts.push(self.parse_expr()?);
+        }
+        Ok(Expr::Sequence(parts))
     }
 
     fn parse_assign(&mut self) -> Result<Expr, String> {
@@ -431,6 +460,15 @@ impl Parser {
     }
 
     fn parse_unary(&mut self) -> Result<Expr, String> {
+        // `typeof` is a word, not a symbol, so it arrives as an identifier.
+        if matches!(self.peek(), Tok::Ident(name) if name == "typeof") {
+            self.pos += 1;
+            let expr = self.parse_unary()?;
+            return Ok(Expr::Unary {
+                op: "typeof".to_string(),
+                expr: Box::new(expr),
+            });
+        }
         for op in ["!", "-", "+", "~"] {
             if matches!(self.peek(), Tok::Op(o) if o == op) {
                 self.pos += 1;
@@ -530,7 +568,7 @@ impl Parser {
                 })
             }
             Tok::Op(op) if op == "(" => {
-                let e = self.parse_expr()?;
+                let e = self.parse_sequence()?;
                 self.expect_op(")")?;
                 Ok(e)
             }
@@ -581,13 +619,13 @@ mod tests {
         let ast = parse(tokenize("var x = 1 + 2 * 3;").unwrap()).unwrap();
         // Should nest as 1 + (2 * 3), not (1 + 2) * 3.
         match &ast[0] {
-            Stmt::VarDecl {
-                init: Some(Expr::Binary { op, right, .. }),
-                ..
-            } => {
-                assert_eq!(op, "+");
-                assert!(matches!(**right, Expr::Binary { .. }));
-            }
+            Stmt::VarDecl { names } => match &names[0].1 {
+                Some(Expr::Binary { op, right, .. }) => {
+                    assert_eq!(op, "+");
+                    assert!(matches!(**right, Expr::Binary { .. }));
+                }
+                other => panic!("unexpected init: {other:?}"),
+            },
             other => panic!("unexpected: {other:?}"),
         }
     }
@@ -596,18 +634,12 @@ mod tests {
     fn parses_literals_and_indexing() {
         let ast = parse(tokenize("var a = [1, 2]; var o = {x: 1}; a[0]; o.x;").unwrap()).unwrap();
         assert!(matches!(
-            ast[0],
-            Stmt::VarDecl {
-                init: Some(Expr::ArrayLit(_)),
-                ..
-            }
+            &ast[0],
+            Stmt::VarDecl { names } if matches!(names[0].1, Some(Expr::ArrayLit(_)))
         ));
         assert!(matches!(
-            ast[1],
-            Stmt::VarDecl {
-                init: Some(Expr::ObjectLit(_)),
-                ..
-            }
+            &ast[1],
+            Stmt::VarDecl { names } if matches!(names[0].1, Some(Expr::ObjectLit(_)))
         ));
         assert!(matches!(ast[2], Stmt::ExprStmt(Expr::Index { .. })));
         assert!(matches!(ast[3], Stmt::ExprStmt(Expr::Member { .. })));

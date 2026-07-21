@@ -219,6 +219,31 @@ mod tests {
     }
 
     #[test]
+    fn window_is_defined_and_the_comma_operator_works() {
+        // Scripts reach for window constantly; it used to fail at first mention.
+        let out = run("window.addEventListener('load', function () {});                        window.console.log('via window');                        console.log(typeof window);");
+        assert_eq!(out.errors, Vec::<String>::new());
+        assert_eq!(out.console, ["via window", "object"]);
+
+        // A comma expression runs every part and takes the last as its value.
+        let out = run("var a = 0; var b = (a = 1, a + 1); console.log(a, b);");
+        assert_eq!(out.console, ["1 2"]);
+
+        // A comma still separates arguments and array items, not expressions.
+        let out = run("function f(x, y) { return x + y; } console.log(f(2, 3), [1, 2].length);");
+        assert_eq!(out.console, ["5 2"]);
+
+        // One `var` can declare several names — very common in real scripts.
+        let out = run("var a = 1, b = a + 1, c; console.log(a, b, typeof c);");
+        assert_eq!(out.console, ["1 2 undefined"]);
+
+        // Feature detection: an unknown name answers rather than failing.
+        let out = run("console.log(typeof nothingHere, typeof document, typeof 1, typeof 'a');");
+        assert_eq!(out.errors, Vec::<String>::new());
+        assert_eq!(out.console, ["undefined object number string"]);
+    }
+
+    #[test]
     fn reads_and_mutates_the_dom() {
         let dom = DomView {
             elements: vec![ElementInfo {
