@@ -81,6 +81,61 @@ fn parse_visit(line: &str) -> Option<Visit> {
     Some(Visit { when, url, title: parts.next().unwrap_or("").to_string() })
 }
 
+#[derive(Debug, PartialEq)]
+pub struct Bookmark {
+    pub url: String,
+    pub title: String,
+}
+
+/// Save a bookmark, replacing any existing one for the same URL.
+pub fn add_bookmark(url: &str, title: &str) {
+    let (url, title) = (sanitize(url), sanitize(title));
+    if url.is_empty() {
+        return;
+    }
+    let Some(dir) = profile_dir() else { return };
+    let mut marks = read_bookmarks(&dir);
+    marks.retain(|b| b.url != url);
+    marks.push(Bookmark { url, title });
+    write_bookmarks(&dir, &marks);
+}
+
+/// Remove a bookmark. Returns whether anything was removed.
+pub fn remove_bookmark(url: &str) -> bool {
+    let Some(dir) = profile_dir() else { return false };
+    let mut marks = read_bookmarks(&dir);
+    let before = marks.len();
+    marks.retain(|b| b.url != url);
+    let changed = marks.len() != before;
+    if changed {
+        write_bookmarks(&dir, &marks);
+    }
+    changed
+}
+
+pub fn load_bookmarks() -> Vec<Bookmark> {
+    profile_dir().map(|dir| read_bookmarks(&dir)).unwrap_or_default()
+}
+
+pub fn is_bookmarked(url: &str) -> bool {
+    load_bookmarks().iter().any(|b| b.url == url)
+}
+
+fn read_bookmarks(dir: &Path) -> Vec<Bookmark> {
+    let text = crate::crypto::read_file(&dir.join("bookmarks.tsv")).unwrap_or_default();
+    text.lines()
+        .filter_map(|line| {
+            let (url, title) = line.split_once('\t')?;
+            (!url.is_empty()).then(|| Bookmark { url: url.into(), title: title.into() })
+        })
+        .collect()
+}
+
+fn write_bookmarks(dir: &Path, marks: &[Bookmark]) {
+    let text: String = marks.iter().map(|b| format!("{}\t{}\n", b.url, b.title)).collect();
+    crate::crypto::write_file(&dir.join("bookmarks.tsv"), &text);
+}
+
 /// Persist the open tabs so the next launch can restore them.
 pub fn save_session(urls: &[String], active: usize) {
     if let Some(dir) = profile_dir() {
