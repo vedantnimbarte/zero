@@ -32,6 +32,8 @@ const TAB_ROW_H: u32 = 40; // padding(10*2) + height(20)
 const TOOLBAR_H: u32 = 48;
 const AI_PANEL_W: u32 = 320;
 const SCROLLBAR_W: u32 = 12;
+/// The right-hand strip of a tab row that closes it.
+const CLOSE_W: u32 = 32;
 
 const TOOLBAR_CSS: &str = "body{background:#1f2127;color:#f2f3f5;font-size:15px;} \
      #bar{padding:9px;height:30px;} \
@@ -124,6 +126,32 @@ fn address_label(address: &str) -> String {
             .unwrap_or_else(|| address.to_string()),
     };
     title
+}
+
+/// What a click in the sidebar landed on.
+#[derive(Debug, PartialEq)]
+enum SidebarHit {
+    Select(usize),
+    Close(usize),
+    NewTab,
+    None,
+}
+
+/// Resolve a sidebar click. The rows are laid out by the engine, so this
+/// arithmetic has to agree with [`App::sidebar_html`]: a header, then one row
+/// per tab, then the new-tab row.
+fn sidebar_hit(x: f32, y: f32, tabs: usize) -> SidebarHit {
+    if y < SIDEBAR_HEAD_H as f32 {
+        return SidebarHit::None; // the header is decoration
+    }
+    let row = ((y - SIDEBAR_HEAD_H as f32) / TAB_ROW_H as f32) as usize;
+    match row {
+        r if r == tabs => SidebarHit::NewTab,
+        r if r > tabs => SidebarHit::None, // empty space below the list
+        // The close affordance is the right margin of the row.
+        r if x >= (SIDEBAR_W - CLOSE_W) as f32 => SidebarHit::Close(r),
+        r => SidebarHit::Select(r),
+    }
 }
 
 /// Everything that belongs to one tab, including its own history and render cache.
@@ -380,7 +408,20 @@ impl App {
     }
 
     fn close_tab(&mut self) {
-        self.tabs.remove(self.active);
+        let active = self.active;
+        self.close_tab_at(active);
+    }
+
+    fn close_tab_at(&mut self, index: usize) {
+        if index >= self.tabs.len() {
+            return;
+        }
+        self.tabs.remove(index);
+        // Keep the same tab in front where possible: closing one before the
+        // active tab would otherwise shift the selection sideways.
+        if index < self.active {
+            self.active -= 1;
+        }
         if self.tabs.is_empty() {
             self.tabs.push(Tab::blank()); // always keep one tab open
         }
@@ -501,12 +542,7 @@ impl App {
         let (w, h) = self.window_size();
 
         if cx < SIDEBAR_W as f32 {
-            if cy >= SIDEBAR_HEAD_H as f32 {
-                let row = ((cy - SIDEBAR_HEAD_H as f32) / TAB_ROW_H as f32) as usize;
-                if row < self.tabs.len() {
-                    self.active = row;
-                }
-            }
+            self.handle_sidebar_click(cx, cy);
             return;
         }
         if cy < TOOLBAR_H as f32 {
@@ -794,6 +830,16 @@ impl App {
         self.request_redraw(); // the star changed
     }
 
+    fn handle_sidebar_click(&mut self, x: f32, y: f32) {
+        match sidebar_hit(x, y, self.tabs.len()) {
+            SidebarHit::Select(row) => self.active = row,
+            SidebarHit::Close(row) => self.close_tab_at(row),
+            SidebarHit::NewTab => self.new_tab(),
+            SidebarHit::None => return,
+        }
+        self.request_redraw();
+    }
+
     fn handle_toolbar_click(&mut self, x: f32, y: f32) -> bool {
         let local_x = x - SIDEBAR_W as f32;
         let hit = self
@@ -837,10 +883,16 @@ impl App {
             .map(|(i, t)| {
                 let class = if i == self.active { "tab active" } else { "tab" };
                 let label = label_for(&t.doc.title(), &t.address);
-                format!("<div class=\"{class}\">{}</div>", escape(&label))
+                // The x sits in the row's right margin, where clicks close the tab.
+                format!(
+                    "<div class=\"{class}\"><span class=\"name\">{}</span>                     <span class=\"x\">&times;</span></div>",
+                    escape(&label)
+                )
             })
             .collect();
-        format!("<html><body><div id=\"head\">ZERO</div>{rows}</body></html>")
+        format!(
+            "<html><body><div id=\"head\">ZERO</div>{rows}             <div class=\"tab new\">+  New tab</div></body></html>"
+        )
     }
 
     /// Height is injected so the sidebar background fills the window.
@@ -849,7 +901,12 @@ impl App {
             "body{{background:#141519;color:#c9ccd3;font-size:14px;height:{height}px;}} \
              #head{{color:#6b7280;padding:12px;height:20px;}} \
              .tab{{padding:10px;height:20px;}} \
-             .active{{background:#26282f;color:#ffffff;}}"
+             .active{{background:#26282f;color:#ffffff;}} \
+             .new{{color:#6b7280;}} \
+             .name{{display:inline-block;width:{name}px;}} \
+             .x{{display:inline-block;width:{close}px;color:#6b7280;text-align:right;}}",
+            name = SIDEBAR_W - CLOSE_W - 24, // 24 = the row's left+right padding
+            close = CLOSE_W - 8,
         )
     }
 
@@ -977,6 +1034,23 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sidebar_clicks_land_on_the_right_row() {
+        let head = SIDEBAR_HEAD_H as f32;
+        let row_h = TAB_ROW_H as f32;
+        // The header is not a tab.
+        assert_eq!(sidebar_hit(50.0, head - 1.0, 3), SidebarHit::None);
+        // First and third rows.
+        assert_eq!(sidebar_hit(50.0, head + 1.0, 3), SidebarHit::Select(0));
+        assert_eq!(sidebar_hit(50.0, head + 2.0 * row_h, 3), SidebarHit::Select(2));
+        // The right margin closes rather than selects.
+        let close_x = (SIDEBAR_W - CLOSE_W) as f32 + 1.0;
+        assert_eq!(sidebar_hit(close_x, head + 1.0, 3), SidebarHit::Close(0));
+        // The row after the last tab opens a new one; below that, nothing.
+        assert_eq!(sidebar_hit(50.0, head + 3.0 * row_h, 3), SidebarHit::NewTab);
+        assert_eq!(sidebar_hit(50.0, head + 4.0 * row_h, 3), SidebarHit::None);
+    }
 
     #[test]
     fn tab_labels_prefer_the_page_title() {
