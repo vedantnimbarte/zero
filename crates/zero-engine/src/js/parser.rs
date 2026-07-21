@@ -24,6 +24,8 @@ pub enum Expr {
     ArrayLit(Vec<Expr>),
     /// A function expression, which captures the scope it was created in.
     Func { params: Vec<String>, body: Vec<Stmt> },
+    This,
+    New { callee: Box<Expr>, args: Vec<Expr> },
 }
 
 #[derive(Debug, Clone)]
@@ -36,6 +38,10 @@ pub enum Stmt {
     Block(Vec<Stmt>),
     Return(Option<Expr>),
     FuncDecl { name: String, params: Vec<String>, body: Vec<Stmt> },
+    Throw(Expr),
+    Try { body: Vec<Stmt>, param: Option<String>, catch: Vec<Stmt>, finally: Vec<Stmt> },
+    /// `class C { constructor(..){} method(..){} }`
+    ClassDecl { name: String, methods: Vec<(String, Vec<String>, Vec<Stmt>)> },
 }
 
 /// Binding power for binary operators; higher binds tighter.
@@ -129,6 +135,40 @@ impl Parser {
             let params = self.parse_params()?;
             let body = self.parse_block_body()?;
             return Ok(Stmt::FuncDecl { name, params, body });
+        }
+        if self.eat_kw(Kw::Throw) {
+            let value = self.parse_expr()?;
+            self.eat_op(";");
+            return Ok(Stmt::Throw(value));
+        }
+        if self.eat_kw(Kw::Try) {
+            let body = self.parse_block_body()?;
+            let (mut param, mut catch) = (None, Vec::new());
+            if self.eat_kw(Kw::Catch) {
+                if self.eat_op("(") {
+                    param = Some(self.expect_ident()?);
+                    self.expect_op(")")?;
+                }
+                catch = self.parse_block_body()?;
+            }
+            let finally =
+                if self.eat_kw(Kw::Finally) { self.parse_block_body()? } else { Vec::new() };
+            return Ok(Stmt::Try { body, param, catch, finally });
+        }
+        if self.eat_kw(Kw::Class) {
+            let name = self.expect_ident()?;
+            self.expect_op("{")?;
+            let mut methods = Vec::new();
+            while !self.eat_op("}") {
+                if *self.peek() == Tok::Eof {
+                    return Err("unterminated class body".into());
+                }
+                let method = self.expect_ident()?;
+                let params = self.parse_params()?;
+                let body = self.parse_block_body()?;
+                methods.push((method, params, body));
+            }
+            return Ok(Stmt::ClassDecl { name, methods });
         }
         if self.eat_kw(Kw::Return) {
             let value = if matches!(self.peek(), Tok::Op(o) if o == ";") || *self.peek() == Tok::Eof
@@ -321,6 +361,18 @@ impl Parser {
             Tok::Kw(Kw::False) => Ok(Expr::Bool(false)),
             Tok::Kw(Kw::Null) => Ok(Expr::Null),
             Tok::Kw(Kw::Undefined) => Ok(Expr::Undefined),
+            Tok::Kw(Kw::This) => Ok(Expr::This),
+            Tok::Kw(Kw::New) => {
+                let callee = self.parse_primary()?;
+                let mut args = Vec::new();
+                if self.eat_op("(") {
+                    while !self.eat_op(")") {
+                        args.push(self.parse_expr()?);
+                        self.eat_op(",");
+                    }
+                }
+                Ok(Expr::New { callee: Box::new(callee), args })
+            }
             Tok::Op(op) if op == "(" => {
                 let e = self.parse_expr()?;
                 self.expect_op(")")?;
