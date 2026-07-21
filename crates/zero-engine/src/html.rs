@@ -240,22 +240,104 @@ impl Parser {
     }
 }
 
+/// The named references common enough to matter. Numeric references cover
+/// everything else, including every Indic codepoint.
+///
+/// ponytail: HTML5 defines ~2200 names; an unknown one is left as written,
+/// which reads as the source text rather than as a wrong character.
+const ENTITIES: &[(&str, char)] = &[
+    ("amp", '&'),
+    ("lt", '<'),
+    ("gt", '>'),
+    ("quot", '"'),
+    ("apos", '\''),
+    ("nbsp", '\u{a0}'),
+    ("mdash", '—'),
+    ("ndash", '–'),
+    ("hellip", '…'),
+    ("copy", '©'),
+    ("reg", '®'),
+    ("trade", '™'),
+    ("laquo", '«'),
+    ("raquo", '»'),
+    ("ldquo", '“'),
+    ("rdquo", '”'),
+    ("lsquo", '‘'),
+    ("rsquo", '’'),
+    ("times", '×'),
+    ("middot", '·'),
+    ("deg", '°'),
+    ("bull", '•'),
+    ("euro", '€'),
+    ("pound", '£'),
+    ("rupee", '₹'),
+];
+
+/// Decode character references in one pass.
+///
+/// One pass matters: replacing `&amp;` before `&lt;` would turn the *escaped*
+/// text `&amp;lt;` into a real `<`.
 fn decode_entities(s: &str) -> String {
     if !s.contains('&') {
         return s.to_string();
     }
-    s.replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&nbsp;", " ")
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(start) = rest.find('&') {
+        out.push_str(&rest[..start]);
+        let tail = &rest[start + 1..];
+        // A reference is short; anything longer is a stray ampersand.
+        match tail.find(';').filter(|end| *end <= 10) {
+            Some(end) => match decode_one(&tail[..end]) {
+                Some(c) => {
+                    out.push(c);
+                    rest = &tail[end + 1..];
+                }
+                None => {
+                    out.push('&'); // unknown name: leave it as the author wrote it
+                    rest = tail;
+                }
+            },
+            None => {
+                out.push('&');
+                rest = tail;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// One reference body (between `&` and `;`), named or numeric.
+fn decode_one(body: &str) -> Option<char> {
+    if let Some(digits) = body.strip_prefix('#') {
+        let code = match digits.strip_prefix(['x', 'X']) {
+            Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+            None => digits.parse().ok()?,
+        };
+        return char::from_u32(code);
+    }
+    ENTITIES.iter().find(|(name, _)| *name == body).map(|(_, c)| *c)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::dom::NodeType;
+
+    #[test]
+    fn decodes_named_and_numeric_references() {
+        assert_eq!(decode_entities("a &mdash; b"), "a — b");
+        assert_eq!(decode_entities("5 &times; 3 &deg;"), "5 × 3 °");
+        // Numeric, decimal and hex — this is how non-Latin text often arrives.
+        assert_eq!(decode_entities("&#2325;&#x915;"), "कक");
+        // Escaped markup decodes once, not twice.
+        assert_eq!(decode_entities("&amp;lt;b&amp;gt;"), "&lt;b&gt;");
+        // A stray ampersand, an unknown name, and a runaway `&` all survive.
+        assert_eq!(decode_entities("Tom & Jerry"), "Tom & Jerry");
+        assert_eq!(decode_entities("&nosuch;"), "&nosuch;");
+        assert_eq!(decode_entities("a&b"), "a&b");
+    }
 
     #[test]
     fn parses_nested_elements_and_attrs() {
