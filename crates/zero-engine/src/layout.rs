@@ -29,6 +29,16 @@ pub struct TextFragment {
     pub font_index: usize,
 }
 
+/// The painted area of an element, for hit-testing clicks against scripts.
+#[derive(Clone)]
+pub struct ElementRect {
+    pub node_id: usize,
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
 /// A clickable region for an `<a href>`, in absolute page coordinates.
 #[derive(Clone)]
 pub struct LinkArea {
@@ -421,6 +431,25 @@ fn collect_inline_text(bx: &LayoutBox, default_size: f32, href: Option<&str>, ou
     }
     for child in &bx.children {
         collect_inline_text(child, default_size, current_href.as_deref(), out);
+    }
+}
+
+/// Gather the painted box of every element, so the embedder can hit-test clicks.
+pub fn collect_element_rects(bx: &LayoutBox, out: &mut Vec<ElementRect>) {
+    if let BoxType::BlockNode(styled) | BoxType::InlineNode(styled) = bx.box_type {
+        if let NodeType::Element(ref e) = styled.node.node_type {
+            let b = bx.dimensions.border_box();
+            out.push(ElementRect {
+                node_id: e.node_id,
+                x: b.x,
+                y: b.y,
+                width: b.width,
+                height: b.height,
+            });
+        }
+    }
+    for child in &bx.children {
+        collect_element_rects(child, out);
     }
 }
 

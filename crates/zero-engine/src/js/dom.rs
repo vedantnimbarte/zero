@@ -12,6 +12,8 @@
 #[derive(Clone, Default)]
 pub struct ElementInfo {
     pub path: Vec<usize>,
+    /// Stable element identity (see `dom::ElementData::node_id`).
+    pub node_id: usize,
     pub id: String,
     pub tag: String,
     pub text: String,

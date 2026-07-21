@@ -20,6 +20,10 @@ pub enum NodeType {
 pub struct ElementData {
     pub tag_name: String,
     pub attributes: AttrMap,
+    /// Stable identity used by scripts and event dispatch. 0 means "not yet
+    /// assigned"; the document numbers new nodes without renumbering old ones,
+    /// so handlers registered earlier keep pointing at the same element.
+    pub node_id: usize,
 }
 
 pub fn text(data: String) -> Node {
@@ -27,7 +31,10 @@ pub fn text(data: String) -> Node {
 }
 
 pub fn elem(name: String, attributes: AttrMap, children: Vec<Node>) -> Node {
-    Node { children, node_type: NodeType::Element(ElementData { tag_name: name, attributes }) }
+    Node {
+        children,
+        node_type: NodeType::Element(ElementData { tag_name: name, attributes, node_id: 0 }),
+    }
 }
 
 impl ElementData {
