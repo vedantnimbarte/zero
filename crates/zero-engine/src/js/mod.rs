@@ -298,6 +298,33 @@ mod tests {
     }
 
     #[test]
+    fn query_selectors_find_elements_by_tag_class_and_id() {
+        let mut doc = crate::Document::load(
+            "<html><body>\
+               <p class='note'>one</p>\
+               <p class='note wide'>two</p>\
+               <div id='only' class='note'>three</div>\
+               <div id='out'>-</div>\
+               <script>\
+                 var paras = document.querySelectorAll('p');\
+                 var notes = document.getElementsByClassName('note');\
+                 var wide = document.querySelector('.wide');\
+                 var byId = document.querySelector('#only');\
+                 var missing = document.querySelector('.nope');\
+                 document.getElementById('out').textContent =\
+                   paras.length + '/' + notes.length + '/' + wide.textContent +\
+                   '/' + byId.tagName + '/' + missing;\
+               </script></body></html>",
+            "",
+        );
+        let out = doc.text_of(6); // the #out div
+        // 2 paragraphs, 3 elements carrying `note`, compound class match, id match,
+        // and a miss reads as null rather than erroring.
+        assert!(out.contains("2/3/two/DIV/null"), "got {out:?}");
+        assert!(doc.console.iter().all(|l| !l.contains("error")), "{:?}", doc.console);
+    }
+
+    #[test]
     fn class_name_can_be_read_and_restyled() {
         let mut doc = crate::Document::load(
             "<html><body><div id='box' class='idle'>x</div><div id='out'>-</div>\

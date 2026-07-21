@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html><head><style>
+body { background: #0e0f12; color: #f2f3f5; padding: 26px; font-size: 15px; }
+h1 { color: #e5484d; font-size: 26px; }
+h2 { color: #9a9da6; font-size: 13px; }
+.row { display: flex; gap: 10px; }
+.item { background: #17181c; padding: 12px; border-radius: 8px; flex-grow: 1; }
+.done { background: #30a46c; color: #06251a; padding: 12px; border-radius: 8px; flex-grow: 1; }
+.card { background: #1f2127; padding: 14px; border-radius: 8px; }
+</style></head><body>
+<h1>querySelector</h1>
+<h2>Tasks</h2>
+<div class="row">
+  <div class="item">write parser</div>
+  <div class="item">write layout</div>
+  <div class="item">write painter</div>
+  <div class="item">ship it</div>
+</div>
+<h2>Summary (built by script)</h2>
+<div id="summary" class="card">-</div>
+<script>
+  // Mark everything except the last item as done.
+  var items = document.getElementsByClassName('item');
+  var total = items.length;
+  for (var i = 0; i < total - 1; i++) {
+    items[i].className = 'done';
+  }
+
+  var done = document.querySelectorAll('.done');
+  var left = document.querySelectorAll('.item');
+  var names = [];
+  for (var j = 0; j < done.length; j++) {
+    names.push(done[j].textContent);
+  }
+  document.querySelector('#summary').textContent =
+    done.length + ' of ' + total + ' done (' + names.join(', ') + ') - ' +
+    left.length + ' remaining';
+</script>
+</body></html>
