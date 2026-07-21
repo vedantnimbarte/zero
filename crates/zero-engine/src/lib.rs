@@ -824,6 +824,7 @@ fn build_dom_view(root: &Node) -> js::DomView {
                 class: e.attributes.get("class").cloned().unwrap_or_default(),
                 tag: e.tag_name.clone(),
                 text: text_content(node),
+                attributes: e.attributes.clone(),
             });
         }
         for (i, child) in node.children.iter().enumerate() {

@@ -50,12 +50,52 @@ pub struct SimpleSelector {
     pub tag_name: Option<String>,
     pub id: Option<String>,
     pub class: Vec<String>,
+    pub attrs: Vec<AttrTest>,
+}
+
+/// An `[attr]`, `[attr=value]`, `[attr~=value]` … condition.
+#[derive(Debug)]
+pub struct AttrTest {
+    pub name: String,
+    pub op: AttrOp,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AttrOp {
+    /// `[attr]` — present at all.
+    Exists,
+    Equals,
+    /// `~=` — one of a space-separated list.
+    Includes,
+    Prefix,
+    Suffix,
+    Contains,
+}
+
+impl AttrTest {
+    /// Does an element's value for this attribute satisfy the test?
+    pub fn matches(&self, value: Option<&str>) -> bool {
+        let Some(value) = value else { return false };
+        match self.op {
+            AttrOp::Exists => true,
+            AttrOp::Equals => value == self.value,
+            AttrOp::Includes => value.split_whitespace().any(|part| part == self.value),
+            // An empty operand can never match, per the selectors spec.
+            AttrOp::Prefix => !self.value.is_empty() && value.starts_with(&self.value),
+            AttrOp::Suffix => !self.value.is_empty() && value.ends_with(&self.value),
+            AttrOp::Contains => !self.value.is_empty() && value.contains(&self.value),
+        }
+    }
 }
 
 impl SimpleSelector {
     /// True for `*` or for a compound we failed to read anything out of.
     pub fn is_empty(&self) -> bool {
-        self.tag_name.is_none() && self.id.is_none() && self.class.is_empty()
+        self.tag_name.is_none()
+            && self.id.is_none()
+            && self.class.is_empty()
+            && self.attrs.is_empty()
     }
 }
 
@@ -597,6 +637,7 @@ impl Parser {
             tag_name: None,
             id: None,
             class: Vec::new(),
+            attrs: Vec::new(),
         };
         loop {
             match self.next_char_or('\0') {
@@ -611,6 +652,10 @@ impl Parser {
                 '*' => {
                     self.consume_char();
                 }
+                '[' => match self.parse_attr_test() {
+                    Some(test) => selector.attrs.push(test),
+                    None => break, // malformed: let the caller drop the rule
+                },
                 // The one pseudo-class worth supporting: sheets define their
                 // custom properties on :root, and dropping it loses all of them.
                 ':' if self.starts_with(":root") => {
@@ -624,6 +669,55 @@ impl Parser {
             }
         }
         selector
+    }
+
+    /// `[name]`, `[name=value]`, `[name~="value"]` and friends.
+    fn parse_attr_test(&mut self) -> Option<AttrTest> {
+        self.consume_char(); // '['
+        self.consume_whitespace();
+        let name = self.parse_identifier().to_ascii_lowercase();
+        self.consume_whitespace();
+        if name.is_empty() {
+            return None;
+        }
+        if self.starts_with("]") {
+            self.consume_char();
+            return Some(AttrTest { name, op: AttrOp::Exists, value: String::new() });
+        }
+        let op = match self.next_char_or(' ') {
+            '=' => AttrOp::Equals,
+            '~' => AttrOp::Includes,
+            '^' => AttrOp::Prefix,
+            '$' => AttrOp::Suffix,
+            '*' => AttrOp::Contains,
+            _ => return None,
+        };
+        self.consume_char();
+        if op != AttrOp::Equals {
+            if self.next_char_or(' ') != '=' {
+                return None;
+            }
+            self.consume_char();
+        }
+        self.consume_whitespace();
+        // The value may be quoted, and either quote is allowed.
+        let value = match self.next_char_or(' ') {
+            quote @ ('"' | '\'') => {
+                self.consume_char();
+                let value = self.consume_while(|c| c != quote);
+                self.consume_char(); // closing quote
+                value
+            }
+            _ => self.consume_while(|c| c != ']' && !c.is_whitespace()),
+        };
+        self.consume_whitespace();
+        // A case-insensitivity flag (`i`) is accepted but not honoured.
+        self.consume_while(|c| c != ']');
+        if !self.starts_with("]") {
+            return None;
+        }
+        self.consume_char();
+        Some(AttrTest { name, op, value })
     }
 
     fn parse_declarations(&mut self) -> Vec<Declaration> {

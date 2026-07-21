@@ -22,6 +22,9 @@ pub struct ElementInfo {
     pub class: String,
     pub tag: String,
     pub text: String,
+    /// Every attribute, so attribute selectors mean the same thing here as in
+    /// the style tree.
+    pub attributes: std::collections::HashMap<String, String>,
 }
 
 /// A snapshot of every element in the document, in tree order.
@@ -94,6 +97,10 @@ impl crate::style::Matchable for ElementInfo {
 
     fn has_class(&self, class: &str) -> bool {
         self.class.split_whitespace().any(|c| c == class)
+    }
+
+    fn attr(&self, name: &str) -> Option<&str> {
+        self.attributes.get(name).map(String::as_str)
     }
 }
 

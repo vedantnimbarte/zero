@@ -91,6 +91,7 @@ pub trait Matchable {
     fn tag(&self) -> &str;
     fn elem_id(&self) -> Option<&str>;
     fn has_class(&self, class: &str) -> bool;
+    fn attr(&self, name: &str) -> Option<&str>;
 }
 
 impl Matchable for ElementData {
@@ -104,6 +105,10 @@ impl Matchable for ElementData {
 
     fn has_class(&self, class: &str) -> bool {
         self.classes().contains(class)
+    }
+
+    fn attr(&self, name: &str) -> Option<&str> {
+        self.attributes.get(name).map(String::as_str)
     }
 }
 
@@ -147,7 +152,10 @@ fn matches_simple_selector<E: Matchable>(elem: &E, selector: &SimpleSelector) ->
     if selector.id.iter().any(|id| elem.elem_id() != Some(id.as_str())) {
         return false;
     }
-    !selector.class.iter().any(|class| !elem.has_class(class))
+    if selector.class.iter().any(|class| !elem.has_class(class)) {
+        return false;
+    }
+    selector.attrs.iter().all(|test| test.matches(elem.attr(&test.name)))
 }
 
 type MatchedRule<'a> = (Specificity, &'a Rule);
@@ -393,6 +401,31 @@ mod tests {
     }
 
     const RED: Value = Value::ColorValue(crate::css::Color { r: 255, g: 0, b: 0, a: 255 });
+
+    #[test]
+    fn attribute_selectors_match_on_value() {
+        let html = "<body><input type=\"text\" name=\"q\">                    <input type=\"submit\">                    <a href=\"https://a.com/x.pdf\" rel=\"nofollow noopener\">link</a></body>";
+        let css = "[type=text] { color: #ff0000; }                    input[type=\"submit\"] { color: #00ff00; }                    a[href$=\".pdf\"] { color: #0000ff; }                    a[rel~=noopener] { background-color: #111111; }                    [name] { padding: 4px; }                    a[href^=\"ftp\"] { color: #ffffff; }";
+        let dom = crate::html::parse(html.to_string());
+        let sheet = crate::css::parse(css.to_string());
+        let styled = style_tree(&dom, &sheet);
+        let color = |i: usize| styled.children[i].value("color");
+        let rgb = |r, g, b| {
+            Some(Value::ColorValue(crate::css::Color { r, g, b, a: 255 }))
+        };
+
+        assert_eq!(color(0), rgb(255, 0, 0)); // [type=text]
+        assert_eq!(color(1), rgb(0, 255, 0)); // input[type="submit"]
+        assert_eq!(color(2), rgb(0, 0, 255)); // suffix match on href
+        // `~=` matches one word of a space-separated list.
+        assert_eq!(
+            styled.children[2].value("background-color"),
+            Some(Value::ColorValue(crate::css::Color { r: 17, g: 17, b: 17, a: 255 }))
+        );
+        // Presence alone, and a prefix that does not match.
+        assert_eq!(styled.children[0].value("padding"), Some(Value::Length(4.0, Unit::Px)));
+        assert_eq!(styled.children[1].value("padding"), None);
+    }
 
     #[test]
     fn html_attributes_style_elements_but_css_still_wins() {
