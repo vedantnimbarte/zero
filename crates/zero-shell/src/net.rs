@@ -4,13 +4,60 @@
 //! tracker blocking lives at this layer (see [`crate::blocker`]).
 
 use crate::blocker;
-use std::cell::Cell;
+use crate::cookies::{site_of, CookieJar};
+use std::cell::{Cell, RefCell};
 use std::fs;
 use std::io::Read;
 use std::rc::Rc;
 
 pub fn is_url(s: &str) -> bool {
     s.starts_with("http://") || s.starts_with("https://")
+}
+
+thread_local! {
+    /// One jar for the process, loaded once and written back after each response.
+    static JAR: RefCell<CookieJar> = RefCell::new(
+        crate::storage::profile_dir()
+            .map(|dir| CookieJar::load(&dir))
+            .unwrap_or_default(),
+    );
+    /// The site being visited, which partitions every cookie for this page.
+    static PARTITION: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+/// Set the top-level site that subsequent requests belong to.
+pub fn set_partition(url: &str) {
+    PARTITION.with(|p| *p.borrow_mut() = site_of(url));
+}
+
+fn partition() -> String {
+    PARTITION.with(|p| p.borrow().clone())
+}
+
+/// Attach any cookies this request should carry.
+fn with_cookies(url: &str, request: ureq::Request) -> ureq::Request {
+    match JAR.with(|jar| jar.borrow().header_for(&partition(), url)) {
+        Some(header) => request.set("Cookie", &header),
+        None => request,
+    }
+}
+
+/// Record `Set-Cookie` headers from a response, then persist the jar.
+fn absorb_cookies(url: &str, response: &ureq::Response) {
+    let headers = response.all("set-cookie");
+    if headers.is_empty() {
+        return;
+    }
+    let site = partition();
+    JAR.with(|jar| {
+        let mut jar = jar.borrow_mut();
+        for header in headers {
+            jar.store(&site, url, header);
+        }
+        if let Some(dir) = crate::storage::profile_dir() {
+            jar.save(&dir);
+        }
+    });
 }
 
 /// Loads `<img>` bytes for the engine, resolving relative URLs against the page.
@@ -57,7 +104,9 @@ impl zero_engine::ResourceLoader for ShellLoader {
 }
 
 fn fetch_bytes(url: &str) -> Option<impl Read> {
-    ureq::get(url).call().ok().map(|r| r.into_reader())
+    let response = with_cookies(url, ureq::get(url)).call().ok()?;
+    absorb_cookies(url, &response);
+    Some(response.into_reader())
 }
 
 /// Resolve a possibly-relative resource URL against a base page URL or file path.
@@ -113,7 +162,9 @@ pub struct Fetched {
 /// ponytail: blocking call on the UI thread — fine for now; move off-thread if it stalls.
 fn try_fetch(url: &str) -> Option<String> {
     eprintln!("fetching {url} ...");
-    ureq::get(url).call().ok()?.into_string().ok()
+    let response = with_cookies(url, ureq::get(url)).call().ok()?;
+    absorb_cookies(url, &response);
+    response.into_string().ok()
 }
 
 /// Load a page, preferring HTTPS.
@@ -122,6 +173,8 @@ fn try_fetch(url: &str) -> Option<String> {
 /// cleartext if the secure attempt actually fails — so users get encryption by
 /// default without breaking sites that genuinely have no HTTPS.
 pub fn load_target(target: &str) -> Fetched {
+    // Cookies are keyed by the site being visited, so set that before fetching.
+    set_partition(target);
     if !is_url(target) {
         let body = fs::read_to_string(target)
             .unwrap_or_else(|e| error_page("Cannot open", &format!("{target}: {e}")));

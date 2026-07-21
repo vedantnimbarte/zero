@@ -16,6 +16,7 @@
 mod ai;
 mod app;
 mod blocker;
+mod cookies;
 mod fonts;
 mod net;
 mod storage;
