@@ -221,6 +221,32 @@ impl App {
 
     fn handle_key(&mut self, event: KeyEvent) {
         let ctrl = self.modifiers.control_key();
+        // A focused page field owns plain typing; chords still reach the browser.
+        if !ctrl && self.tab().doc.is_focused() {
+            let handled = match event.logical_key {
+                Key::Named(NamedKey::Backspace) => self.tab_mut().doc.backspace(),
+                Key::Named(NamedKey::Escape) => {
+                    self.tab_mut().doc.blur();
+                    true
+                }
+                Key::Named(NamedKey::Enter) => {
+                    self.tab_mut().doc.blur();
+                    true
+                }
+                _ => match &event.text {
+                    Some(text) => {
+                        let typed: String =
+                            text.chars().filter(|c| !c.is_control()).collect();
+                        !typed.is_empty() && self.tab_mut().doc.insert_text(&typed)
+                    }
+                    None => false,
+                },
+            };
+            if handled {
+                self.tab_mut().page_canvas = None; // field text changed
+                return;
+            }
+        }
         match event.logical_key {
             Key::Character(ref c) if ctrl => match c.as_str() {
                 "t" => self.new_tab(),
@@ -283,6 +309,7 @@ impl App {
         // Window coords -> page coords (undo chrome offsets, add scroll).
         let px = cx - SIDEBAR_W as f32;
         let py = cy - TOOLBAR_H as f32 + self.tab().scroll_y;
+        self.tab_mut().doc.blur(); // clicking the page clears focus unless a field is hit
         // Innermost element wins, so a handler on a child beats one on its parent.
         let hit = self
             .tab()
@@ -293,6 +320,13 @@ impl App {
             .next_back();
         if let Some(node_id) = hit {
             let tab = self.tab_mut();
+            // Focus a text field so typing goes to the page instead of the address bar.
+            if tab.doc.focus(node_id) {
+                tab.page_canvas = None;
+                self.request_redraw();
+                return;
+            }
+            tab.doc.blur();
             if tab.doc.click(node_id) {
                 tab.page_canvas = None; // handler may have changed the DOM
                 self.request_redraw();
