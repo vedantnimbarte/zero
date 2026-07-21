@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html><head><style>
+body { background: #0e0f12; color: #f2f3f5; padding: 26px; font-size: 15px; }
+h1 { color: #e5484d; font-size: 26px; }
+h2 { color: #9a9da6; font-size: 13px; }
+.field { background: #fff; color: #111; padding: 9px; border-radius: 6px; width: 340px; }
+.card { background: #17181c; padding: 14px; border-radius: 8px; width: 480px; }
+.btn { display: inline-block; background: #30a46c; color: #06251a; padding: 10px;
+       border-radius: 6px; width: 130px; }
+</style></head><body>
+<h1>localStorage</h1>
+<h2>Type a note, save it, then reload the page - it comes back</h2>
+<input id="note" class="field" placeholder="a note to remember">
+<p><span id="save" class="btn">Save</span> <span id="wipe" class="btn">Clear</span></p>
+<div id="out" class="card">loading...</div>
+<script>
+  var out = document.getElementById('out');
+  var note = document.getElementById('note');
+
+  var visits = localStorage.getItem('visits');
+  var count = visits === null ? 1 : (visits * 1) + 1;
+  localStorage.setItem('visits', count + '');
+
+  function show() {
+    var saved = localStorage.getItem('note');
+    var text = saved === null ? '(nothing saved)' : saved;
+    out.textContent = 'visit #' + count + '  -  saved note: ' + text;
+  }
+  show();
+
+  document.getElementById('save').onclick = function () {
+    localStorage.setItem('note', note.value);
+    show();
+  };
+  document.getElementById('wipe').onclick = function () {
+    localStorage.clear();
+    show();
+  };
+</script>
+</body></html>
