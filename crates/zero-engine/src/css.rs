@@ -42,12 +42,41 @@ pub struct Declaration {
 pub enum Value {
     Keyword(String),
     Length(f32, Unit),
+    /// A unitless number, e.g. `flex-grow: 2` or `opacity: 0.5`.
+    Number(f32),
     ColorValue(Color),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Unit {
     Px,
+    /// Relative to the element's own font size.
+    Em,
+    /// Relative to the root font size.
+    Rem,
+    /// Relative to a context-dependent base, usually the containing block's width.
+    Percent,
+}
+
+/// What relative lengths resolve against. Percentages normally use the containing
+/// block's width; `em` uses the element's own computed font size.
+#[derive(Debug, Clone, Copy)]
+pub struct LengthContext {
+    pub percent_base: f32,
+    pub font_size: f32,
+    pub root_font_size: f32,
+}
+
+pub const DEFAULT_FONT_SIZE: f32 = 16.0;
+
+impl Default for LengthContext {
+    fn default() -> Self {
+        LengthContext {
+            percent_base: 0.0,
+            font_size: DEFAULT_FONT_SIZE,
+            root_font_size: DEFAULT_FONT_SIZE,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -69,11 +98,28 @@ impl Selector {
 }
 
 impl Value {
-    /// Length in px; anything non-length (keywords, colors) resolves to 0.
-    pub fn to_px(&self) -> f32 {
+    /// Absolute px, resolving relative units against `ctx`.
+    pub fn resolve(&self, ctx: LengthContext) -> f32 {
         match *self {
-            Value::Length(f, Unit::Px) => f,
+            Value::Length(v, Unit::Px) => v,
+            Value::Length(v, Unit::Em) => v * ctx.font_size,
+            Value::Length(v, Unit::Rem) => v * ctx.root_font_size,
+            Value::Length(v, Unit::Percent) => v / 100.0 * ctx.percent_base,
+            Value::Number(n) => n,
             _ => 0.0,
+        }
+    }
+
+    /// Absolute px for values that need no context. Relative units resolve to 0,
+    /// so prefer [`Value::resolve`] anywhere a context is available.
+    pub fn to_px(&self) -> f32 {
+        self.resolve(LengthContext::default())
+    }
+
+    pub fn as_number(&self) -> Option<f32> {
+        match *self {
+            Value::Number(n) => Some(n),
+            _ => None,
         }
     }
 }
@@ -95,8 +141,20 @@ fn classify_value(s: &str) -> Option<Value> {
     if let Some(hex) = s.strip_prefix('#') {
         return parse_hex_color(hex);
     }
-    if let Some(num) = s.strip_suffix("px") {
-        return num.trim().parse::<f32>().ok().map(|f| Value::Length(f, Unit::Px));
+    for (suffix, unit) in
+        [("px", Unit::Px), ("rem", Unit::Rem), ("em", Unit::Em), ("%", Unit::Percent)]
+    {
+        // Only a *numeric* prefix makes this a length; otherwise fall through so
+        // keywords that merely end in a unit name (e.g. `system`) still parse.
+        if let Some(num) = s.strip_suffix(suffix) {
+            if let Ok(f) = num.trim().parse::<f32>() {
+                return Some(Value::Length(f, unit));
+            }
+        }
+    }
+    // A bare number (flex-grow, opacity, line-height, z-index).
+    if let Ok(n) = s.parse::<f32>() {
+        return Some(Value::Number(n));
     }
     // A single bare keyword (e.g. `block`, `auto`). A CSS identifier can't start with
     // a digit, so digit-prefixed tokens with unknown units (`60vw`, `5em`) are rejected
@@ -340,6 +398,28 @@ mod tests {
     }
 
     #[test]
+    fn parses_relative_units_and_numbers() {
+        let s = parse(
+            ".a { width: 50%; padding: 1.5em; margin: 2rem; flex-grow: 2; line-height: 1.4; }"
+                .to_string(),
+        );
+        let d = &s.rules[0].declarations;
+        assert_eq!(d[0].value, Value::Length(50.0, Unit::Percent));
+        assert_eq!(d[1].value, Value::Length(1.5, Unit::Em));
+        assert_eq!(d[2].value, Value::Length(2.0, Unit::Rem));
+        assert_eq!(d[3].value, Value::Number(2.0));
+        assert_eq!(d[4].value, Value::Number(1.4));
+    }
+
+    #[test]
+    fn resolves_relative_units() {
+        let ctx = LengthContext { percent_base: 800.0, font_size: 20.0, root_font_size: 16.0 };
+        assert_eq!(Value::Length(50.0, Unit::Percent).resolve(ctx), 400.0);
+        assert_eq!(Value::Length(1.5, Unit::Em).resolve(ctx), 30.0);
+        assert_eq!(Value::Length(2.0, Unit::Rem).resolve(ctx), 32.0);
+    }
+
+    #[test]
     fn skips_unsupported_without_panic() {
         // Complex selector, at-rule, rgb(), % — all dropped; the plain rule survives.
         let s = parse(
@@ -350,8 +430,7 @@ mod tests {
                 .to_string(),
         );
         assert_eq!(s.rules.len(), 1); // only `.ok`
-        let ok = &s.rules[0];
-        // `width: 50%` dropped (unsupported unit); color + padding kept.
-        assert_eq!(ok.declarations.len(), 2);
+        // color + width(%) + padding all understood now.
+        assert_eq!(s.rules[0].declarations.len(), 3);
     }
 }
