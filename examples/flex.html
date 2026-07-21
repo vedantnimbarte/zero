@@ -7,10 +7,10 @@
         h2 { color: #9a9da6; font-size: 15px; }
 
         .row { display: flex; gap: 12px; }
-        .card { background: #17181c; padding: 16px; }
+        .card { background: #17181c; padding: 16px; flex-grow: 1; }
         .sidebar { display: flex; gap: 12px; }
         .rail { background: #e5484d; color: #ffffff; width: 180px; padding: 16px; }
-        .main { background: #1f2127; padding: 16px; }
+        .main { background: #1f2127; padding: 16px; flex-grow: 1; }
         .col { display: flex; flex-direction: column; gap: 8px; }
         .chip { background: #30a46c; color: #0e0f12; padding: 10px; }
     </style>
@@ -18,7 +18,7 @@
 <body>
     <h1>Flexbox layout</h1>
 
-    <h2>Three equal columns (all auto width)</h2>
+    <h2>Three equal columns (flex-grow: 1)</h2>
     <div class="row">
         <div class="card">First column shares the space equally with its siblings.</div>
         <div class="card">Second column, same treatment.</div>
@@ -29,6 +29,12 @@
     <div class="sidebar">
         <div class="rail">Fixed 180px</div>
         <div class="main">This panel absorbs whatever width is left over, which is how real page shells are built.</div>
+    </div>
+
+    <h2>Content-sized items (no flex-grow) hug their text</h2>
+    <div class="row">
+        <div class="chip">short</div>
+        <div class="chip">a somewhat longer chip</div>
     </div>
 
     <h2>Column direction with gap</h2>
