@@ -13,6 +13,7 @@
 //!   +----------+---------------------------+
 //! ```
 
+use crate::ai::{Assistant, LocalAssistant, PageContext};
 use crate::net::{load_target, normalize_target, resolve_url, ShellLoader};
 use std::num::NonZeroU32;
 use std::rc::Rc;
@@ -28,9 +29,12 @@ const SIDEBAR_W: u32 = 220;
 const SIDEBAR_HEAD_H: u32 = 44; // header row height, so tab hit-testing is exact
 const TAB_ROW_H: u32 = 40; // padding(10*2) + height(20)
 const TOOLBAR_H: u32 = 48;
+const AI_PANEL_W: u32 = 320;
 
 const TOOLBAR_CSS: &str =
     "body{background:#1f2127;color:#f2f3f5;font-size:16px;} #bar{padding:14px;height:20px;}";
+
+const AI_CSS: &str = "body{background:#141519;color:#c9ccd3;font-size:14px;}      #head{background:#26282f;color:#f2f3f5;padding:12px;height:20px;}      .line{padding:2px;} .src{color:#6b7280;padding:10px;}";
 
 const NEW_TAB_HTML: &str = "<html><head><style>\
     body{background:#0e0f12;color:#f2f3f5;padding:48px;font-size:18px;}\
@@ -109,6 +113,8 @@ pub fn run_window(engine: Engine, html: String, css: String, address: String) {
         active: 0,
         modifiers: ModifiersState::default(),
         cursor: (0.0, 0.0),
+        ai_open: false,
+        ai_text: String::new(),
         window: None,
         surface: None,
     };
@@ -121,6 +127,8 @@ struct App {
     active: usize,
     modifiers: ModifiersState,
     cursor: (f32, f32),
+    ai_open: bool,
+    ai_text: String,
     window: Option<Rc<Window>>,
     surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
 }
@@ -217,6 +225,7 @@ impl App {
             Key::Character(ref c) if ctrl => match c.as_str() {
                 "t" => self.new_tab(),
                 "w" => self.close_tab(),
+                "i" => self.toggle_assistant(),
                 _ => {}
             },
             Key::Named(NamedKey::Tab) if ctrl => self.next_tab(),
@@ -261,6 +270,14 @@ impl App {
         }
         if cy < TOOLBAR_H as f32 {
             return; // toolbar clicks don't navigate
+        }
+        if self.ai_open {
+            let panel_x0 = self.window.as_ref().map(|w| w.inner_size().width).unwrap_or(0)
+                as f32
+                - AI_PANEL_W as f32;
+            if cx >= panel_x0 {
+                return; // clicks in the assistant panel aren't page clicks
+            }
         }
 
         // Window coords -> page coords (undo chrome offsets, add scroll).
@@ -354,6 +371,43 @@ impl App {
         if let Some(window) = &self.window {
             window.set_title(&format!("Zero Browser — {title}"));
         }
+        if self.ai_open {
+            self.run_assistant(); // keep the panel in sync with the new page
+        }
+    }
+
+    // --- assistant ---
+
+    fn toggle_assistant(&mut self) {
+        self.ai_open = !self.ai_open;
+        if self.ai_open {
+            self.run_assistant();
+        }
+    }
+
+    /// Build the page context and ask the assistant. Runs on-device by default.
+    fn run_assistant(&mut self) {
+        let tab = self.tab();
+        let ctx = PageContext {
+            url: tab.address.clone(),
+            text: tab.doc.page_text(),
+            headings: tab.doc.headings(),
+            blocked_trackers: tab.blocked_count,
+            secure: tab.secure,
+        };
+        let assistant = LocalAssistant;
+        self.ai_text = format!("{}
+
+[{}]", assistant.respond(&ctx), assistant.provenance());
+    }
+
+    fn ai_html(&self) -> String {
+        let body: String = self
+            .ai_text
+            .lines()
+            .map(|line| format!("<div class=\"line\">{}</div>", escape(line)))
+            .collect();
+        format!("<html><body><div id=\"head\">Assistant</div>{body}</body></html>")
     }
 
     // --- chrome, rendered by the engine ---
@@ -404,7 +458,9 @@ impl App {
             None => return,
         };
         let sw = SIDEBAR_W.min(w);
-        let content_w = w.saturating_sub(sw).max(1);
+        // The assistant panel takes width from the content area, so the page reflows.
+        let aw = if self.ai_open { AI_PANEL_W.min(w.saturating_sub(sw)) } else { 0 };
+        let content_w = w.saturating_sub(sw + aw).max(1);
         let tb = TOOLBAR_H.min(h);
         let page_vh = h.saturating_sub(tb).max(1);
 
@@ -443,6 +499,11 @@ impl App {
             self.engine.render(&self.sidebar_html(), &Self::sidebar_css(h), sw as f32, h as f32);
         let toolbar =
             self.engine.render(&self.toolbar_html(), TOOLBAR_CSS, content_w as f32, tb as f32);
+        let ai_panel = if aw > 0 {
+            Some(self.engine.render(&self.ai_html(), AI_CSS, aw as f32, h as f32))
+        } else {
+            None
+        };
 
         // Disjoint field borrows: tabs (shared) + surface (mut).
         let page = self.tabs[self.active].page_canvas.as_ref().unwrap();
@@ -455,11 +516,15 @@ impl App {
             .expect("surface resize");
         let mut buffer = surface.buffer_mut().expect("surface buffer");
 
-        let (w, sw, tb) = (w as usize, sw as usize, tb as usize);
+        let (w, sw, tb, aw) = (w as usize, sw as usize, tb as usize, aw as usize);
+        let ai_x0 = w - aw; // panel occupies the right edge
         for y in 0..h as usize {
             for x in 0..w {
                 let px = if x < sw {
                     sidebar.pixels[y * sidebar.width + x]
+                } else if aw > 0 && x >= ai_x0 {
+                    let panel = ai_panel.as_ref().unwrap();
+                    panel.pixels[y * panel.width + (x - ai_x0)]
                 } else if y < tb {
                     toolbar.pixels[y * toolbar.width + (x - sw)]
                 } else {
