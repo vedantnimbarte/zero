@@ -160,8 +160,9 @@ pub struct Interp {
     env: EnvRef,
     depth: usize,
     dom: DomView,
-    /// Click handlers, keyed by stable element node_id so they survive re-renders.
-    handlers: HashMap<usize, Value>,
+    /// Event handlers keyed by (element node_id, event type), so they survive
+    /// re-renders and one element can listen for several events.
+    handlers: HashMap<(usize, String), Value>,
     /// Callbacks queued by setTimeout, ordered by delay then insertion.
     timers: Vec<(f64, usize, Value)>,
     timer_seq: usize,
@@ -240,13 +241,13 @@ impl Interp {
         self.dom = dom;
     }
 
-    pub fn has_handler(&self, node_id: usize) -> bool {
-        self.handlers.contains_key(&node_id)
+    pub fn has_handler(&self, node_id: usize, event: &str) -> bool {
+        self.handlers.contains_key(&(node_id, event.to_string()))
     }
 
-    /// Fire the click handler for an element. Returns false if it has none.
-    pub fn dispatch_click(&mut self, node_id: usize) -> bool {
-        let handler = match self.handlers.get(&node_id) {
+    /// Fire an element's handler for `event`. Returns false if it has none.
+    pub fn dispatch(&mut self, node_id: usize, event: &str) -> bool {
+        let handler = match self.handlers.get(&(node_id, event.to_string())) {
             Some(h) => h.clone(),
             None => return false,
         };
@@ -611,9 +612,10 @@ impl Interp {
                                 self.out.field_writes.push((id, v.to_display()));
                             }
                         }
-                        "onclick" => {
+                        // `onclick`, `oninput`, `onchange`, ... all register the same way.
+                        name if name.starts_with("on") => {
                             if let Some(id) = self.node_id_of(i) {
-                                self.handlers.insert(id, v);
+                                self.handlers.insert((id, name[2..].to_string()), v);
                             }
                         }
                         "textContent" | "innerText" => {
@@ -621,6 +623,10 @@ impl Interp {
                         }
                         "innerHTML" => {
                             self.out.mutations.push(Mutation::SetHtml(i, v.to_display()))
+                        }
+                        // Restyling: swapping the class re-runs the cascade for this node.
+                        "className" => {
+                            self.out.mutations.push(Mutation::SetClass(i, v.to_display()))
                         }
                         _ => {} // other properties aren't modelled yet
                     },
@@ -686,12 +692,11 @@ impl Interp {
                 Value::Str(joined)
             }
             (Value::Element(i), "addEventListener") => {
-                let is_click = args.first().map(Value::to_display).as_deref() == Some("click");
-                match (is_click, args.get(1), self.node_id_of(*i)) {
-                    (true, Some(f), Some(id)) => {
-                        self.handlers.insert(id, f.clone());
-                    }
-                    _ => {} // only click is supported for now
+                let event = args.first().map(Value::to_display);
+                if let (Some(event), Some(f), Some(id)) =
+                    (event, args.get(1), self.node_id_of(*i))
+                {
+                    self.handlers.insert((id, event), f.clone());
                 }
                 Value::Undefined
             }
@@ -712,6 +717,7 @@ impl Interp {
             "value" => Value::Str(element.text.trim_end_matches('|').to_string()),
             "textContent" | "innerText" | "innerHTML" => Value::Str(element.text.clone()),
             "id" => Value::Str(element.id.clone()),
+            "className" => Value::Str(element.class.clone()),
             "tagName" => Value::Str(element.tag.to_ascii_uppercase()),
             _ => Value::Undefined,
         }

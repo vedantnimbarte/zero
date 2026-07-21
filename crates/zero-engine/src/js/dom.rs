@@ -15,6 +15,7 @@ pub struct ElementInfo {
     /// Stable element identity (see `dom::ElementData::node_id`).
     pub node_id: usize,
     pub id: String,
+    pub class: String,
     pub tag: String,
     pub text: String,
 }
@@ -48,4 +49,6 @@ pub enum Mutation {
     SetText(usize, String),
     /// Replace children with parsed HTML.
     SetHtml(usize, String),
+    /// Replace the element's `class` attribute, restyling it.
+    SetClass(usize, String),
 }
