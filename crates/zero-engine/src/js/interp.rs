@@ -1,14 +1,63 @@
 //! Tree-walking evaluator.
 //!
+//! Scopes form an environment chain, so a function captures the scope it was
+//! defined in — that is what makes closures work.
+//!
 //! ponytail: a straightforward AST interpreter — no bytecode VM, inline caches, or
-//! JIT (those are Phase 2/3 in docs/01-ARCHITECTURE.md §4). Scopes are a simple
-//! stack, so functions see globals and their own locals but do NOT capture their
-//! defining environment: real closures need an environment chain.
+//! JIT (those are Phase 2/3 in docs/01-ARCHITECTURE.md §4). No prototypes: objects
+//! are plain maps and only a handful of built-in methods exist.
 
 use super::dom::{DomView, Mutation};
 use super::parser::{Expr, Stmt};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+
+type EnvRef = Rc<RefCell<Env>>;
+
+/// One lexical scope, linked to the scope enclosing it.
+pub struct Env {
+    vars: HashMap<String, Value>,
+    parent: Option<EnvRef>,
+}
+
+impl Env {
+    fn root() -> EnvRef {
+        Rc::new(RefCell::new(Env { vars: HashMap::new(), parent: None }))
+    }
+
+    fn child(parent: &EnvRef) -> EnvRef {
+        Rc::new(RefCell::new(Env { vars: HashMap::new(), parent: Some(parent.clone()) }))
+    }
+
+    fn get(env: &EnvRef, name: &str) -> Option<Value> {
+        let e = env.borrow();
+        match e.vars.get(name) {
+            Some(v) => Some(v.clone()),
+            None => e.parent.as_ref().and_then(|p| Env::get(p, name)),
+        }
+    }
+
+    /// Assign to an existing binding somewhere up the chain; returns false if unbound.
+    fn set(env: &EnvRef, name: &str, value: Value) -> bool {
+        let mut e = env.borrow_mut();
+        if e.vars.contains_key(name) {
+            e.vars.insert(name.to_string(), value);
+            return true;
+        }
+        match e.parent.clone() {
+            Some(parent) => {
+                drop(e); // release before recursing
+                Env::set(&parent, name, value)
+            }
+            None => false,
+        }
+    }
+
+    fn define(env: &EnvRef, name: String, value: Value) {
+        env.borrow_mut().vars.insert(name, value);
+    }
+}
 
 #[derive(Clone)]
 pub enum Value {
@@ -20,8 +69,8 @@ pub enum Value {
     Func(Rc<FuncData>),
     /// A built-in implemented in Rust (console.log, document.write, ...).
     Native(&'static str),
-    /// A namespace object like `console`; property -> value.
-    Object(Rc<HashMap<String, Value>>),
+    Object(Rc<RefCell<HashMap<String, Value>>>),
+    Array(Rc<RefCell<Vec<Value>>>),
     /// A handle into the document snapshot (see [`super::dom`]).
     Element(usize),
 }
@@ -29,6 +78,8 @@ pub enum Value {
 pub struct FuncData {
     pub params: Vec<String>,
     pub body: Vec<Stmt>,
+    /// The scope this function was created in — the essence of a closure.
+    closure: EnvRef,
 }
 
 impl Value {
@@ -46,7 +97,10 @@ impl Value {
             Value::Null => "null".into(),
             Value::Undefined => "undefined".into(),
             Value::Func(_) | Value::Native(_) => "function".into(),
-            Value::Object(_) => "[object]".into(),
+            Value::Array(items) => {
+                items.borrow().iter().map(Value::to_display).collect::<Vec<_>>().join(",")
+            }
+            Value::Object(_) => "[object Object]".into(),
             Value::Element(_) => "[object HTMLElement]".into(),
         }
     }
@@ -89,9 +143,16 @@ pub struct Output {
 }
 
 pub struct Interp {
-    scopes: Vec<HashMap<String, Value>>,
+    env: EnvRef,
+    depth: usize,
     dom: DomView,
     pub out: Output,
+}
+
+fn namespace(entries: &[(&str, &'static str)]) -> Value {
+    let map: HashMap<String, Value> =
+        entries.iter().map(|(k, v)| (k.to_string(), Value::Native(v))).collect();
+    Value::Object(Rc::new(RefCell::new(map)))
 }
 
 impl Interp {
@@ -100,33 +161,25 @@ impl Interp {
     }
 
     pub fn with_dom(dom: DomView) -> Interp {
-        let mut globals = HashMap::new();
-        globals.insert(
-            "console".to_string(),
-            Value::Object(Rc::new(HashMap::from([(
-                "log".to_string(),
-                Value::Native("console.log"),
-            )]))),
+        let env = Env::root();
+        Env::define(&env, "console".into(), namespace(&[("log", "console.log")]));
+        Env::define(
+            &env,
+            "document".into(),
+            namespace(&[
+                ("write", "document.write"),
+                ("getElementById", "document.getElementById"),
+            ]),
         );
-        globals.insert(
-            "document".to_string(),
-            Value::Object(Rc::new(HashMap::from([(
-                "write".to_string(),
-                Value::Native("document.write"),
-            ), (
-                "getElementById".to_string(),
-                Value::Native("document.getElementById"),
-            )]))),
-        );
-        Interp { scopes: vec![globals], dom, out: Output::default() }
+        Interp { env, depth: 0, dom, out: Output::default() }
     }
 
     pub fn run(&mut self, program: &[Stmt]) {
         // Hoist function declarations so they can be called before their definition.
         for stmt in program {
             if let Stmt::FuncDecl { name, params, body } = stmt {
-                let f = Value::Func(Rc::new(FuncData { params: params.clone(), body: body.clone() }));
-                self.define(name.clone(), f);
+                let f = self.make_function(params.clone(), body.clone());
+                Env::define(&self.env, name.clone(), f);
             }
         }
         for stmt in program {
@@ -141,22 +194,20 @@ impl Interp {
         }
     }
 
-    fn define(&mut self, name: String, value: Value) {
-        self.scopes.last_mut().expect("a scope always exists").insert(name, value);
+    fn make_function(&self, params: Vec<String>, body: Vec<Stmt>) -> Value {
+        Value::Func(Rc::new(FuncData { params, body, closure: self.env.clone() }))
     }
 
-    fn lookup(&self, name: &str) -> Option<Value> {
-        self.scopes.iter().rev().find_map(|s| s.get(name).cloned())
-    }
-
-    fn assign(&mut self, name: &str, value: Value) {
-        for scope in self.scopes.iter_mut().rev() {
-            if scope.contains_key(name) {
-                scope.insert(name.to_string(), value);
-                return;
-            }
-        }
-        self.define(name.to_string(), value); // implicit global
+    /// Run `body` in a fresh child scope, restoring the previous scope afterwards.
+    fn in_child_scope(
+        &mut self,
+        run: impl FnOnce(&mut Self) -> Result<Flow, String>,
+    ) -> Result<Flow, String> {
+        let saved = self.env.clone();
+        self.env = Env::child(&saved);
+        let result = run(self);
+        self.env = saved;
+        result
     }
 
     fn exec(&mut self, stmt: &Stmt) -> Result<Flow, String> {
@@ -166,7 +217,7 @@ impl Interp {
                     Some(e) => self.eval(e)?,
                     None => Value::Undefined,
                 };
-                self.define(name.clone(), v);
+                Env::define(&self.env, name.clone(), v);
                 Ok(Flow::Normal)
             }
             Stmt::ExprStmt(e) => {
@@ -174,10 +225,8 @@ impl Interp {
                 Ok(Flow::Normal)
             }
             Stmt::Block(body) => {
-                self.scopes.push(HashMap::new());
-                let result = self.exec_body(body);
-                self.scopes.pop();
-                result
+                let body = body.clone();
+                self.in_child_scope(|me| me.exec_body(&body))
             }
             Stmt::If { cond, then, otherwise } => {
                 if self.eval(cond)?.truthy() {
@@ -202,25 +251,26 @@ impl Interp {
                 Ok(Flow::Normal)
             }
             Stmt::For { init, cond, step, body } => {
-                self.scopes.push(HashMap::new());
-                let result = (|| {
-                    if let Some(init) = init {
-                        self.exec(init)?;
+                let (init, cond, step, body) =
+                    (init.clone(), cond.clone(), step.clone(), body.clone());
+                self.in_child_scope(move |me| {
+                    if let Some(init) = &init {
+                        me.exec(init)?;
                     }
                     let mut guard = 0;
                     loop {
-                        let keep_going = match cond {
-                            Some(c) => self.eval(c)?.truthy(),
+                        let keep_going = match &cond {
+                            Some(c) => me.eval(c)?.truthy(),
                             None => true,
                         };
                         if !keep_going {
                             break;
                         }
-                        if let Flow::Return(v) = self.exec(body)? {
+                        if let Flow::Return(v) = me.exec(&body)? {
                             return Ok(Flow::Return(v));
                         }
-                        if let Some(step) = step {
-                            self.eval(step)?;
+                        if let Some(step) = &step {
+                            me.eval(step)?;
                         }
                         guard += 1;
                         if guard > 1_000_000 {
@@ -228,9 +278,7 @@ impl Interp {
                         }
                     }
                     Ok(Flow::Normal)
-                })();
-                self.scopes.pop();
-                result
+                })
             }
             Stmt::Return(value) => {
                 let v = match value {
@@ -240,8 +288,8 @@ impl Interp {
                 Ok(Flow::Return(v))
             }
             Stmt::FuncDecl { name, params, body } => {
-                let f = Value::Func(Rc::new(FuncData { params: params.clone(), body: body.clone() }));
-                self.define(name.clone(), f);
+                let f = self.make_function(params.clone(), body.clone());
+                Env::define(&self.env, name.clone(), f);
                 Ok(Flow::Normal)
             }
         }
@@ -264,7 +312,23 @@ impl Interp {
             Expr::Null => Ok(Value::Null),
             Expr::Undefined => Ok(Value::Undefined),
             Expr::Ident(name) => {
-                self.lookup(name).ok_or_else(|| format!("{name} is not defined"))
+                Env::get(&self.env, name).ok_or_else(|| format!("{name} is not defined"))
+            }
+            Expr::Func { params, body } => Ok(self.make_function(params.clone(), body.clone())),
+            Expr::ArrayLit(items) => {
+                let mut values = Vec::with_capacity(items.len());
+                for item in items {
+                    values.push(self.eval(item)?);
+                }
+                Ok(Value::Array(Rc::new(RefCell::new(values))))
+            }
+            Expr::ObjectLit(props) => {
+                let mut map = HashMap::new();
+                for (key, expr) in props {
+                    let v = self.eval(expr)?;
+                    map.insert(key.clone(), v);
+                }
+                Ok(Value::Object(Rc::new(RefCell::new(map))))
             }
             Expr::Unary { op, expr } => {
                 let v = self.eval(expr)?;
@@ -290,46 +354,137 @@ impl Interp {
             }
             Expr::Assign { target, value } => {
                 let v = self.eval(value)?;
-                match &**target {
-                    Expr::Ident(name) => {
-                        self.assign(name, v.clone());
-                        Ok(v)
-                    }
-                    Expr::Member { object, property } => {
-                        if let Value::Element(i) = self.eval(object)? {
-                            match property.as_str() {
-                                "textContent" | "innerText" => {
-                                    self.out.mutations.push(Mutation::SetText(i, v.to_display()))
-                                }
-                                "innerHTML" => {
-                                    self.out.mutations.push(Mutation::SetHtml(i, v.to_display()))
-                                }
-                                _ => {} // other properties aren't modelled yet
-                            }
-                        }
-                        Ok(v)
-                    }
-                    _ => Err("invalid assignment target".into()),
-                }
+                self.assign_to(target, v.clone())?;
+                Ok(v)
             }
             Expr::Member { object, property } => {
                 let obj = self.eval(object)?;
-                Ok(match obj {
-                    Value::Object(map) => map.get(property).cloned().unwrap_or(Value::Undefined),
-                    Value::Str(s) if property == "length" => Value::Num(s.chars().count() as f64),
-                    Value::Element(i) => self.element_property(i, property),
-                    _ => Value::Undefined,
+                Ok(self.get_property(&obj, property))
+            }
+            Expr::Index { object, index } => {
+                let obj = self.eval(object)?;
+                let key = self.eval(index)?;
+                Ok(match (&obj, &key) {
+                    (Value::Array(items), _) => {
+                        let i = key.as_number();
+                        let items = items.borrow();
+                        if i >= 0.0 && (i as usize) < items.len() {
+                            items[i as usize].clone()
+                        } else {
+                            Value::Undefined
+                        }
+                    }
+                    _ => self.get_property(&obj, &key.to_display()),
                 })
             }
             Expr::Call { callee, args } => {
-                let f = self.eval(callee)?;
                 let mut values = Vec::with_capacity(args.len());
                 for a in args {
                     values.push(self.eval(a)?);
                 }
+                // Method calls need the receiver, so handle `obj.m()` specially.
+                if let Expr::Member { object, property } = &**callee {
+                    let receiver = self.eval(object)?;
+                    if let Some(result) = self.call_method(&receiver, property, &values)? {
+                        return Ok(result);
+                    }
+                    let f = self.get_property(&receiver, property);
+                    return self.call(f, values);
+                }
+                let f = self.eval(callee)?;
                 self.call(f, values)
             }
         }
+    }
+
+    fn assign_to(&mut self, target: &Expr, v: Value) -> Result<(), String> {
+        match target {
+            Expr::Ident(name) => {
+                if !Env::set(&self.env, name, v.clone()) {
+                    Env::define(&self.env, name.clone(), v); // implicit global
+                }
+                Ok(())
+            }
+            Expr::Member { object, property } => {
+                match self.eval(object)? {
+                    Value::Object(map) => {
+                        map.borrow_mut().insert(property.clone(), v);
+                    }
+                    Value::Element(i) => match property.as_str() {
+                        "textContent" | "innerText" => {
+                            self.out.mutations.push(Mutation::SetText(i, v.to_display()))
+                        }
+                        "innerHTML" => {
+                            self.out.mutations.push(Mutation::SetHtml(i, v.to_display()))
+                        }
+                        _ => {} // other properties aren't modelled yet
+                    },
+                    _ => {}
+                }
+                Ok(())
+            }
+            Expr::Index { object, index } => {
+                let obj = self.eval(object)?;
+                let key = self.eval(index)?;
+                match obj {
+                    Value::Array(items) => {
+                        let i = key.as_number();
+                        if i >= 0.0 {
+                            let mut items = items.borrow_mut();
+                            let i = i as usize;
+                            if i >= items.len() {
+                                items.resize(i + 1, Value::Undefined);
+                            }
+                            items[i] = v;
+                        }
+                    }
+                    Value::Object(map) => {
+                        map.borrow_mut().insert(key.to_display(), v);
+                    }
+                    _ => {}
+                }
+                Ok(())
+            }
+            _ => Err("invalid assignment target".into()),
+        }
+    }
+
+    fn get_property(&self, obj: &Value, property: &str) -> Value {
+        match obj {
+            Value::Object(map) => map.borrow().get(property).cloned().unwrap_or(Value::Undefined),
+            Value::Array(items) if property == "length" => {
+                Value::Num(items.borrow().len() as f64)
+            }
+            Value::Str(s) if property == "length" => Value::Num(s.chars().count() as f64),
+            Value::Element(i) => self.element_property(*i, property),
+            _ => Value::Undefined,
+        }
+    }
+
+    /// Built-in methods on arrays and strings. `None` means "not a built-in".
+    fn call_method(
+        &mut self,
+        receiver: &Value,
+        method: &str,
+        args: &[Value],
+    ) -> Result<Option<Value>, String> {
+        let result = match (receiver, method) {
+            (Value::Array(items), "push") => {
+                items.borrow_mut().extend(args.iter().cloned());
+                Value::Num(items.borrow().len() as f64)
+            }
+            (Value::Array(items), "pop") => items.borrow_mut().pop().unwrap_or(Value::Undefined),
+            (Value::Array(items), "join") => {
+                let sep = args.first().map(Value::to_display).unwrap_or_else(|| ",".into());
+                let joined =
+                    items.borrow().iter().map(Value::to_display).collect::<Vec<_>>().join(&sep);
+                Value::Str(joined)
+            }
+            (Value::Str(s), "toUpperCase") => Value::Str(s.to_uppercase()),
+            (Value::Str(s), "toLowerCase") => Value::Str(s.to_lowercase()),
+            _ => return Ok(None),
+        };
+        Ok(Some(result))
     }
 
     fn element_property(&self, index: usize, property: &str) -> Value {
@@ -348,8 +503,7 @@ impl Interp {
     fn call(&mut self, callee: Value, args: Vec<Value>) -> Result<Value, String> {
         match callee {
             Value::Native(name) => {
-                let text =
-                    args.iter().map(Value::to_display).collect::<Vec<_>>().join(" ");
+                let text = args.iter().map(Value::to_display).collect::<Vec<_>>().join(" ");
                 match name {
                     "console.log" => self.out.console.push(text),
                     "document.write" => self.out.writes.push_str(&text),
@@ -364,16 +518,23 @@ impl Interp {
                 Ok(Value::Undefined)
             }
             Value::Func(f) => {
-                let mut scope = HashMap::new();
-                for (i, param) in f.params.iter().enumerate() {
-                    scope.insert(param.clone(), args.get(i).cloned().unwrap_or(Value::Undefined));
-                }
-                if self.scopes.len() > 200 {
+                if self.depth > 200 {
                     return Err("maximum call depth exceeded".into());
                 }
-                self.scopes.push(scope);
+                // Calls run in a child of the *defining* scope, not the calling one.
+                let saved = self.env.clone();
+                self.env = Env::child(&f.closure);
+                for (i, param) in f.params.iter().enumerate() {
+                    Env::define(
+                        &self.env,
+                        param.clone(),
+                        args.get(i).cloned().unwrap_or(Value::Undefined),
+                    );
+                }
+                self.depth += 1;
                 let result = self.exec_body(&f.body);
-                self.scopes.pop();
+                self.depth -= 1;
+                self.env = saved;
                 match result? {
                     Flow::Return(v) => Ok(v),
                     Flow::Normal => Ok(Value::Undefined),
