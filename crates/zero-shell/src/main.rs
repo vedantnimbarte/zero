@@ -38,8 +38,10 @@ fn main() {
         return;
     }
     let png_mode = args.first().map(|a| a == "--png").unwrap_or(false);
+    // Like --png, but captures the whole browser window instead of just the page.
+    let shot_mode = args.first().map(|a| a == "--shot").unwrap_or(false);
     let ai_mode = args.first().map(|a| a == "--ai").unwrap_or(false);
-    if png_mode || ai_mode {
+    if png_mode || ai_mode || shot_mode {
         args.remove(0);
     }
     let mut args = args.into_iter().peekable();
@@ -87,7 +89,17 @@ fn main() {
 
     let engine = fonts::build_engine();
 
-    if png_mode {
+    if shot_mode {
+        let out_path = args.next().unwrap_or_else(|| "window.png".into());
+        let (pixels, w, h) = app::screenshot(engine, html, css, address, 1280, 800);
+        let buffer: Vec<u8> = pixels
+            .iter()
+            .flat_map(|p| [(p >> 16) as u8, (p >> 8) as u8, *p as u8, 255])
+            .collect();
+        let img = image::RgbaImage::from_raw(w, h, buffer).expect("pixel buffer size mismatch");
+        img.save(&out_path).expect("could not write PNG");
+        println!("Window -> {out_path} ({w}x{h})");
+    } else if png_mode {
         let out_path = args.next().unwrap_or_else(|| "output.png".into());
         // A trailing argument is a find-in-page query, so highlighting can be
         // eyeballed headlessly.

@@ -91,14 +91,28 @@ fn escape(s: &str) -> String {
 fn storage_site(address: &str) -> String {
     let site = crate::cookies::site_of(address);
     if site.is_empty() {
-        tab_title(address)
+        address_label(address)
     } else {
         site
     }
 }
 
-/// A short label for a tab: the host for URLs, the file name for paths.
-fn tab_title(address: &str) -> String {
+/// The label for a tab: the page's own title when it has one, else its address.
+/// Truncated, because a real title is often longer than the sidebar is wide.
+fn label_for(title: &str, address: &str) -> String {
+    let text = match title.trim() {
+        "" => address_label(address),
+        title => title.to_string(),
+    };
+    if text.chars().count() > 22 {
+        text.chars().take(21).collect::<String>() + "..."
+    } else {
+        text
+    }
+}
+
+/// A short label for an address: the host for URLs, the file name for paths.
+fn address_label(address: &str) -> String {
     if address.is_empty() {
         return "New Tab".to_string();
     }
@@ -109,11 +123,7 @@ fn tab_title(address: &str) -> String {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| address.to_string()),
     };
-    if title.chars().count() > 22 {
-        title.chars().take(21).collect::<String>() + "..."
-    } else {
-        title
-    }
+    title
 }
 
 /// Everything that belongs to one tab, including its own history and render cache.
@@ -170,6 +180,42 @@ impl Tab {
         let mut tab = Tab::new(address.clone(), crate::internal::page(&address), String::new());
         tab.address = address; // shown in the bar, and reloadable like any page
         tab
+    }
+}
+
+/// Compose the browser window — chrome and all — without opening one.
+///
+/// The UI is worth looking at while developing it, and this goes through the
+/// same [`App::frame`] the window does, so a screenshot cannot drift from what
+/// the user actually sees.
+pub fn screenshot(
+    engine: Engine,
+    html: String,
+    css: String,
+    address: String,
+    width: u32,
+    height: u32,
+) -> (Vec<u32>, u32, u32) {
+    let mut app = App::new(engine, vec![Tab::new(address, html, css)], 0);
+    (app.frame(width, height), width, height)
+}
+
+impl App {
+    fn new(engine: Engine, tabs: Vec<Tab>, active: usize) -> App {
+        App {
+            engine,
+            tabs,
+            active,
+            modifiers: ModifiersState::default(),
+            cursor: (0.0, 0.0),
+            ai_open: false,
+            ai_text: String::new(),
+            toolbar_rects: Vec::new(),
+            find: None,
+            dragging_scrollbar: false,
+            window: None,
+            surface: None,
+        }
     }
 }
 
@@ -261,7 +307,7 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(_) => self.request_redraw(),
-            WindowEvent::RedrawRequested => self.redraw(),
+            WindowEvent::RedrawRequested => self.render(),
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 self.handle_key(event);
                 self.request_redraw();
@@ -594,10 +640,12 @@ impl App {
         tab.matches.clear();
         tab.scroll_y = 0.0;
         tab.page_canvas = None; // force re-render of the new page
-        let title = tab.address.clone();
-        storage::record_visit(&title, &tab_title(&title));
+        let address = tab.address.clone();
+        let title = tab.doc.title();
+        storage::record_visit(&address, &label_for(&title, &address));
         if let Some(window) = &self.window {
-            window.set_title(&format!("Zero Browser — {title}"));
+            let shown = if title.is_empty() { address } else { title };
+            window.set_title(&format!("Zero Browser — {shown}"));
         }
         self.save_session();
         if self.ai_open {
@@ -740,7 +788,7 @@ impl App {
             return; // nothing worth saving
         }
         if !storage::remove_bookmark(&url) {
-            let title = tab_title(&url);
+            let title = label_for(&self.tab().doc.title(), &url);
             storage::add_bookmark(&url, &title);
         }
         self.request_redraw(); // the star changed
@@ -788,7 +836,8 @@ impl App {
             .enumerate()
             .map(|(i, t)| {
                 let class = if i == self.active { "tab active" } else { "tab" };
-                format!("<div class=\"{class}\">{}</div>", escape(&tab_title(&t.address)))
+                let label = label_for(&t.doc.title(), &t.address);
+                format!("<div class=\"{class}\">{}</div>", escape(&label))
             })
             .collect();
         format!("<html><body><div id=\"head\">ZERO</div>{rows}</body></html>")
@@ -804,14 +853,11 @@ impl App {
         )
     }
 
-    fn redraw(&mut self) {
-        let (w, h) = match &self.window {
-            Some(window) => {
-                let s = window.inner_size();
-                (s.width.max(1), s.height.max(1))
-            }
-            None => return,
-        };
+    /// Render every region and compose them into one frame (0xRRGGBB per pixel).
+    ///
+    /// Independent of the window, so a headless screenshot goes through exactly
+    /// the same path the user sees rather than a second, drifting copy.
+    fn frame(&mut self, w: u32, h: u32) -> Vec<u32> {
         let sw = SIDEBAR_W.min(w);
         // The assistant panel takes width from the content area, so the page reflows.
         let aw = if self.ai_open { AI_PANEL_W.min(w.saturating_sub(sw)) } else { 0 };
@@ -868,16 +914,8 @@ impl App {
             None
         };
 
-        // Disjoint field borrows: tabs (shared) + surface (mut).
         let page = self.tabs[self.active].page_canvas.as_ref().unwrap();
-        let surface = match self.surface.as_mut() {
-            Some(s) => s,
-            None => return,
-        };
-        surface
-            .resize(NonZeroU32::new(w).unwrap(), NonZeroU32::new(h).unwrap())
-            .expect("surface resize");
-        let mut buffer = surface.buffer_mut().expect("surface buffer");
+        let mut buffer = vec![0u32; (w * h) as usize];
 
         let (w, sw, tb, aw) = (w as usize, sw as usize, tb as usize, aw as usize);
         let ai_x0 = w - aw; // panel occupies the right edge
@@ -915,6 +953,22 @@ impl App {
                 }
             }
         }
+        buffer
+    }
+
+    /// Blit a composed frame to the window.
+    fn render(&mut self) {
+        let (w, h) = self.window_size();
+        if w == 0 || h == 0 {
+            return;
+        }
+        let frame = self.frame(w, h);
+        let Some(surface) = self.surface.as_mut() else { return };
+        surface
+            .resize(NonZeroU32::new(w).unwrap(), NonZeroU32::new(h).unwrap())
+            .expect("surface resize");
+        let mut buffer = surface.buffer_mut().expect("surface buffer");
+        buffer.copy_from_slice(&frame);
         buffer.present().expect("buffer present");
     }
 }
@@ -923,6 +977,18 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tab_labels_prefer_the_page_title() {
+        assert_eq!(label_for("Hacker News", "https://news.ycombinator.com"), "Hacker News");
+        // No title: fall back to the host, not the whole URL.
+        assert_eq!(label_for("", "https://news.ycombinator.com/item?id=1"), "news.ycombinator.com");
+        assert_eq!(label_for("   ", "https://example.com"), "example.com");
+        // Long titles are truncated to fit the sidebar.
+        let long = label_for("Rust (programming language) - Wikipedia", "https://x.com");
+        assert_eq!(long.chars().count(), 24);
+        assert!(long.ends_with("..."));
+    }
 
     #[test]
     fn form_submission_targets() {
