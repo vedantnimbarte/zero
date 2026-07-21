@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <style>
+        body { background: #0e0f12; color: #f2f3f5; padding: 32px; font-size: 17px; }
+        h1 { color: #e5484d; font-size: 30px; }
+        .box { background: #17181c; width: 600px; padding: 16px; }
+        .hit { background: #30a46c; color: #0e0f12; width: 600px; padding: 16px; }
+    </style>
+</head>
+<body>
+    <h1 id="title">PLACEHOLDER TITLE</h1>
+    <div class="box" id="status">this text will be replaced by JavaScript</div>
+    <div class="hit" id="markup">and this one gets replaced with real markup</div>
+    <script>
+        document.getElementById('title').textContent = 'DOM manipulation works';
+
+        var el = document.getElementById('status');
+        console.log('read back:', el.textContent);
+        el.textContent = 'textContent set from script (was: ' + el.tagName + '#' + el.id + ')';
+
+        var total = 0;
+        for (var i = 1; i <= 4; i++) { total += i * i; }
+        document.getElementById('markup').innerHTML =
+            '<div class="box">innerHTML parsed into real nodes. sum of squares 1..4 = ' + total + '</div>';
+    </script>
+</body>
+</html>
