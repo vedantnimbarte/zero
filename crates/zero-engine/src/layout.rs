@@ -13,7 +13,7 @@ use crate::css::{Color, Unit, Value};
 use crate::dom::NodeType;
 use crate::resource::ImageMap;
 use crate::style::{Display, StyledNode};
-use crate::text::{shape_run, Fonts, PositionedGlyph};
+use crate::text::{shape_run, FontSet, PositionedGlyph};
 
 /// A run of text (one word) placed at an absolute position, ready to paint.
 /// Holds shaped glyphs, not characters — see [`crate::text`].
@@ -25,6 +25,8 @@ pub struct TextFragment {
     pub y: f32,
     pub size: f32,
     pub color: Color,
+    /// Which font in the [`FontSet`] shaped this run (fallback picks per word).
+    pub font_index: usize,
 }
 
 /// A clickable region for an `<a href>`, in absolute page coordinates.
@@ -118,7 +120,7 @@ impl<'a> LayoutBox<'a> {
         }
     }
 
-    fn layout(&mut self, containing_block: Dimensions, fonts: Option<&Fonts>, images: &ImageMap) {
+    fn layout(&mut self, containing_block: Dimensions, fonts: Option<&FontSet>, images: &ImageMap) {
         match self.box_type {
             BoxType::BlockNode(_) => self.layout_block(containing_block, fonts, images),
             BoxType::AnonymousBlock => self.layout_inline(containing_block, fonts),
@@ -127,7 +129,7 @@ impl<'a> LayoutBox<'a> {
         }
     }
 
-    fn layout_block(&mut self, containing_block: Dimensions, fonts: Option<&Fonts>, images: &ImageMap) {
+    fn layout_block(&mut self, containing_block: Dimensions, fonts: Option<&FontSet>, images: &ImageMap) {
         // Width depends on the parent, so it's computed top-down first.
         self.calculate_block_width(containing_block);
         self.calculate_block_position(containing_block);
@@ -170,7 +172,7 @@ impl<'a> LayoutBox<'a> {
 
     /// Lay out inline children (text) as wrapped lines, producing text fragments
     /// and this box's height. ponytail: word-level wrapping, no per-glyph breaking.
-    fn layout_inline(&mut self, containing_block: Dimensions, fonts: Option<&Fonts>) {
+    fn layout_inline(&mut self, containing_block: Dimensions, fonts: Option<&FontSet>) {
         let start_x = containing_block.content.x;
         let max_width = containing_block.content.width;
         let top = containing_block.content.height + containing_block.content.y;
@@ -203,11 +205,13 @@ impl<'a> LayoutBox<'a> {
 
         for piece in &pieces {
             let word_height = piece.size * 1.25;
-            let (_, space_w) = shape_run(fonts, " ", piece.size);
+            let (_, space_w) = shape_run(&fonts.entries[0], " ", piece.size);
 
             for word in piece.text.split_whitespace() {
-                // Shape the whole word: this is where Indic reordering/conjuncts happen.
-                let (glyphs, word_w) = shape_run(fonts, word, piece.size);
+                // Pick a font that can draw this word, then shape it: this is where
+                // Indic reordering/conjuncts happen.
+                let font_index = fonts.pick(word);
+                let (glyphs, word_w) = shape_run(&fonts.entries[font_index], word, piece.size);
                 // Wrap if this word overflows and we're not at line start.
                 if cursor_x > start_x && cursor_x + word_w > start_x + max_width {
                     cursor_y += line_height;
@@ -221,6 +225,7 @@ impl<'a> LayoutBox<'a> {
                     y: cursor_y,
                     size: piece.size,
                     color: piece.color,
+                    font_index,
                 });
                 if let Some(href) = &piece.href {
                     link_areas.push(LinkArea {
@@ -333,7 +338,7 @@ impl<'a> LayoutBox<'a> {
             + d.padding.top;
     }
 
-    fn layout_block_children(&mut self, fonts: Option<&Fonts>, images: &ImageMap) {
+    fn layout_block_children(&mut self, fonts: Option<&FontSet>, images: &ImageMap) {
         let d = &mut self.dimensions;
         for child in &mut self.children {
             child.layout(*d, fonts, images);
@@ -370,7 +375,7 @@ impl<'a> LayoutBox<'a> {
 pub fn layout_tree<'a>(
     node: &'a StyledNode<'a>,
     mut containing_block: Dimensions,
-    fonts: Option<&Fonts>,
+    fonts: Option<&FontSet>,
     images: &ImageMap,
 ) -> LayoutBox<'a> {
     // Height starts at 0 so children accumulate into it.

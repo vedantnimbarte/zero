@@ -8,7 +8,7 @@ use crate::css::{Color, Value};
 use crate::dom::NodeType;
 use crate::layout::{BoxType, LayoutBox, Rect, TextFragment};
 use crate::resource::{DecodedImage, ImageMap};
-use fontdue::Font;
+use crate::text::FontSet;
 
 pub struct Canvas {
     pub pixels: Vec<Color>,
@@ -44,7 +44,12 @@ impl Canvas {
 
     /// Rasterize a shaped run glyph-by-glyph and alpha-blend it onto the canvas.
     /// Positions come from the shaper, so scripts that reorder or stack marks land correctly.
-    fn paint_text(&mut self, frag: &TextFragment, font: &Font) {
+    /// Uses the same font the shaper picked, so glyph ids resolve correctly.
+    fn paint_text(&mut self, frag: &TextFragment, fonts: &FontSet) {
+        let font = match fonts.entries.get(frag.font_index) {
+            Some(entry) => entry.raster,
+            None => return,
+        };
         let ascent = font.horizontal_line_metrics(frag.size).map_or(frag.size, |m| m.ascent);
         let baseline = frag.y + ascent;
 
@@ -108,15 +113,15 @@ fn blend(dst: Color, src: Color, coverage: u8) -> Color {
     Color { r: mix(dst.r, src.r), g: mix(dst.g, src.g), b: mix(dst.b, src.b), a: 255 }
 }
 
-pub fn paint(layout_root: &LayoutBox, bounds: Rect, font: Option<&Font>, images: &ImageMap) -> Canvas {
+pub fn paint(layout_root: &LayoutBox, bounds: Rect, fonts: Option<&FontSet>, images: &ImageMap) -> Canvas {
     let display_list = build_display_list(layout_root);
     let mut canvas = Canvas::new(bounds.width as usize, bounds.height as usize);
     for item in &display_list {
         match item {
             DisplayCommand::SolidColor(color, rect) => canvas.paint_solid(*color, *rect),
             DisplayCommand::Text(frag) => {
-                if let Some(font) = font {
-                    canvas.paint_text(frag, font);
+                if let Some(fonts) = fonts {
+                    canvas.paint_text(frag, fonts);
                 }
             }
             DisplayCommand::Image(src, rect) => {
