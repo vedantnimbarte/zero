@@ -117,6 +117,7 @@ impl Blocker {
         self.rules.iter().filter(|r| !r.exception).any(|r| matches(&r))
     }
 
+    #[cfg(test)]
     pub fn rule_count(&self) -> usize {
         self.rules.len()
     }
