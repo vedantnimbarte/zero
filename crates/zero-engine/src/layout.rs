@@ -788,7 +788,10 @@ impl<'a> LayoutBox<'a> {
             let word_height = piece.size * 1.25;
             let (_, space_w) = shape_run(&fonts.entries[0], " ", piece.size);
 
-            for word in piece.text.split_whitespace() {
+            // Only space, tab and newline collapse in CSS. A non-breaking space
+            // is an ordinary character that happens to look like a space, so it
+            // must stay inside the word — pages use it to hold spacing.
+            for word in piece.text.split_ascii_whitespace() {
                 // Pick a font that can draw this word, then shape it: this is where
                 // Indic reordering/conjuncts happen.
                 let font_index = fonts.pick(word);
@@ -1724,7 +1727,7 @@ fn measure_text(text: &str, size: f32, fonts: Option<&FontSet>) -> f32 {
         Some(f) => f,
         None => return 0.0,
     };
-    let trimmed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = text.split_ascii_whitespace().collect::<Vec<_>>().join(" ");
     if trimmed.is_empty() {
         return 0.0;
     }
