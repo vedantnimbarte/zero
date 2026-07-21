@@ -36,7 +36,16 @@ impl zero_engine::ResourceLoader for ShellLoader {
             return None;
         }
         if is_url(&resolved) {
+            // HTTPS-first for subresources too, falling back to cleartext only on failure.
             let mut buf = Vec::new();
+            if let Some(rest) = resolved.strip_prefix("http://") {
+                if let Some(mut r) = fetch_bytes(&format!("https://{rest}")) {
+                    if r.read_to_end(&mut buf).is_ok() {
+                        return Some(buf);
+                    }
+                    buf.clear();
+                }
+            }
             fetch_bytes(&resolved)?.read_to_end(&mut buf).ok()?;
             Some(buf)
         } else if resolved.starts_with("data:") {
@@ -93,26 +102,45 @@ pub fn normalize_target(s: &str) -> String {
     }
 }
 
-/// Fetch a URL over HTTP(S).
-/// ponytail: blocking call on the UI thread — fine for now; move off-thread if it stalls.
-pub fn fetch_url(url: &str) -> String {
-    eprintln!("fetching {url} ...");
-    ureq::get(url)
-        .call()
-        .and_then(|r| r.into_string().map_err(Into::into))
-        .unwrap_or_else(|e| {
-            eprintln!("fetch failed: {e}");
-            error_page("Failed to load", &format!("{url}: {e}"))
-        })
+/// A loaded document, plus the URL it actually came from and whether the
+/// connection was secure (an HTTPS upgrade may change the URL).
+pub struct Fetched {
+    pub url: String,
+    pub body: String,
+    pub secure: bool,
 }
 
-pub fn load_target(target: &str) -> String {
-    if is_url(target) {
-        fetch_url(target)
-    } else {
-        fs::read_to_string(target)
-            .unwrap_or_else(|e| error_page("Cannot open", &format!("{target}: {e}")))
+/// ponytail: blocking call on the UI thread — fine for now; move off-thread if it stalls.
+fn try_fetch(url: &str) -> Option<String> {
+    eprintln!("fetching {url} ...");
+    ureq::get(url).call().ok()?.into_string().ok()
+}
+
+/// Load a page, preferring HTTPS.
+///
+/// An explicit `http://` URL is retried over HTTPS first, and only falls back to
+/// cleartext if the secure attempt actually fails — so users get encryption by
+/// default without breaking sites that genuinely have no HTTPS.
+pub fn load_target(target: &str) -> Fetched {
+    if !is_url(target) {
+        let body = fs::read_to_string(target)
+            .unwrap_or_else(|e| error_page("Cannot open", &format!("{target}: {e}")));
+        return Fetched { url: target.to_string(), body, secure: true }; // local: no network
     }
+
+    if let Some(rest) = target.strip_prefix("http://") {
+        let upgraded = format!("https://{rest}");
+        if let Some(body) = try_fetch(&upgraded) {
+            return Fetched { url: upgraded, body, secure: true };
+        }
+        eprintln!("HTTPS upgrade failed for {target}; falling back to cleartext");
+        let body = try_fetch(target)
+            .unwrap_or_else(|| error_page("Failed to load", target));
+        return Fetched { url: target.to_string(), body, secure: false };
+    }
+
+    let body = try_fetch(target).unwrap_or_else(|| error_page("Failed to load", target));
+    Fetched { url: target.to_string(), body, secure: true }
 }
 
 fn error_page(title: &str, detail: &str) -> String {
