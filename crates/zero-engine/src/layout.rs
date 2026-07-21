@@ -3,20 +3,23 @@
 //! Block layout + basic inline text layout (word wrapping). Text nodes become
 //! positioned [`TextFragment`]s the painter draws.
 //!
+//! Words are shaped (see [`crate::text`]) so complex scripts render correctly.
+//!
 //! ponytail: inline layout is word-granular with a naive `size * 1.25` line height;
-//! no kerning, bidi, justification, or mixed-baseline runs. Real line-breaking and
-//! Indic shaping are later phases (docs/01-ARCHITECTURE.md §10).
+//! no bidi, justification, or mixed-baseline runs. Proper line-breaking is a later
+//! phase (docs/01-ARCHITECTURE.md §10).
 
 use crate::css::{Color, Unit, Value};
 use crate::dom::NodeType;
 use crate::resource::ImageMap;
 use crate::style::{Display, StyledNode};
-use fontdue::Font;
+use crate::text::{shape_run, Fonts, PositionedGlyph};
 
 /// A run of text (one word) placed at an absolute position, ready to paint.
+/// Holds shaped glyphs, not characters — see [`crate::text`].
 #[derive(Clone)]
 pub struct TextFragment {
-    pub text: String,
+    pub glyphs: Vec<PositionedGlyph>,
     pub x: f32,
     /// Top of the line box (baseline is derived at paint time from font ascent).
     pub y: f32,
@@ -115,21 +118,21 @@ impl<'a> LayoutBox<'a> {
         }
     }
 
-    fn layout(&mut self, containing_block: Dimensions, font: Option<&Font>, images: &ImageMap) {
+    fn layout(&mut self, containing_block: Dimensions, fonts: Option<&Fonts>, images: &ImageMap) {
         match self.box_type {
-            BoxType::BlockNode(_) => self.layout_block(containing_block, font, images),
-            BoxType::AnonymousBlock => self.layout_inline(containing_block, font),
+            BoxType::BlockNode(_) => self.layout_block(containing_block, fonts, images),
+            BoxType::AnonymousBlock => self.layout_inline(containing_block, fonts),
             // A bare inline node is laid out by its anonymous-block parent, not here.
             BoxType::InlineNode(_) => {}
         }
     }
 
-    fn layout_block(&mut self, containing_block: Dimensions, font: Option<&Font>, images: &ImageMap) {
+    fn layout_block(&mut self, containing_block: Dimensions, fonts: Option<&Fonts>, images: &ImageMap) {
         // Width depends on the parent, so it's computed top-down first.
         self.calculate_block_width(containing_block);
         self.calculate_block_position(containing_block);
         // Then children are laid out to discover this box's height.
-        self.layout_block_children(font, images);
+        self.layout_block_children(fonts, images);
         self.calculate_block_height();
         // A replaced element (<img>) overrides content size with its resolved dimensions.
         if let Some((w, h)) = self.resolved_image_size(images) {
@@ -167,7 +170,7 @@ impl<'a> LayoutBox<'a> {
 
     /// Lay out inline children (text) as wrapped lines, producing text fragments
     /// and this box's height. ponytail: word-level wrapping, no per-glyph breaking.
-    fn layout_inline(&mut self, containing_block: Dimensions, font: Option<&Font>) {
+    fn layout_inline(&mut self, containing_block: Dimensions, fonts: Option<&Fonts>) {
         let start_x = containing_block.content.x;
         let max_width = containing_block.content.width;
         let top = containing_block.content.height + containing_block.content.y;
@@ -176,7 +179,7 @@ impl<'a> LayoutBox<'a> {
         self.dimensions.content.y = top;
         self.dimensions.content.width = max_width;
 
-        let font = match font {
+        let fonts = match fonts {
             Some(f) => f,
             None => {
                 self.dimensions.content.height = 0.0;
@@ -200,11 +203,11 @@ impl<'a> LayoutBox<'a> {
 
         for piece in &pieces {
             let word_height = piece.size * 1.25;
-            let space_w = font.metrics(' ', piece.size).advance_width;
+            let (_, space_w) = shape_run(fonts, " ", piece.size);
 
             for word in piece.text.split_whitespace() {
-                let word_w: f32 =
-                    word.chars().map(|c| font.metrics(c, piece.size).advance_width).sum();
+                // Shape the whole word: this is where Indic reordering/conjuncts happen.
+                let (glyphs, word_w) = shape_run(fonts, word, piece.size);
                 // Wrap if this word overflows and we're not at line start.
                 if cursor_x > start_x && cursor_x + word_w > start_x + max_width {
                     cursor_y += line_height;
@@ -213,7 +216,7 @@ impl<'a> LayoutBox<'a> {
                 }
                 line_height = line_height.max(word_height);
                 fragments.push(TextFragment {
-                    text: word.to_string(),
+                    glyphs,
                     x: cursor_x,
                     y: cursor_y,
                     size: piece.size,
@@ -330,10 +333,10 @@ impl<'a> LayoutBox<'a> {
             + d.padding.top;
     }
 
-    fn layout_block_children(&mut self, font: Option<&Font>, images: &ImageMap) {
+    fn layout_block_children(&mut self, fonts: Option<&Fonts>, images: &ImageMap) {
         let d = &mut self.dimensions;
         for child in &mut self.children {
-            child.layout(*d, font, images);
+            child.layout(*d, fonts, images);
             // Grow this box to contain each child's margin box.
             d.content.height += child.dimensions.margin_box().height;
         }
@@ -367,13 +370,13 @@ impl<'a> LayoutBox<'a> {
 pub fn layout_tree<'a>(
     node: &'a StyledNode<'a>,
     mut containing_block: Dimensions,
-    font: Option<&Font>,
+    fonts: Option<&Fonts>,
     images: &ImageMap,
 ) -> LayoutBox<'a> {
     // Height starts at 0 so children accumulate into it.
     containing_block.content.height = 0.0;
     let mut root_box = build_layout_tree(node);
-    root_box.layout(containing_block, font, images);
+    root_box.layout(containing_block, fonts, images);
     root_box
 }
 

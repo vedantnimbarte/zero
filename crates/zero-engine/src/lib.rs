@@ -24,6 +24,7 @@ pub mod layout;
 pub mod paint;
 pub mod resource;
 pub mod style;
+pub mod text;
 
 pub use css::Color;
 pub use layout::LinkArea;
@@ -33,6 +34,7 @@ pub use resource::{DecodedImage, ResourceLoader};
 use dom::{Node, NodeType};
 use fontdue::Font;
 use resource::{ImageMap, NullLoader};
+use text::Fonts;
 
 /// The result of rendering: pixels plus clickable link regions (page coordinates).
 pub struct Page {
@@ -50,21 +52,25 @@ const USER_AGENT_CSS: &str = "
 ";
 
 /// A rendering engine instance. Holds the font used for text; construct once, render many.
+///
+/// Keeps the raw font bytes so a shaping face can be built per render (shaping and
+/// rasterizing are two views of the same font file).
 pub struct Engine {
-    font: Option<Font>,
+    raster: Option<Font>,
+    font_bytes: Option<Vec<u8>>,
 }
 
 impl Engine {
     /// Build an engine that renders text using the given TrueType font bytes.
     pub fn new(font_bytes: &[u8]) -> Result<Engine, &'static str> {
-        let font = Font::from_bytes(font_bytes, fontdue::FontSettings::default())?;
-        Ok(Engine { font: Some(font) })
+        let raster = Font::from_bytes(font_bytes, fontdue::FontSettings::default())?;
+        Ok(Engine { raster: Some(raster), font_bytes: Some(font_bytes.to_vec()) })
     }
 
     /// Build an engine with no font: boxes/colors render, text is skipped.
     /// Useful for tests and headless shape rendering.
     pub fn shapes_only() -> Engine {
-        Engine { font: None }
+        Engine { raster: None, font_bytes: None }
     }
 
     /// Render an HTML + CSS document to a pixel [`Canvas`], without loading any
@@ -105,12 +111,19 @@ impl Engine {
         viewport.content.width = width;
         viewport.content.height = height;
 
-        let layout_root = layout::layout_tree(&style_root, viewport, self.font.as_ref(), &images);
+        // Shaping face is built per render; it borrows the stored font bytes.
+        let face = self.font_bytes.as_deref().and_then(|b| rustybuzz::Face::from_slice(b, 0));
+        let fonts = match (self.raster.as_ref(), face.as_ref()) {
+            (Some(raster), Some(shaper)) => Some(Fonts { raster, shaper }),
+            _ => None,
+        };
+
+        let layout_root = layout::layout_tree(&style_root, viewport, fonts.as_ref(), &images);
         // Canvas is at least the viewport, but grows to the full document height so
         // the embedder can scroll through overflow.
         let doc_height = layout_root.dimensions.margin_box().height.max(height);
         let bounds = layout::Rect { x: 0.0, y: 0.0, width, height: doc_height };
-        let canvas = paint::paint(&layout_root, bounds, self.font.as_ref(), &images);
+        let canvas = paint::paint(&layout_root, bounds, self.raster.as_ref(), &images);
 
         let mut links = Vec::new();
         layout::collect_links(&layout_root, &mut links);

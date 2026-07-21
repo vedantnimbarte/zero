@@ -42,17 +42,17 @@ impl Canvas {
         }
     }
 
-    /// Rasterize a text run glyph-by-glyph and alpha-blend it onto the canvas.
+    /// Rasterize a shaped run glyph-by-glyph and alpha-blend it onto the canvas.
+    /// Positions come from the shaper, so scripts that reorder or stack marks land correctly.
     fn paint_text(&mut self, frag: &TextFragment, font: &Font) {
         let ascent = font.horizontal_line_metrics(frag.size).map_or(frag.size, |m| m.ascent);
         let baseline = frag.y + ascent;
-        let mut pen_x = frag.x;
 
-        for ch in frag.text.chars() {
-            let (m, coverage) = font.rasterize(ch, frag.size);
+        for glyph in &frag.glyphs {
+            let (m, coverage) = font.rasterize_indexed(glyph.id, frag.size);
             // fontdue gives per-pixel coverage (0..=255); place relative to the baseline.
-            let gx = (pen_x + m.xmin as f32).round() as i32;
-            let gy = (baseline - m.ymin as f32 - m.height as f32).round() as i32;
+            let gx = (frag.x + glyph.x + m.xmin as f32).round() as i32;
+            let gy = (baseline - glyph.y - m.ymin as f32 - m.height as f32).round() as i32;
 
             for row in 0..m.height {
                 for col in 0..m.width {
@@ -69,7 +69,6 @@ impl Canvas {
                     self.pixels[idx] = blend(self.pixels[idx], frag.color, a);
                 }
             }
-            pen_x += m.advance_width;
         }
     }
 
