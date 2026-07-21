@@ -16,7 +16,7 @@ mod blocker;
 mod fonts;
 mod net;
 
-use net::{fetch_url, is_url, ShellLoader};
+use net::{is_url, load_target, ShellLoader};
 use std::fs;
 use zero_engine::Engine;
 
@@ -34,7 +34,10 @@ fn main() {
             let css = fs::read_to_string("examples/test.css").expect("read css");
             (html, css, "examples/test.html".to_string())
         }
-        Some(target) if is_url(&target) => (fetch_url(&target), String::new(), target),
+        Some(target) if is_url(&target) => {
+            let fetched = load_target(&target);
+            (fetched.body, String::new(), fetched.url)
+        }
         Some(target) => {
             let html = fs::read_to_string(&target).expect("could not read HTML file");
             // A following `*.css` arg is an explicit stylesheet; otherwise rely on

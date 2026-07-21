@@ -33,6 +33,7 @@ pub fn run_window(engine: Engine, html: String, css: String, address: String) {
         links: Vec::new(),
         cursor: (0.0, 0.0),
         blocked_count: 0,
+        secure: true,
         cache_w: 0,
         cache_h: 0,
         window: None,
@@ -55,6 +56,7 @@ struct App {
     links: Vec<zero_engine::LinkArea>,
     cursor: (f32, f32),
     blocked_count: usize,
+    secure: bool,
     cache_w: u32,
     cache_h: u32,
     window: Option<Rc<Window>>,
@@ -195,13 +197,16 @@ impl App {
 
     /// Load a target into the page without touching history.
     fn load(&mut self, target: String) {
-        self.address = target.clone();
-        self.page_html = load_target(&target);
+        let fetched = load_target(&target);
+        // An HTTPS upgrade can change the URL, so adopt whatever actually loaded.
+        self.address = fetched.url.clone();
+        self.page_html = fetched.body;
+        self.secure = fetched.secure;
         self.page_css = String::new(); // rely on the page's own <style>
         self.scroll_y = 0.0;
         self.page_canvas = None; // force re-render of the new page
         if let Some(window) = &self.window {
-            window.set_title(&format!("Zero Browser — {target}"));
+            window.set_title(&format!("Zero Browser — {}", self.address));
         }
     }
 
@@ -212,12 +217,13 @@ impl App {
             .replace('&', "&amp;")
             .replace('<', "&lt;")
             .replace('>', "&gt;");
+        let lock = if self.secure { "" } else { "Not secure  .  " };
         let shield = if self.blocked_count > 0 {
             format!("     .     {} trackers blocked", self.blocked_count)
         } else {
             String::new()
         };
-        format!("<html><body><div id=\"bar\">{safe}|{shield}</div></body></html>")
+        format!("<html><body><div id=\"bar\">{lock}{safe}|{shield}</div></body></html>")
     }
 
     fn redraw(&mut self) {
