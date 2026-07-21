@@ -23,6 +23,8 @@ pub enum Display {
     Flex,
     Grid,
     Table,
+    /// Sits in a line like text, but sizes itself like a block.
+    InlineBlock,
     None,
 }
 
@@ -66,6 +68,7 @@ impl<'a> StyledNode<'a> {
         match self.value("display") {
             Some(Value::Keyword(s)) => match &*s {
                 "block" => Display::Block,
+                "inline-block" => Display::InlineBlock,
                 // inline-flex is treated as a block-level flex container for now.
                 "flex" | "inline-flex" => Display::Flex,
                 "grid" | "inline-grid" => Display::Grid,
