@@ -640,7 +640,7 @@ impl Engine {
         let layout_root = layout::layout_tree(&style_root, viewport, fonts.as_ref(), &images);
         // Canvas is at least the viewport, but grows to the full document height so
         // the embedder can scroll through overflow.
-        let doc_height = layout_root.dimensions.margin_box().height.max(height);
+        let doc_height = layout::content_bottom(&layout_root).max(height);
         let bounds = layout::Rect {
             x: 0.0,
             y: 0.0,

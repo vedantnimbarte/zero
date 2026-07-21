@@ -1628,7 +1628,24 @@ fn row_at_mut<'b, 'a>(
     }
 }
 
-/// Gather the painted box of every element, so the embedder can hit-test clicks./// Gather the painted box of every element, so the embedder can hit-test clicks.
+/// The lowest painted edge in the tree.
+///
+/// The root box's own height is not enough: `overflow` defaults to visible, so
+/// content sticking out of a fixed-height box (`body { height: 100% }` is common)
+/// still paints and still has to be scrollable.
+pub fn content_bottom(bx: &LayoutBox) -> f32 {
+    let own = bx.dimensions.margin_box();
+    let mut bottom = own.y + own.height;
+    for frag in &bx.text_fragments {
+        bottom = bottom.max(frag.y + frag.size * 1.25);
+    }
+    for child in &bx.children {
+        bottom = bottom.max(content_bottom(child));
+    }
+    bottom
+}
+
+/// Gather the painted box of every element, so the embedder can hit-test clicks.
 pub fn collect_element_rects(bx: &LayoutBox, out: &mut Vec<ElementRect>) {
     if let BoxType::BlockNode(styled) | BoxType::InlineNode(styled) = bx.box_type {
         if let NodeType::Element(ref e) = styled.node.node_type {
