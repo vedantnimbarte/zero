@@ -32,9 +32,14 @@ const TOOLBAR_CSS: &str =
 
 /// Font *sourcing* is a platform/shell concern — the engine only wants bytes.
 fn load_system_font() -> Option<Vec<u8>> {
+    // Prefer fonts with broad script coverage (Latin + Indic) so Devanagari/Tamil
+    // render. ponytail: single font, no per-script fallback yet.
     const CANDIDATES: &[&str] = &[
+        "C:/Windows/Fonts/Nirmala.ttf", // Latin + Devanagari/Tamil/Telugu/...
         "C:/Windows/Fonts/segoeui.ttf",
         "C:/Windows/Fonts/arial.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf",
+        "/System/Library/Fonts/Supplemental/Kohinoor.ttc",
         "/System/Library/Fonts/Supplemental/Arial.ttf",
         "/Library/Fonts/Arial.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
