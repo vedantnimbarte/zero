@@ -342,8 +342,10 @@ impl Document {
 const USER_AGENT_CSS: &str = "
     html, body, div, p, h1, h2, h3, h4, h5, h6, ul, ol, li, section, article,
     header, footer, nav, main, aside, figure, figcaption, blockquote, pre,
-    table, tr, form, fieldset, address, hr, img, input, textarea, button, select,
-    label { display: block; }
+    tr, form, fieldset, address, hr, img, input, textarea, button, select,
+    label, tbody, thead, tfoot { display: block; }
+    table { display: table; }
+    td, th { display: block; padding: 6px; }
     input, textarea, select { background: #ffffff; color: #111111; padding: 7px;
         border-radius: 4px; width: 260px; }
     button { background: #e6e8ec; color: #111111; padding: 8px; border-radius: 4px;
