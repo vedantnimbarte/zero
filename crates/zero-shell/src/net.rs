@@ -6,6 +6,7 @@
 use crate::blocker;
 use crate::cookies::{site_of, CookieJar};
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
 use std::rc::Rc;
@@ -66,11 +67,19 @@ pub struct ShellLoader {
     base: String,
     /// Shared with the app so the toolbar can report what was blocked.
     pub blocked: Rc<Cell<usize>>,
+    /// Subresources already fetched for this page, misses included so a 404 is
+    /// not retried. The engine re-collects images and stylesheets on every
+    /// render, and a render happens on every keystroke — without this, typing
+    /// one character refetches the whole page's assets over the network.
+    ///
+    /// ponytail: lives as long as the tab's document and has no size limit;
+    /// a shared LRU across tabs is the upgrade if memory becomes a problem.
+    cache: RefCell<HashMap<String, Option<Vec<u8>>>>,
 }
 
 impl ShellLoader {
     pub fn new(base: String) -> ShellLoader {
-        ShellLoader { base, blocked: Rc::new(Cell::new(0)) }
+        ShellLoader { base, blocked: Rc::new(Cell::new(0)), cache: RefCell::new(HashMap::new()) }
     }
 }
 
@@ -82,6 +91,19 @@ impl zero_engine::ResourceLoader for ShellLoader {
             self.blocked.set(self.blocked.get() + 1);
             return None;
         }
+        if let Some(hit) = self.cache.borrow().get(&resolved) {
+            return hit.clone();
+        }
+        let fetched = self.fetch(&resolved);
+        self.cache.borrow_mut().insert(resolved, fetched.clone());
+        fetched
+    }
+}
+
+impl ShellLoader {
+    /// The uncached fetch, by scheme.
+    fn fetch(&self, resolved: &str) -> Option<Vec<u8>> {
+        let resolved = resolved.to_string();
         if is_url(&resolved) {
             // HTTPS-first for subresources too, falling back to cleartext only on failure.
             let mut buf = Vec::new();
@@ -221,6 +243,28 @@ fn error_page(title: &str, detail: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Deleting the file between loads proves the second never hit the disk —
+    /// the same reason the network is not hit again on every keystroke.
+    #[test]
+    fn subresources_are_fetched_once() {
+        use zero_engine::ResourceLoader;
+        let dir = std::env::temp_dir().join("zero-loader-cache");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("scratch dir");
+        let file = dir.join("style.css");
+        fs::write(&file, "p{color:red}").expect("write");
+
+        let loader = ShellLoader::new(dir.join("page.html").to_string_lossy().into_owned());
+        assert_eq!(loader.load("style.css").as_deref(), Some(&b"p{color:red}"[..]));
+        fs::remove_file(&file).expect("remove");
+        assert_eq!(loader.load("style.css").as_deref(), Some(&b"p{color:red}"[..]));
+
+        // A miss is remembered too, so a 404 is not retried on every render.
+        assert_eq!(loader.load("missing.css"), None);
+        fs::write(dir.join("missing.css"), "p{}").expect("write");
+        assert_eq!(loader.load("missing.css"), None);
+    }
 
     #[test]
     fn resolves_relative_absolute_and_scheme_relative() {
