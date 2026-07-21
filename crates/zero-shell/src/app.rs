@@ -64,8 +64,9 @@ fn tab_title(address: &str) -> String {
 /// Everything that belongs to one tab, including its own history and render cache.
 struct Tab {
     address: String,
-    page_html: String,
-    page_css: String,
+    /// Owns the parsed DOM and a live JS runtime, so handlers survive between frames.
+    doc: zero_engine::Document,
+    element_rects: Vec<zero_engine::ElementRect>,
     history: Vec<String>,
     history_index: usize,
     scroll_y: f32,
@@ -82,8 +83,8 @@ impl Tab {
         Tab {
             history: vec![address.clone()],
             address,
-            page_html: html,
-            page_css: css,
+            doc: zero_engine::Document::load(&html, &css),
+            element_rects: Vec::new(),
             history_index: 0,
             scroll_y: 0.0,
             secure: true,
@@ -265,6 +266,23 @@ impl App {
         // Window coords -> page coords (undo chrome offsets, add scroll).
         let px = cx - SIDEBAR_W as f32;
         let py = cy - TOOLBAR_H as f32 + self.tab().scroll_y;
+        // Innermost element wins, so a handler on a child beats one on its parent.
+        let hit = self
+            .tab()
+            .element_rects
+            .iter()
+            .filter(|r| px >= r.x && px <= r.x + r.width && py >= r.y && py <= r.y + r.height)
+            .map(|r| r.node_id)
+            .next_back();
+        if let Some(node_id) = hit {
+            let tab = self.tab_mut();
+            if tab.doc.click(node_id) {
+                tab.page_canvas = None; // handler may have changed the DOM
+                self.request_redraw();
+                return;
+            }
+        }
+
         let href = self
             .tab()
             .links
@@ -327,9 +345,9 @@ impl App {
         let tab = self.tab_mut();
         // An HTTPS upgrade can change the URL, so adopt whatever actually loaded.
         tab.address = fetched.url;
-        tab.page_html = fetched.body;
         tab.secure = fetched.secure;
-        tab.page_css = String::new(); // rely on the page's own <style>
+        // A new page means a new document and a fresh JS runtime.
+        tab.doc = zero_engine::Document::load(&fetched.body, "");
         tab.scroll_y = 0.0;
         tab.page_canvas = None; // force re-render of the new page
         let title = tab.address.clone();
@@ -397,9 +415,8 @@ impl App {
             let tab = &mut self.tabs[self.active];
             if tab.page_canvas.is_none() || tab.cache_w != content_w || tab.cache_h != page_vh {
                 let loader = ShellLoader::new(tab.address.clone());
-                let page = engine.render_page(
-                    &tab.page_html,
-                    &tab.page_css,
+                let page = engine.render_document(
+                    &mut tab.doc,
                     content_w as f32,
                     page_vh as f32,
                     &loader,
@@ -410,6 +427,7 @@ impl App {
                 }
                 tab.page_canvas = Some(page.canvas);
                 tab.links = page.links;
+                tab.element_rects = page.element_rects;
                 tab.cache_w = content_w;
                 tab.cache_h = page_vh;
             }
