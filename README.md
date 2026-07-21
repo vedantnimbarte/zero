@@ -57,8 +57,9 @@ correctly, including their own stylesheets, tables and forms.
 
 - **HTML**: tolerant parser, character references, raw-text and void elements
 - **CSS**: external `<link>` sheets, `@media` (type + width), descendant/child
-  selectors, the cascade with specificity, HTML presentation attributes
-  (`bgcolor`, `width`, `align`), named colours, `rgb()`/`hsl()`, alpha
+  selectors, custom properties (`var()`, defined on `:root`), the cascade with
+  specificity, HTML presentation attributes (`bgcolor`, `width`, `align`),
+  named colours, `rgb()`/`hsl()`, alpha
 - **Layout**: block, inline, inline-block, flex (wrap/grow/justify/align), grid
   (`repeat()`, `fr`, spans), tables (colspan/rowspan), out-of-flow positioning,
   intrinsic sizing, `text-align`
@@ -72,8 +73,9 @@ correctly, including their own stylesheets, tables and forms.
   `localStorage` partitioned per site, profile data encrypted at rest (DPAPI on
   Windows; macOS and Linux backends are still to come)
 
-**Known limits.** Pseudo-classes (`:hover`), attribute selectors and `@import`
-are parsed but not applied. Sites built on fixed/sticky positioning overlap —
+**Known limits.** Pseudo-classes other than `:root` (so `:hover`), attribute
+selectors and `@import` are skipped — a rule using one is dropped rather than
+misapplied. Sites built on fixed/sticky positioning overlap —
 Wikipedia's current skin is the clearest example. Layout and paint are
 single-threaded, and a page is painted in full rather than by viewport.
 
