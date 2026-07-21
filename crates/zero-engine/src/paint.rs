@@ -227,6 +227,11 @@ fn blend(dst: Color, src: Color, coverage: u8) -> Color {
 pub fn paint(layout_root: &LayoutBox, bounds: Rect, fonts: Option<&FontSet>, images: &ImageMap) -> Canvas {
     let display_list = build_display_list(layout_root);
     let mut canvas = Canvas::new(bounds.width as usize, bounds.height as usize);
+    // The root background paints the whole canvas, not just the root's box, so a
+    // short dark page doesn't leave white below it (CSS 2.1 §14.2).
+    if let Some(color) = canvas_background(layout_root) {
+        canvas.paint_solid(color, bounds);
+    }
     for item in &display_list {
         match item {
             DisplayCommand::SolidColor(color, rect) => canvas.paint_solid(*color, *rect),
@@ -441,6 +446,13 @@ fn render_borders(list: &mut DisplayList, layout_box: &LayoutBox) {
     list.push(DisplayCommand::SolidColor(color, Rect { x: b.x + b.width - d.border.right, y: b.y, width: d.border.right, height: b.height }));
     list.push(DisplayCommand::SolidColor(color, Rect { x: b.x, y: b.y, width: b.width, height: d.border.top }));
     list.push(DisplayCommand::SolidColor(color, Rect { x: b.x, y: b.y + b.height - d.border.bottom, width: b.width, height: d.border.bottom }));
+}
+
+/// The colour that propagates to the canvas: the root element's own background,
+/// or `<body>`'s if the root has none.
+fn canvas_background(root: &LayoutBox) -> Option<Color> {
+    let of = |b: &LayoutBox| get_color(b, "background").or_else(|| get_color(b, "background-color"));
+    of(root).or_else(|| root.children.iter().find_map(of))
 }
 
 fn get_color(layout_box: &LayoutBox, name: &str) -> Option<Color> {
