@@ -195,6 +195,10 @@ impl<'a> LayoutBox<'a> {
         // Width depends on the parent, so it's computed top-down first.
         self.calculate_block_width(containing_block);
         self.calculate_block_position(containing_block);
+        // Children accumulate into this height, so it must start at zero. A box can
+        // be laid out more than once (tables, grid, flex, positioned two-pass), and
+        // a stale value would push every descendant down by the previous height.
+        self.dimensions.content.height = 0.0;
         // Then children are laid out to discover this box's height.
         match self.get_style_node().display() {
             Display::Flex => self.layout_flex_children(fonts, images),
@@ -259,14 +263,13 @@ impl<'a> LayoutBox<'a> {
         Some((w, h))
     }
 
-    /// Table layout: align cells into shared columns.
+    /// Table layout: align cells into shared columns, honouring colspan/rowspan.
     ///
-    /// Column widths come from each column's widest cell, then scale to fill the
-    /// table. Rows take the height of their tallest cell, and every cell is
-    /// stretched to that height so backgrounds line up.
+    /// Column widths come from each column's widest single-column cell, then scale
+    /// to fill the table. Rows take the height of their tallest cell.
     ///
-    /// ponytail: no `colspan`/`rowspan`, no `<caption>`/`<colgroup>`, and no
-    /// border-collapse — one level of `thead`/`tbody`/`tfoot` nesting is understood.
+    /// ponytail: no `<caption>`/`<colgroup>` or border-collapse; one level of
+    /// `thead`/`tbody`/`tfoot` nesting is understood.
     fn layout_table_children(&mut self, fonts: Option<&FontSet>, images: &ImageMap) {
         let container = self.dimensions.content;
         let style = self.get_style_node();
@@ -292,77 +295,150 @@ impl<'a> LayoutBox<'a> {
             return self.layout_block_children(fonts, images);
         }
 
-        // Each column is as wide as its widest cell, then scaled to fill the table.
-        let mut widths: Vec<f32> = Vec::new();
-        for &path in &rows {
-            let row = row_at(&self.children, path);
-            for (c, cell) in row.children.iter().enumerate() {
-                let wanted = match cell.box_type {
-                    BoxType::AnonymousBlock => 0.0,
-                    _ => max_content_width(cell.get_style_node(), fonts, images),
-                };
-                if c == widths.len() {
-                    widths.push(wanted);
-                } else {
-                    widths[c] = widths[c].max(wanted);
-                }
-            }
+        // Assign every cell a column, skipping slots still covered by a rowspan
+        // from an earlier row. `spans` counts how many further rows each column owes.
+        struct Placed {
+            row: usize,
+            cell: usize,
+            column: usize,
+            colspan: usize,
+            rowspan: usize,
         }
-        if widths.is_empty() {
+        let mut placed: Vec<Placed> = Vec::new();
+        let mut carry: Vec<usize> = Vec::new(); // remaining rowspan rows per column
+        let mut column_count = 0usize;
+
+        for (r, &path) in rows.iter().enumerate() {
+            let row = row_at(&self.children, path);
+            let mut column = 0usize;
+            for (cell_index, cell) in row.children.iter().enumerate() {
+                let (colspan, rowspan) = match cell.box_type {
+                    BoxType::AnonymousBlock => (1, 1),
+                    _ => cell_spans(cell.get_style_node()),
+                };
+                // Step over columns a previous row is still occupying.
+                while carry.get(column).copied().unwrap_or(0) > 0 {
+                    column += 1;
+                }
+                placed.push(Placed { row: r, cell: cell_index, column, colspan, rowspan });
+                if rowspan > 1 {
+                    while carry.len() < column + colspan {
+                        carry.push(0);
+                    }
+                    // Counted down once at the end of every row, including this
+                    // one, so `rowspan: 2` still covers the row below.
+                    for c in column..column + colspan {
+                        carry[c] = rowspan;
+                    }
+                }
+                column += colspan;
+                column_count = column_count.max(column);
+            }
+            // One row consumed from every outstanding rowspan.
+            for slot in carry.iter_mut() {
+                *slot = slot.saturating_sub(1);
+            }
+            let _ = r;
+        }
+        if column_count == 0 {
             return self.layout_block_children(fonts, images);
         }
-        let gaps = spacing * widths.len().saturating_sub(1) as f32;
-        let natural: f32 = widths.iter().sum();
+
+        // Only single-column cells drive column widths; spanning cells would
+        // otherwise inflate whichever column they happen to start in.
+        let mut widths: Vec<f32> = vec![0.0; column_count];
+        for item in &placed {
+            if item.colspan != 1 {
+                continue;
+            }
+            let cell = &row_at(&self.children, rows[item.row]).children[item.cell];
+            let wanted = match cell.box_type {
+                BoxType::AnonymousBlock => 0.0,
+                _ => max_content_width(cell.get_style_node(), fonts, images),
+            };
+            widths[item.column] = widths[item.column].max(wanted);
+        }
+        let gaps = spacing * column_count.saturating_sub(1) as f32;
         let available = (container.width - gaps).max(1.0);
+        let natural: f32 = widths.iter().sum();
         if natural > 0.0 {
             let scale = available / natural;
-            for w in widths.iter_mut() {
-                *w *= scale;
-            }
+            widths.iter_mut().for_each(|w| *w *= scale);
         } else {
-            let even = available / widths.len() as f32;
+            let even = available / column_count as f32;
             widths.iter_mut().for_each(|w| *w = even);
         }
 
-        // Place cells column by column, then equalise each row's height.
-        let mut cursor_y = container.y;
-        let mut total_height = 0.0_f32;
-        for (index, &path) in rows.iter().enumerate() {
-            let mut row_height = 0.0_f32;
-            {
-                let row = row_at_mut(&mut self.children, path);
-                let mut cursor_x = container.x;
-                for (c, cell) in row.children.iter_mut().enumerate() {
-                    let width = widths.get(c).copied().unwrap_or(0.0);
-                    let mut slot: Dimensions = Default::default();
-                    slot.content = Rect { x: cursor_x, y: cursor_y, width, height: 0.0 };
-                    cell.layout(slot, fonts, images);
-                    row_height = row_height.max(cell.dimensions.margin_box().height);
-                    cursor_x += width + spacing;
-                }
-                // Stretch cells so a row's backgrounds share one baseline.
-                for cell in row.children.iter_mut() {
-                    let outer = cell.dimensions.margin_box().height;
-                    if outer < row_height {
-                        cell.dimensions.content.height += row_height - outer;
-                    }
-                }
-                row.dimensions.content = Rect {
-                    x: container.x,
-                    y: cursor_y,
-                    width: container.width,
-                    height: row_height,
-                };
+        // Row heights: measure each cell, attributing a rowspan cell to its last row.
+        let mut row_heights: Vec<f32> = vec![0.0; rows.len()];
+        for item in &placed {
+            let width = span_width(&widths, item.column, item.colspan, spacing);
+            let row_path = rows[item.row];
+            let cell = &mut row_at_mut(&mut self.children, row_path).children[item.cell];
+            let mut slot: Dimensions = Default::default();
+            slot.content = Rect { x: container.x, y: container.y, width, height: 0.0 };
+            cell.layout(slot, fonts, images);
+            if item.rowspan == 1 {
+                let height = cell.dimensions.margin_box().height;
+                row_heights[item.row] = row_heights[item.row].max(height);
             }
-            cursor_y += row_height + spacing;
-            total_height += row_height;
-            if index + 1 < rows.len() {
-                total_height += spacing;
+        }
+        // A spanning cell only needs the rows it covers to add up to its height.
+        for item in placed.iter().filter(|p| p.rowspan > 1) {
+            let last = (item.row + item.rowspan - 1).min(rows.len() - 1);
+            let covered: f32 = row_heights[item.row..=last].iter().sum::<f32>()
+                + spacing * (last - item.row) as f32;
+            let cell = &row_at(&self.children, rows[item.row]).children[item.cell];
+            let needed = cell.dimensions.margin_box().height;
+            if needed > covered {
+                row_heights[last] += needed - covered;
             }
         }
 
+        // Final placement, now that column x offsets and row y offsets are known.
+        let row_tops: Vec<f32> = row_heights
+            .iter()
+            .scan(container.y, |y, h| {
+                let top = *y;
+                *y += h + spacing;
+                Some(top)
+            })
+            .collect();
+
+        for item in &placed {
+            let width = span_width(&widths, item.column, item.colspan, spacing);
+            let x = container.x
+                + widths[..item.column].iter().sum::<f32>()
+                + spacing * item.column as f32;
+            let last = (item.row + item.rowspan - 1).min(rows.len() - 1);
+            let height: f32 = row_heights[item.row..=last].iter().sum::<f32>()
+                + spacing * (last - item.row) as f32;
+
+            let row_path = rows[item.row];
+            let top = row_tops[item.row];
+            let cell = &mut row_at_mut(&mut self.children, row_path).children[item.cell];
+            let mut slot: Dimensions = Default::default();
+            slot.content = Rect { x, y: top, width, height: 0.0 };
+            cell.layout(slot, fonts, images);
+            // Stretch so a row's backgrounds share one baseline.
+            let outer = cell.dimensions.margin_box().height;
+            if outer < height {
+                cell.dimensions.content.height += height - outer;
+            }
+        }
+
+        for (r, &path) in rows.iter().enumerate() {
+            let row = row_at_mut(&mut self.children, path);
+            row.dimensions.content = Rect {
+                x: container.x,
+                y: row_tops[r],
+                width: container.width,
+                height: row_heights[r],
+            };
+        }
+
         // Sections wrap their rows, so give them the union of what they contain.
-        for (i, child) in self.children.iter_mut().enumerate() {
+        for child in self.children.iter_mut() {
             if matches!(tag_name_of(child).as_deref(), Some("tbody" | "thead" | "tfoot")) {
                 let top = child.children.first().map(|r| r.dimensions.content.y);
                 let bottom = child
@@ -370,17 +446,13 @@ impl<'a> LayoutBox<'a> {
                     .last()
                     .map(|r| r.dimensions.content.y + r.dimensions.content.height);
                 if let (Some(top), Some(bottom)) = (top, bottom) {
-                    child.dimensions.content = Rect {
-                        x: container.x,
-                        y: top,
-                        width: container.width,
-                        height: bottom - top,
-                    };
+                    child.dimensions.content =
+                        Rect { x: container.x, y: top, width: container.width, height: bottom - top };
                 }
             }
-            let _ = i;
         }
-        self.dimensions.content.height = total_height;
+        self.dimensions.content.height = row_heights.iter().sum::<f32>()
+            + spacing * rows.len().saturating_sub(1) as f32;
     }
 
     /// Grid layout: place items into a track grid, honouring explicit placement.
@@ -1371,6 +1443,27 @@ fn measure_text(text: &str, size: f32, fonts: Option<&FontSet>) -> f32 {
     shape_run(&fonts.entries[fonts.pick(&trimmed)], &trimmed, size).1
 }
 
+/// `colspan`/`rowspan` for a cell, defaulting to 1 and clamped to something sane.
+fn cell_spans(style: &StyledNode) -> (usize, usize) {
+    let attr = |name: &str| match style.node.node_type {
+        NodeType::Element(ref e) => e
+            .attributes
+            .get(name)
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(1)
+            .clamp(1, 1000),
+        _ => 1,
+    };
+    (attr("colspan"), attr("rowspan"))
+}
+
+/// Total width of `colspan` columns starting at `column`, including the gaps
+/// between them, which a spanning cell absorbs.
+fn span_width(widths: &[f32], column: usize, colspan: usize, spacing: f32) -> f32 {
+    let end = (column + colspan).min(widths.len());
+    widths[column..end].iter().sum::<f32>() + spacing * (end - column).saturating_sub(1) as f32
+}
+
 /// The tag of an element box, if it is one.
 fn tag_name_of(bx: &LayoutBox) -> Option<String> {
     let style = match bx.box_type {
@@ -1545,6 +1638,70 @@ mod tests {
         assert_eq!(resolve_tracks("repeat(3, 1fr)", 920.0, 20.0, ctx), vec![293.33334; 3]);
         // A fixed track keeps its size; fr splits what's left (600 - 200 - 10 = 390).
         assert_eq!(resolve_tracks("200px 1fr 2fr", 600.0, 5.0, ctx), vec![200.0, 130.0, 260.0]);
+    }
+
+    #[test]
+    fn span_width_absorbs_the_gaps_it_covers() {
+        let widths = [100.0, 150.0, 200.0];
+        assert_eq!(span_width(&widths, 0, 1, 10.0), 100.0);
+        // Spanning two columns also swallows the 10px gap between them.
+        assert_eq!(span_width(&widths, 0, 2, 10.0), 260.0);
+        assert_eq!(span_width(&widths, 0, 3, 10.0), 470.0);
+        // A span running past the last column is clamped, not a panic.
+        assert_eq!(span_width(&widths, 2, 5, 10.0), 200.0);
+    }
+
+    #[test]
+    fn table_cells_span_columns_and_rows() {
+        let node = dom::elem("div".into(), HashMap::new(), vec![]);
+        // Cells need real element nodes so colspan/rowspan attributes are visible.
+        let cell_node = |colspan: &str, rowspan: &str| {
+            let mut attrs = HashMap::new();
+            if !colspan.is_empty() {
+                attrs.insert("colspan".to_string(), colspan.to_string());
+            }
+            if !rowspan.is_empty() {
+                attrs.insert("rowspan".to_string(), rowspan.to_string());
+            }
+            dom::elem("td".into(), attrs, vec![])
+        };
+        let plain = cell_node("", "");
+        let wide = cell_node("2", "");
+        let tall = cell_node("", "2");
+
+        fn block<'a>(n: &'a dom::Node) -> StyledNode<'a> {
+            let mut v = HashMap::new();
+            v.insert("display".to_string(), Value::Keyword("block".into()));
+            v.insert("height".to_string(), Value::Length(20.0, Unit::Px));
+            StyledNode { node: n, specified_values: v, children: vec![] }
+        }
+        let tr = dom::elem("tr".into(), HashMap::new(), vec![]);
+        fn row<'a>(n: &'a dom::Node, cells: Vec<StyledNode<'a>>) -> StyledNode<'a> {
+            let mut v = HashMap::new();
+            v.insert("display".to_string(), Value::Keyword("block".into()));
+            StyledNode { node: n, specified_values: v, children: cells }
+        }
+        // Row 0: [rowspan=2][colspan=2]   Row 1: [a][b]  (col 0 covered by the rowspan)
+        let mut table_values = HashMap::new();
+        table_values.insert("display".to_string(), Value::Keyword("table".into()));
+        let table = StyledNode {
+            node: &node,
+            specified_values: table_values,
+            children: vec![
+                row(&tr, vec![block(&tall), block(&wide)]),
+                row(&tr, vec![block(&plain), block(&plain)]),
+            ],
+        };
+
+        let mut viewport: Dimensions = Default::default();
+        viewport.content.width = 300.0;
+        let laid = layout_tree(&table, viewport, None, &ImageMap::new());
+
+        let row1: Vec<f32> =
+            laid.children[1].children.iter().map(|c| c.dimensions.content.x).collect();
+        // Column 0 is still owned by the rowspan, so row 1 starts at column 1.
+        assert!(row1[0] > 0.0, "second row must skip the spanned column, got {row1:?}");
+        assert!(row1[1] > row1[0]);
     }
 
     #[test]
