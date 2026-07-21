@@ -73,6 +73,9 @@ pub struct Document {
     selections: HashMap<usize, (String, String)>,
     /// The find-in-page query, highlighted on the next render.
     find: Option<String>,
+    /// The parsed stylesheet, kept between renders, keyed by the source text and
+    /// the viewport width it was filtered for.
+    sheet: Option<((u64, u32), css::Stylesheet, style::RuleIndex)>,
     /// The element under the cursor, plus its ancestors — `:hover` applies to
     /// the whole chain, not just the innermost element.
     hovered: style::HoverChain,
@@ -126,6 +129,7 @@ impl Document {
             focus_baseline: String::new(),
             selections: HashMap::new(),
             find: None,
+            sheet: None,
             hovered: Default::default(),
             console: Vec::new(),
         };
@@ -630,26 +634,32 @@ impl Engine {
 
         // Cascade order (later wins on ties):
         // UA stylesheet < linked stylesheets < page <style> < caller CSS.
-        let mut stylesheet = css::parse(USER_AGENT_CSS.to_string());
-        let mut linked = String::new();
-        collect_linked_css(root, loader, &mut linked);
-        stylesheet.rules.extend(css::parse(linked).rules);
-        let mut page_css = String::new();
-        collect_style_text(root, &mut page_css);
-        stylesheet.rules.extend(css::parse(page_css).rules);
-        stylesheet
-            .rules
-            .extend(css::parse(css_source.to_string()).rules);
+        let mut source = USER_AGENT_CSS.to_string();
+        collect_linked_css(root, loader, &mut source);
+        source.push('\n');
+        collect_style_text(root, &mut source);
+        source.push('\n');
+        source.push_str(css_source);
 
-        // Media blocks are parsed but only apply at this viewport width.
-        stylesheet.rules.retain(|rule| css::media_matches(rule.media.as_deref(), width));
+        // Parsing a real site's CSS costs more than styling, layout and paint
+        // together, and it is the same text on every render — so reuse it unless
+        // the text or the viewport width (which decides @media) has changed.
+        let key = (hash_of(&source), width.to_bits());
+        if doc.sheet.as_ref().map(|(cached, ..)| *cached) != Some(key) {
+            let mut parsed = css::parse(source);
+            parsed.rules.retain(|rule| css::media_matches(rule.media.as_deref(), width));
+            let index = style::RuleIndex::build(&parsed);
+            doc.sheet = Some((key, parsed, index));
+        }
+        let (_, stylesheet, rule_index) = doc.sheet.as_ref().expect("just cached");
+
         // Whether any rule cares about the cursor, so the embedder can skip
         // re-rendering on mouse movement when nothing would change.
         let uses_hover = stylesheet
             .rules
             .iter()
             .any(|rule| rule.selectors.iter().any(|s| s.parts.iter().any(|p| p.simple.hover)));
-        let style_root = style::style_tree_with_hover(root, &stylesheet, &doc.hovered);
+        let style_root = style::style_tree_indexed(root, stylesheet, rule_index, &doc.hovered);
 
         // Fetch + decode every <img> up front so layout knows their sizes.
         let mut images = ImageMap::new();
@@ -916,6 +926,14 @@ fn node_at<'a>(root: &'a mut Node, path: &[usize]) -> Option<&'a mut Node> {
 }
 
 /// Gather the text inside every `<script>` element into one JS source string.
+/// A cheap content hash, to notice when a page's CSS actually changes.
+fn hash_of(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// A node and every element it sits inside, by id.
 fn ancestor_chain(root: &Node, node_id: usize) -> style::HoverChain {
     fn walk(node: &Node, node_id: usize, path: &mut Vec<usize>) -> bool {

@@ -181,30 +181,95 @@ fn matches_simple_selector<E: Matchable>(elem: &E, selector: &SimpleSelector) ->
     selector.attrs.iter().all(|test| test.matches(elem.attr(&test.name)))
 }
 
-type MatchedRule<'a> = (Specificity, &'a Rule);
+/// Rules bucketed by what their subject requires, so an element only tests the
+/// handful that could possibly match instead of the whole sheet.
+///
+/// A real page has hundreds of rules and thousands of elements; matching every
+/// pair was costing more than layout and paint together.
+pub struct RuleIndex {
+    by_id: HashMap<String, Vec<usize>>,
+    by_class: HashMap<String, Vec<usize>>,
+    by_tag: HashMap<String, Vec<usize>>,
+    /// Rules whose subject names nothing indexable (`*`, `[attr]`, `:hover`).
+    universal: Vec<usize>,
+}
+
+impl RuleIndex {
+    pub fn build(stylesheet: &Stylesheet) -> RuleIndex {
+        let mut index = RuleIndex {
+            by_id: HashMap::new(),
+            by_class: HashMap::new(),
+            by_tag: HashMap::new(),
+            universal: Vec::new(),
+        };
+        for (i, rule) in stylesheet.rules.iter().enumerate() {
+            for selector in &rule.selectors {
+                // The subject decides: ancestor conditions are checked later.
+                let Some(subject) = selector.subject() else {
+                    index.universal.push(i);
+                    continue;
+                };
+                // Most selective key first, so buckets stay small.
+                if let Some(id) = &subject.id {
+                    index.by_id.entry(id.clone()).or_default().push(i);
+                } else if let Some(class) = subject.class.first() {
+                    index.by_class.entry(class.clone()).or_default().push(i);
+                } else if let Some(tag) = &subject.tag_name {
+                    index.by_tag.entry(tag.clone()).or_default().push(i);
+                } else {
+                    index.universal.push(i);
+                }
+            }
+        }
+        index
+    }
+
+    /// Rule indices worth testing against this element, in document order.
+    fn candidates<E: Matchable>(&self, elem: &E, classes: &[&str]) -> Vec<usize> {
+        let mut out = self.universal.clone();
+        if let Some(id) = elem.elem_id() {
+            out.extend(self.by_id.get(id).into_iter().flatten());
+        }
+        for class in classes {
+            out.extend(self.by_class.get(*class).into_iter().flatten());
+        }
+        out.extend(self.by_tag.get(elem.tag()).into_iter().flatten());
+        // A rule can arrive by more than one route (two selectors, two classes).
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+}
+
+/// (specificity, document order, rule) — order breaks specificity ties, so a
+/// bucketed sweep cascades exactly like a linear one.
+type MatchedRule<'a> = (Specificity, usize, &'a Rule);
 
 fn match_rule<'a>(
     elem: &ElementData,
     ancestors: &[&ElementData],
     rule: &'a Rule,
+    order: usize,
     hovered: &HoverChain,
 ) -> Option<MatchedRule<'a>> {
     rule.selectors
         .iter()
         .find(|selector| matches(elem, ancestors, selector, hovered))
-        .map(|selector| (selector.specificity(), rule))
+        .map(|selector| (selector.specificity(), order, rule))
 }
 
 fn matching_rules<'a>(
     elem: &ElementData,
     ancestors: &[&ElementData],
     stylesheet: &'a Stylesheet,
+    index: &RuleIndex,
     hovered: &HoverChain,
 ) -> Vec<MatchedRule<'a>> {
-    stylesheet
-        .rules
-        .iter()
-        .filter_map(|rule| match_rule(elem, ancestors, rule, hovered))
+    let classes: Vec<&str> = elem.classes().into_iter().collect();
+    index
+        .candidates(elem, &classes)
+        .into_iter()
+        .filter_map(|i| match_rule(elem, ancestors, &stylesheet.rules[i], i, hovered))
         .collect()
 }
 
@@ -212,13 +277,15 @@ fn specified_values(
     elem: &ElementData,
     ancestors: &[&ElementData],
     stylesheet: &Stylesheet,
+    index: &RuleIndex,
     hovered: &HoverChain,
 ) -> PropertyMap {
     let mut values = presentation_hints(elem);
-    let mut rules = matching_rules(elem, ancestors, stylesheet, hovered);
-    // Apply low specificity first so high specificity overrides it.
-    rules.sort_by(|&(a, _), &(b, _)| a.cmp(&b));
-    for (_, rule) in rules {
+    let mut rules = matching_rules(elem, ancestors, stylesheet, index, hovered);
+    // Apply low specificity first so high specificity overrides it, and let
+    // document order settle ties.
+    rules.sort_by(|&(a, ai, _), &(b, bi, _)| a.cmp(&b).then(ai.cmp(&bi)));
+    for (_, _, rule) in rules {
         for declaration in &rule.declarations {
             values.insert(declaration.name.clone(), declaration.value.clone());
         }
@@ -232,6 +299,12 @@ fn specified_values(
 /// is a `bgcolor` attribute, not a stylesheet. These are the lowest priority
 /// input to the cascade, so any CSS rule still overrides them.
 fn presentation_hints(elem: &ElementData) -> PropertyMap {
+    const NAMES: [&str; 6] = ["bgcolor", "text", "color", "align", "width", "height"];
+    // Most elements have none of these, and the map itself costs more than the
+    // check does.
+    if !NAMES.iter().any(|name| elem.attributes.contains_key(*name)) {
+        return PropertyMap::new();
+    }
     let mut hints = PropertyMap::new();
     let attr = |name: &str| elem.attributes.get(name).map(|v| v.trim().to_string());
 
@@ -312,17 +385,11 @@ fn substitute_vars(text: &str, vars: &PropertyMap) -> Option<String> {
     Some(out)
 }
 
-/// Turn values that mention variables into real values, now that inheritance
-/// has brought every visible custom property into `values`.
-fn resolve_vars(values: &mut PropertyMap) {
-    let vars: PropertyMap = values
-        .iter()
-        .filter(|(name, _)| is_custom_property(name))
-        .map(|(name, value)| (name.clone(), value.clone()))
-        .collect();
-    if vars.is_empty() {
-        return;
-    }
+/// Turn values that mention variables into real values, using the custom
+/// properties visible at this element.
+fn resolve_vars(values: &mut PropertyMap, vars: &PropertyMap) {
+    // Most elements mention no variable at all. Finding that out first avoids
+    // copying the inherited variable table onto every element on the page.
     let pending: Vec<(String, String)> = values
         .iter()
         .filter_map(|(name, value)| match value {
@@ -332,8 +399,11 @@ fn resolve_vars(values: &mut PropertyMap) {
             _ => None,
         })
         .collect();
+    if pending.is_empty() {
+        return;
+    }
     for (name, text) in pending {
-        match substitute_vars(&text, &vars).and_then(|text| crate::css::parse_value(&text)) {
+        match substitute_vars(&text, vars).and_then(|text| crate::css::parse_value(&text)) {
             Some(value) => {
                 values.insert(name, value);
             }
@@ -359,18 +429,42 @@ pub fn style_tree_with_hover<'a>(
     stylesheet: &'a Stylesheet,
     hovered: &HoverChain,
 ) -> StyledNode<'a> {
-    style_tree_inner(root, stylesheet, &HashMap::new(), &mut Vec::new(), hovered)
+    let index = RuleIndex::build(stylesheet);
+    style_tree_indexed(root, stylesheet, &index, hovered)
+}
+
+/// Style a tree with an index that was built once and kept, which is what a
+/// repeated render should do rather than rebuilding it every frame.
+pub fn style_tree_indexed<'a>(
+    root: &'a Node,
+    stylesheet: &'a Stylesheet,
+    index: &RuleIndex,
+    hovered: &HoverChain,
+) -> StyledNode<'a> {
+    style_tree_inner(
+        root,
+        stylesheet,
+        index,
+        &HashMap::new(),
+        &std::rc::Rc::new(PropertyMap::new()),
+        &mut Vec::new(),
+        hovered,
+    )
 }
 
 fn style_tree_inner<'a>(
     root: &'a Node,
     stylesheet: &'a Stylesheet,
+    index: &RuleIndex,
     inherited: &PropertyMap,
+    inherited_vars: &std::rc::Rc<PropertyMap>,
     ancestors: &mut Vec<&'a ElementData>,
     hovered: &HoverChain,
 ) -> StyledNode<'a> {
     let mut specified = match root.node_type {
-        NodeType::Element(ref elem) => specified_values(elem, ancestors, stylesheet, hovered),
+        NodeType::Element(ref elem) => {
+            specified_values(elem, ancestors, stylesheet, index, hovered)
+        }
         NodeType::Text(_) => HashMap::new(),
     };
     for prop in INHERITED_PROPERTIES {
@@ -380,12 +474,23 @@ fn style_tree_inner<'a>(
             }
         }
     }
-    // Every custom property in scope inherits, then values that mention one can
-    // finally be read.
-    for (name, value) in inherited.iter().filter(|(name, _)| is_custom_property(name)) {
-        specified.entry(name.clone()).or_insert_with(|| value.clone());
-    }
-    resolve_vars(&mut specified);
+    // Custom properties inherit, but copying them onto every element costs more
+    // than everything else in the cascade on a page that defines many. The table
+    // is shared instead, and only rebuilt where an element adds to it.
+    let vars = match specified.keys().any(|name| is_custom_property(name)) {
+        false => std::rc::Rc::clone(inherited_vars),
+        true => {
+            let mut own = (**inherited_vars).clone();
+            own.extend(
+                specified
+                    .iter()
+                    .filter(|(name, _)| is_custom_property(name))
+                    .map(|(name, value)| (name.clone(), value.clone())),
+            );
+            std::rc::Rc::new(own)
+        }
+    };
+    resolve_vars(&mut specified, &vars);
 
     // Collapse font-size to absolute px now: `em` is relative to the *parent's*
     // font size, which is only knowable here during the top-down walk.
@@ -408,7 +513,9 @@ fn style_tree_inner<'a>(
     let children: Vec<StyledNode> = root
         .children
         .iter()
-        .map(|child| style_tree_inner(child, stylesheet, &specified, ancestors, hovered))
+        .map(|child| {
+            style_tree_inner(child, stylesheet, index, &specified, &vars, ancestors, hovered)
+        })
         .collect();
     if matches!(root.node_type, NodeType::Element(_)) {
         ancestors.pop();
