@@ -267,6 +267,26 @@ fn render_layout_box(list: &mut DisplayList, layout_box: &LayoutBox) {
     if let Some(src) = image_src(layout_box) {
         list.push(DisplayCommand::Image(src, layout_box.dimensions.content));
     }
+    // Inline element backgrounds sit under their own text but over the block's.
+    for inline in &layout_box.inline_boxes {
+        let rect =
+            Rect { x: inline.x, y: inline.y, width: inline.width, height: inline.height };
+        if let Some(background) = inline.background {
+            if inline.radius > 0.0 {
+                list.push(DisplayCommand::RoundedColor(background, rect, inline.radius));
+            } else {
+                list.push(DisplayCommand::SolidColor(background, rect));
+            }
+        }
+        if let Some(border) = inline.border_color {
+            // A hairline outline is enough until inline border widths are modelled.
+            list.push(DisplayCommand::SolidColor(border, Rect { height: 1.0, ..rect }));
+            list.push(DisplayCommand::SolidColor(
+                border,
+                Rect { y: rect.y + rect.height - 1.0, height: 1.0, ..rect },
+            ));
+        }
+    }
     // Text sits above this box's background/borders.
     for frag in &layout_box.text_fragments {
         list.push(DisplayCommand::Text(frag.clone()));
