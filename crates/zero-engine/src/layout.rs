@@ -144,7 +144,11 @@ impl<'a> LayoutBox<'a> {
         self.calculate_block_width(containing_block);
         self.calculate_block_position(containing_block);
         // Then children are laid out to discover this box's height.
-        self.layout_block_children(fonts, images);
+        if self.get_style_node().display() == Display::Flex {
+            self.layout_flex_children(fonts, images);
+        } else {
+            self.layout_block_children(fonts, images);
+        }
         self.calculate_block_height();
         // A replaced element (<img>) overrides content size with its resolved dimensions.
         if let Some((w, h)) = self.resolved_image_size(images) {
@@ -349,12 +353,82 @@ impl<'a> LayoutBox<'a> {
     }
 
     fn layout_block_children(&mut self, fonts: Option<&FontSet>, images: &ImageMap) {
+        self.layout_block_children_gapped(fonts, images, 0.0);
+    }
+
+    fn layout_block_children_gapped(
+        &mut self,
+        fonts: Option<&FontSet>,
+        images: &ImageMap,
+        gap: f32,
+    ) {
+        let count = self.children.len();
         let d = &mut self.dimensions;
-        for child in &mut self.children {
+        for (i, child) in self.children.iter_mut().enumerate() {
             child.layout(*d, fonts, images);
             // Grow this box to contain each child's margin box.
             d.content.height += child.dimensions.margin_box().height;
+            if gap > 0.0 && i + 1 < count {
+                d.content.height += gap;
+            }
         }
+    }
+
+    /// Single-line flex layout.
+    ///
+    /// ponytail: no wrapping, no `flex-grow/shrink/basis`, no `justify-content` or
+    /// `align-items`, and no intrinsic content sizing. Items with an explicit main
+    /// size keep it; the rest split the leftover space equally (which is what
+    /// `flex: 1` does, and covers most real column/nav layouts).
+    fn layout_flex_children(&mut self, fonts: Option<&FontSet>, images: &ImageMap) {
+        let style = self.get_style_node();
+        let is_column = matches!(style.value("flex-direction"), Some(Value::Keyword(ref k)) if k == "column");
+        let gap = style.value("gap").map(|v| v.to_px()).filter(|g| *g > 0.0).unwrap_or(0.0);
+
+        if is_column {
+            // A column flex container stacks like a block, just with gaps.
+            return self.layout_block_children_gapped(fonts, images, gap);
+        }
+
+        let container = self.dimensions.content;
+        let count = self.children.len();
+        if count == 0 {
+            return;
+        }
+
+        // Explicit widths are honoured; everything else shares what's left.
+        let explicit: Vec<Option<f32>> = self
+            .children
+            .iter()
+            .map(|child| match child.box_type {
+                BoxType::AnonymousBlock => None,
+                _ => child.get_style_node().value("width").map(|v| v.to_px()).filter(|w| *w > 0.0),
+            })
+            .collect();
+        let fixed: f32 = explicit.iter().flatten().sum();
+        let flexible = explicit.iter().filter(|w| w.is_none()).count();
+        let total_gap = gap * count.saturating_sub(1) as f32;
+        let leftover = (container.width - fixed - total_gap).max(0.0);
+        let share = if flexible > 0 { leftover / flexible as f32 } else { 0.0 };
+
+        let mut cursor_x = container.x;
+        let mut tallest = 0.0_f32;
+        for (i, child) in self.children.iter_mut().enumerate() {
+            // Each item gets a containing block that is exactly its slot, so an
+            // `auto` width fills the slot rather than the whole container.
+            let mut slot: Dimensions = Default::default();
+            slot.content = Rect {
+                x: cursor_x,
+                y: container.y,
+                width: explicit[i].unwrap_or(share),
+                height: 0.0,
+            };
+            child.layout(slot, fonts, images);
+            let item = child.dimensions.margin_box();
+            cursor_x += item.width + gap;
+            tallest = tallest.max(item.height);
+        }
+        self.dimensions.content.height = tallest;
     }
 
     fn calculate_block_height(&mut self) {
@@ -462,17 +536,27 @@ pub fn collect_links(bx: &LayoutBox, out: &mut Vec<LinkArea>) {
 }
 
 fn build_layout_tree<'a>(style_node: &'a StyledNode<'a>) -> LayoutBox<'a> {
-    let mut root = LayoutBox::new(match style_node.display() {
-        Display::Block => BoxType::BlockNode(style_node),
+    build_box(style_node, false)
+}
+
+/// `force_block` blockifies a node because its parent is a flex container —
+/// flex items are always block-level, whatever their own `display` says.
+fn build_box<'a>(style_node: &'a StyledNode<'a>, force_block: bool) -> LayoutBox<'a> {
+    let display = style_node.display();
+    let mut root = LayoutBox::new(match display {
+        Display::Block | Display::Flex => BoxType::BlockNode(style_node),
+        Display::Inline if force_block => BoxType::BlockNode(style_node),
         Display::Inline => BoxType::InlineNode(style_node),
         Display::None => panic!("Root node has display: none."),
     });
 
+    let parent_is_flex = display == Display::Flex;
     for child in &style_node.children {
         match child.display() {
-            Display::Block => root.children.push(build_layout_tree(child)),
-            Display::Inline => root.get_inline_container().children.push(build_layout_tree(child)),
             Display::None => {} // skip
+            Display::Block | Display::Flex => root.children.push(build_box(child, false)),
+            Display::Inline if parent_is_flex => root.children.push(build_box(child, true)),
+            Display::Inline => root.get_inline_container().children.push(build_box(child, false)),
         }
     }
     root
@@ -498,6 +582,49 @@ mod tests {
 
         let root = layout_tree(&styled, viewport, None, &ImageMap::new());
         assert_eq!(root.dimensions.content.width, 200.0);
+    }
+
+    /// Build a styled node with the given `display`/`width`, plus children.
+    fn styled<'a>(
+        node: &'a dom::Node,
+        display: &str,
+        width: Option<f32>,
+        children: Vec<StyledNode<'a>>,
+    ) -> StyledNode<'a> {
+        let mut values = HashMap::new();
+        values.insert("display".to_string(), Value::Keyword(display.into()));
+        if let Some(w) = width {
+            values.insert("width".to_string(), Value::Length(w, Unit::Px));
+        }
+        StyledNode { node, specified_values: values, children }
+    }
+
+    #[test]
+    fn flex_row_splits_leftover_space_between_auto_items() {
+        let node = dom::elem("div".into(), HashMap::new(), vec![]);
+        // 900 wide: one fixed 300px item, two auto items share the rest.
+        let root = styled(
+            &node,
+            "flex",
+            None,
+            vec![
+                styled(&node, "block", Some(300.0), vec![]),
+                styled(&node, "block", None, vec![]),
+                styled(&node, "block", None, vec![]),
+            ],
+        );
+        let mut viewport: Dimensions = Default::default();
+        viewport.content.width = 900.0;
+
+        let laid = layout_tree(&root, viewport, None, &ImageMap::new());
+        let widths: Vec<f32> = laid.children.iter().map(|c| c.dimensions.content.width).collect();
+        assert_eq!(widths, vec![300.0, 300.0, 300.0]);
+
+        // Items sit side by side, not stacked.
+        let xs: Vec<f32> = laid.children.iter().map(|c| c.dimensions.content.x).collect();
+        assert_eq!(xs, vec![0.0, 300.0, 600.0]);
+        let ys: Vec<f32> = laid.children.iter().map(|c| c.dimensions.content.y).collect();
+        assert_eq!(ys, vec![0.0, 0.0, 0.0]);
     }
 
     #[test]
