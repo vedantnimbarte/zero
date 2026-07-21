@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <style>
+        body { background: #0e0f12; color: #f2f3f5; padding: 24px; font-size: 16px; }
+        h1 { color: #e5484d; font-size: 28px; }
+        h2 { color: #9a9da6; font-size: 15px; }
+
+        .row { display: flex; gap: 12px; }
+        .card { background: #17181c; padding: 16px; }
+        .sidebar { display: flex; gap: 12px; }
+        .rail { background: #e5484d; color: #ffffff; width: 180px; padding: 16px; }
+        .main { background: #1f2127; padding: 16px; }
+        .col { display: flex; flex-direction: column; gap: 8px; }
+        .chip { background: #30a46c; color: #0e0f12; padding: 10px; }
+    </style>
+</head>
+<body>
+    <h1>Flexbox layout</h1>
+
+    <h2>Three equal columns (all auto width)</h2>
+    <div class="row">
+        <div class="card">First column shares the space equally with its siblings.</div>
+        <div class="card">Second column, same treatment.</div>
+        <div class="card">Third column completes the row.</div>
+    </div>
+
+    <h2>Fixed sidebar + flexible main</h2>
+    <div class="sidebar">
+        <div class="rail">Fixed 180px</div>
+        <div class="main">This panel absorbs whatever width is left over, which is how real page shells are built.</div>
+    </div>
+
+    <h2>Column direction with gap</h2>
+    <div class="col">
+        <div class="chip">stacked one</div>
+        <div class="chip">stacked two</div>
+    </div>
+</body>
+</html>
