@@ -24,6 +24,10 @@ pub fn parse(source: String) -> dom::Node {
         input: source,
     };
     let mut nodes = parser.parse_nodes();
+    // Whitespace *between* top-level tags belongs to no element and is not
+    // content — keeping it would wrap a well-formed document in a second,
+    // synthetic <html>, which changes what the page's root element is.
+    nodes.retain(|node| !matches!(&node.node_type, dom::NodeType::Text(t) if t.trim().is_empty()));
     if nodes.len() == 1 {
         nodes.swap_remove(0)
     } else {
@@ -107,12 +111,11 @@ impl Parser {
     fn parse_text(&mut self) -> Option<dom::Node> {
         let raw = self.consume_while(|c| c != '<');
         let decoded = decode_entities(&raw);
-        // Drop whitespace-only text between block tags.
-        if decoded.trim().is_empty() {
-            None
-        } else {
-            Some(dom::text(decoded))
-        }
+        // Whitespace-only text is kept: whether it collapses is a styling
+        // question (`white-space`), not a parsing one, and inside a <pre> it is
+        // the indentation of the code. Text of no length at all is still
+        // nothing — back-to-back tags must not sprout empty nodes.
+        (!decoded.is_empty()).then(|| dom::text(decoded))
     }
 
     fn parse_element(&mut self) -> dom::Node {
