@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html><head><style>
+body { background: #0e0f12; color: #f2f3f5; padding: 26px; font-size: 15px; }
+h1 { color: #e5484d; font-size: 26px; }
+h2 { color: #9a9da6; font-size: 13px; }
+.row { display: flex; gap: 10px; }
+.field { background: #ffffff; color: #111111; padding: 9px; border-radius: 6px; width: 300px; }
+.go { background: #30a46c; color: #06251a; padding: 9px; border-radius: 6px; width: 120px; }
+.out { background: #17181c; padding: 14px; border-radius: 8px; box-shadow: 0px 4px 12px #00000099; }
+</style></head><body>
+<h1>Forms and text input</h1>
+<h2>Click a field, type, then press the button</h2>
+<div class="row">
+  <input id="name" class="field" placeholder="your name">
+  <div id="go" class="go">Greet</div>
+</div>
+<h2>Second field</h2>
+<input id="city" class="field" value="Pune">
+<h2>Output</h2>
+<div id="out" class="out">nothing yet</div>
+<script>
+  var out = document.getElementById('out');
+  document.getElementById('go').onclick = function () {
+    var name = document.getElementById('name').value;
+    var city = document.getElementById('city').value;
+    out.textContent = name === '' ? 'type a name first' : 'Hello ' + name + ' from ' + city + '!';
+  };
+</script>
+</body></html>
