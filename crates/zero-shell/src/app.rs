@@ -129,19 +129,26 @@ struct Tab {
     blocked_count: usize,
     page_canvas: Option<zero_engine::Canvas>,
     links: Vec<zero_engine::LinkArea>,
+    /// Find-in-page match boxes from the last render, for jumping between them.
+    matches: Vec<zero_engine::layout::Rect>,
+    /// Shared with this tab's document so its subresource cache outlives a
+    /// single render — the engine re-asks for images and stylesheets each time.
+    loader: Rc<ShellLoader>,
     cache_w: u32,
     cache_h: u32,
 }
 
 impl Tab {
     fn new(address: String, html: String, css: String) -> Tab {
+        let loader = Rc::new(ShellLoader::new(address.clone()));
         let doc = zero_engine::Document::load_hosted(
             &html,
             &css,
-            Some(Rc::new(ShellLoader::new(address.clone()))),
+            Some(loader.clone()),
             Some(Rc::new(crate::localstore::SiteStore::for_site(&storage_site(&address)))),
         );
         Tab {
+            loader,
             history: vec![address.clone()],
             address,
             doc,
@@ -152,6 +159,7 @@ impl Tab {
             blocked_count: 0,
             page_canvas: None,
             links: Vec::new(),
+            matches: Vec::new(),
             cache_w: 0,
             cache_h: 0,
         }
@@ -176,6 +184,7 @@ pub fn run_window(engine: Engine, html: String, css: String, address: String) {
         ai_open: false,
         ai_text: String::new(),
         toolbar_rects: Vec::new(),
+        find: None,
         dragging_scrollbar: false,
         window: None,
         surface: None,
@@ -207,6 +216,7 @@ pub fn run_window_restoring_session(engine: Engine) -> bool {
         ai_open: false,
         ai_text: String::new(),
         toolbar_rects: Vec::new(),
+        find: None,
         dragging_scrollbar: false,
         window: None,
         surface: None,
@@ -225,6 +235,9 @@ struct App {
     ai_text: String,
     /// Clickable regions of the toolbar, refreshed every frame.
     toolbar_rects: Vec<zero_engine::ElementRect>,
+    /// The find-in-page query while the find bar is open. `None` when closed,
+    /// so typing goes back to the address bar.
+    find: Option<String>,
     dragging_scrollbar: bool,
     window: Option<Rc<Window>>,
     surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
@@ -337,6 +350,30 @@ impl App {
 
     fn handle_key(&mut self, event: KeyEvent) {
         let ctrl = self.modifiers.control_key();
+        // The find bar owns typing while it is open, like the page field does.
+        if !ctrl && self.find.is_some() {
+            match event.logical_key {
+                Key::Named(NamedKey::Escape) => self.close_find(),
+                Key::Named(NamedKey::Backspace) => {
+                    self.find.as_mut().expect("open").pop();
+                    self.apply_find();
+                }
+                Key::Named(NamedKey::Enter) => self.jump_to_match(),
+                _ => match &event.text {
+                    Some(text) => {
+                        let typed: String = text.chars().filter(|c| !c.is_control()).collect();
+                        if typed.is_empty() {
+                            return;
+                        }
+                        self.find.as_mut().expect("open").push_str(&typed);
+                        self.apply_find();
+                    }
+                    None => return,
+                },
+            }
+            self.request_redraw();
+            return;
+        }
         // A focused page field owns plain typing; chords still reach the browser.
         if !ctrl && self.tab().doc.is_focused() {
             let handled = match event.logical_key {
@@ -369,6 +406,8 @@ impl App {
                 "w" => self.close_tab(),
                 "i" => self.toggle_assistant(),
                 "d" => self.toggle_bookmark(),
+                "f" => self.open_find(),
+                "l" => self.tab_mut().address.clear(), // ready for a new address
                 "h" => self.go_to("zero://history".into()),
                 "b" => self.go_to("zero://bookmarks".into()),
                 _ => {}
@@ -543,11 +582,16 @@ impl App {
         tab.secure = fetched.secure;
         // A new page means a new document and a fresh JS runtime. The loader goes
         // in so page scripts can fetch relative to this URL.
-        let loader = Rc::new(ShellLoader::new(tab.address.clone()));
+        tab.loader = Rc::new(ShellLoader::new(tab.address.clone()));
         // localStorage is partitioned by site, like cookies.
         let store = Rc::new(crate::localstore::SiteStore::for_site(&storage_site(&tab.address)));
-        tab.doc =
-            zero_engine::Document::load_hosted(&fetched.body, "", Some(loader), Some(store));
+        tab.doc = zero_engine::Document::load_hosted(
+            &fetched.body,
+            "",
+            Some(tab.loader.clone()),
+            Some(store),
+        );
+        tab.matches.clear();
         tab.scroll_y = 0.0;
         tab.page_canvas = None; // force re-render of the new page
         let title = tab.address.clone();
@@ -610,6 +654,22 @@ impl App {
         let fwd = if tab.history_index + 1 < tab.history.len() { "btn" } else { "off" };
         // A lit star means this page is already bookmarked.
         let star = if storage::is_bookmarked(&tab.address) { "on" } else { "btn" };
+        // With the find bar open it replaces the address, since it owns typing.
+        if let Some(query) = &self.find {
+            let count = tab.matches.len();
+            let hits = match (query.is_empty(), count) {
+                (true, _) => String::new(),
+                (false, 0) => "  -  no matches".to_string(),
+                (false, n) => format!("  -  {n} matches  -  Enter for next"),
+            };
+            return format!(
+                "<html><body><div id=\"bar\">\
+                 <span id=\"back\" class=\"off\">/</span>\
+                 <span id=\"addr\" class=\"addr\">Find: {}|{hits}</span>\
+                 </div></body></html>",
+                escape(query)
+            );
+        }
         format!(
             "<html><body><div id=\"bar\">\
              <span id=\"back\" class=\"{back}\">&lt;</span>\
@@ -632,6 +692,45 @@ impl App {
         let Some(sent) = sent else { return };
         let target = submission_url(&self.tab().address, &sent);
         self.go_to(target);
+    }
+
+    // --- find in page ---
+
+    fn open_find(&mut self) {
+        self.find = Some(String::new());
+        self.tab_mut().doc.blur(); // typing belongs to the find bar now
+        self.request_redraw();
+    }
+
+    fn close_find(&mut self) {
+        self.find = None;
+        self.tab_mut().doc.set_find(None);
+        self.tab_mut().page_canvas = None; // drop the highlights
+    }
+
+    fn apply_find(&mut self) {
+        let query = self.find.clone();
+        let tab = self.tab_mut();
+        tab.doc.set_find(query);
+        tab.page_canvas = None; // highlights are painted, so re-render
+    }
+
+    /// Scroll to the first match below the current position, wrapping at the end.
+    fn jump_to_match(&mut self) {
+        let (_, h) = self.window_size();
+        let viewport = (h.saturating_sub(TOOLBAR_H)) as f32;
+        let tab = self.tab_mut();
+        // Matches are in document order, so "next" is the first one past the top
+        // of the viewport; a small margin stops the current match re-matching.
+        let next = tab
+            .matches
+            .iter()
+            .find(|r| r.y > tab.scroll_y + 4.0)
+            .or_else(|| tab.matches.first());
+        if let Some(rect) = next {
+            // Land the match a third of the way down rather than at the very top.
+            tab.scroll_y = (rect.y - viewport / 3.0).max(0.0);
+        }
     }
 
     /// Save the current page, or unsave it if it is already bookmarked.
@@ -726,12 +825,12 @@ impl App {
             let engine = &self.engine;
             let tab = &mut self.tabs[self.active];
             if tab.page_canvas.is_none() || tab.cache_w != content_w || tab.cache_h != page_vh {
-                let loader = ShellLoader::new(tab.address.clone());
+                let loader = tab.loader.clone();
                 let page = engine.render_document(
                     &mut tab.doc,
                     content_w as f32,
                     page_vh as f32,
-                    &loader,
+                    loader.as_ref(),
                 );
                 tab.blocked_count = loader.blocked.get();
                 for line in &page.console {
@@ -739,6 +838,7 @@ impl App {
                 }
                 tab.page_canvas = Some(page.canvas);
                 tab.links = page.links;
+                tab.matches = page.find_matches;
                 tab.element_rects = page.element_rects;
                 tab.cache_w = content_w;
                 tab.cache_h = page_vh;
