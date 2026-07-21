@@ -20,6 +20,7 @@
 pub mod css;
 pub mod dom;
 pub mod html;
+pub mod js;
 pub mod layout;
 pub mod paint;
 pub mod resource;
@@ -40,6 +41,8 @@ use text::{FontEntry, FontSet};
 pub struct Page {
     pub canvas: Canvas,
     pub links: Vec<LinkArea>,
+    /// console.log output and script errors, for the embedder to surface.
+    pub console: Vec<String>,
 }
 
 /// Minimal user-agent stylesheet: gives real documents sane default display
@@ -111,7 +114,22 @@ impl Engine {
         height: f32,
         loader: &dyn ResourceLoader,
     ) -> Page {
-        let root = html::parse(html_source.to_string());
+        let mut root = html::parse(html_source.to_string());
+
+        // Run <script> content, then splice any document.write() output into the
+        // document so it participates in styling and layout.
+        let mut console = Vec::new();
+        let mut script_source = String::new();
+        collect_script_text(&root, &mut script_source);
+        if !script_source.trim().is_empty() {
+            let out = js::run(&script_source);
+            console.extend(out.console);
+            console.extend(out.errors.iter().map(|e| format!("[error] {e}")));
+            if !out.writes.trim().is_empty() {
+                let written = html::parse(format!("<div>{}</div>", out.writes));
+                append_to_body(&mut root, written);
+            }
+        }
 
         // Cascade order (later wins on ties): UA stylesheet < page <style> < caller CSS.
         let mut stylesheet = css::parse(USER_AGENT_CSS.to_string());
@@ -152,7 +170,7 @@ impl Engine {
 
         let mut links = Vec::new();
         layout::collect_links(&layout_root, &mut links);
-        Page { canvas, links }
+        Page { canvas, links, console }
     }
 }
 
@@ -171,6 +189,39 @@ fn collect_and_load_images(node: &Node, loader: &dyn ResourceLoader, out: &mut I
     }
     for child in &node.children {
         collect_and_load_images(child, loader, out);
+    }
+}
+
+/// Gather the text inside every `<script>` element into one JS source string.
+fn collect_script_text(node: &Node, out: &mut String) {
+    if let NodeType::Element(ref e) = node.node_type {
+        if e.tag_name == "script" && !e.attributes.contains_key("src") {
+            for child in &node.children {
+                if let NodeType::Text(ref t) = child.node_type {
+                    out.push_str(t);
+                    out.push('\n');
+                }
+            }
+        }
+    }
+    for child in &node.children {
+        collect_script_text(child, out);
+    }
+}
+
+/// Append a node to <body> (or the root if there is none).
+fn append_to_body(root: &mut Node, node: Node) {
+    fn find_body(n: &mut Node) -> Option<&mut Node> {
+        if let NodeType::Element(ref e) = n.node_type {
+            if e.tag_name == "body" {
+                return Some(n);
+            }
+        }
+        n.children.iter_mut().find_map(find_body)
+    }
+    match find_body(root) {
+        Some(body) => body.children.push(node),
+        None => root.children.push(node),
     }
 }
 
