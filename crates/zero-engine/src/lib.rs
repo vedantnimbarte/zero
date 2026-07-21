@@ -63,6 +63,9 @@ pub struct Document {
     focused: Option<usize>,
     /// The field's text when it gained focus, so `change` only fires on a real edit.
     focus_baseline: String,
+    /// Each `<select>`'s chosen (label, value), captured before its options are
+    /// collapsed into the closed control's text.
+    selections: HashMap<usize, (String, String)>,
     pub console: Vec<String>,
 }
 
@@ -111,13 +114,58 @@ impl Document {
             form_values: HashMap::new(),
             focused: None,
             focus_baseline: String::new(),
+            selections: HashMap::new(),
             console: Vec::new(),
         };
         doc.assign_node_ids();
+        doc.seed_selections();
         doc.seed_form_values();
         doc.sync_form_fields();
         doc.interp.set_dom(build_dom_view(&doc.root));
         doc
+    }
+
+    /// Record what each `<select>` has chosen, before rendering collapses it.
+    ///
+    /// A closed dropdown shows one option; without this the whole option list
+    /// lays out as text and swamps the page.
+    fn seed_selections(&mut self) {
+        fn walk(node: &Node, out: &mut HashMap<usize, (String, String)>) {
+            if let NodeType::Element(ref e) = node.node_type {
+                if e.tag_name == "select" {
+                    let options: Vec<&Node> = node
+                        .children
+                        .iter()
+                        .filter(|c| matches!(&c.node_type, NodeType::Element(o) if o.tag_name == "option"))
+                        .collect();
+                    // The marked option wins; otherwise a dropdown shows its first.
+                    let chosen = options
+                        .iter()
+                        .find(|o| match &o.node_type {
+                            NodeType::Element(o) => o.attributes.contains_key("selected"),
+                            NodeType::Text(_) => false,
+                        })
+                        .or(options.first())
+                        .copied();
+                    if let Some(option) = chosen {
+                        let label = text_content(option).trim().to_string();
+                        let value = match &option.node_type {
+                            NodeType::Element(o) => {
+                                o.attributes.get("value").cloned().unwrap_or_else(|| label.clone())
+                            }
+                            NodeType::Text(_) => label.clone(),
+                        };
+                        out.insert(e.node_id, (label, value));
+                    }
+                }
+            }
+            for child in &node.children {
+                walk(child, out);
+            }
+        }
+        let mut selections = std::mem::take(&mut self.selections);
+        walk(&self.root, &mut selections);
+        self.selections = selections;
     }
 
     /// Text fields start from their `value` attribute.
@@ -142,10 +190,19 @@ impl Document {
     /// with a caret on the focused one.
     fn sync_form_fields(&mut self) {
         let (values, focused) = (self.form_values.clone(), self.focused);
-        fn walk(node: &mut Node, values: &HashMap<usize, String>, focused: Option<usize>) {
+        let selections = self.selections.clone();
+        fn walk(
+            node: &mut Node,
+            values: &HashMap<usize, String>,
+            focused: Option<usize>,
+            selections: &HashMap<usize, (String, String)>,
+        ) {
             let mut replacement = None;
             if let NodeType::Element(ref e) = node.node_type {
-                if is_text_field(&e.tag_name) {
+                if let Some((label, _)) = selections.get(&e.node_id) {
+                    // A closed dropdown: its choice, not its option list.
+                    replacement = Some(label.clone());
+                } else if is_text_field(&e.tag_name) {
                     let mut text = values.get(&e.node_id).cloned().unwrap_or_default();
                     if focused == Some(e.node_id) {
                         text.push('|'); // caret
@@ -161,10 +218,10 @@ impl Document {
                 return;
             }
             for child in &mut node.children {
-                walk(child, values, focused);
+                walk(child, values, focused, selections);
             }
         }
-        walk(&mut self.root, &values, focused);
+        walk(&mut self.root, &values, focused, &selections);
     }
 
     /// Focus a field. Returns false if the element isn't a text field.
@@ -242,7 +299,7 @@ impl Document {
             return None;
         }
         let mut fields = Vec::new();
-        collect_fields(form, &self.form_values, &mut fields);
+        collect_fields(form, &self.form_values, &self.selections, &mut fields);
         Some(Submission {
             action: element.attributes.get("action").cloned().unwrap_or_default(),
             query: fields
@@ -494,8 +551,12 @@ impl Engine {
         let css_source = doc.css.clone();
         let css_source = css_source.as_str();
 
-        // Cascade order (later wins on ties): UA stylesheet < page <style> < caller CSS.
+        // Cascade order (later wins on ties):
+        // UA stylesheet < linked stylesheets < page <style> < caller CSS.
         let mut stylesheet = css::parse(USER_AGENT_CSS.to_string());
+        let mut linked = String::new();
+        collect_linked_css(root, loader, &mut linked);
+        stylesheet.rules.extend(css::parse(linked).rules);
         let mut page_css = String::new();
         collect_style_text(root, &mut page_css);
         stylesheet.rules.extend(css::parse(page_css).rules);
@@ -545,6 +606,38 @@ pub fn is_text_field(tag: &str) -> bool {
 }
 
 /// Find every `<img src>`, ask the loader for its bytes, and decode it.
+/// Fetch every `<link rel="stylesheet">`, in document order so later sheets win.
+///
+/// A sheet that fails to load is skipped: a missing stylesheet should degrade the
+/// page's appearance, never stop it rendering.
+///
+/// ponytail: `@import` inside a fetched sheet is not followed, so a site that
+/// splits its CSS that way still renders under-styled. One more pass over the
+/// parsed sheet would fix it.
+fn collect_linked_css(node: &Node, loader: &dyn ResourceLoader, out: &mut String) {
+    if let NodeType::Element(ref e) = node.node_type {
+        if e.tag_name == "link" && is_stylesheet(e) {
+            if let Some(href) = e.attributes.get("href") {
+                if let Some(text) = loader.load(href).and_then(|b| String::from_utf8(b).ok()) {
+                    out.push('\n');
+                    out.push_str(&text);
+                }
+            }
+        }
+    }
+    for child in &node.children {
+        collect_linked_css(child, loader, out);
+    }
+}
+
+/// `rel` is a space-separated token list, and matching is case-insensitive.
+fn is_stylesheet(element: &dom::ElementData) -> bool {
+    element
+        .attributes
+        .get("rel")
+        .is_some_and(|rel| rel.split_whitespace().any(|t| t.eq_ignore_ascii_case("stylesheet")))
+}
+
 fn collect_and_load_images(node: &Node, loader: &dyn ResourceLoader, out: &mut ImageMap) {
     if let NodeType::Element(ref e) = node.node_type {
         if e.tag_name == "img" {
@@ -671,19 +764,25 @@ fn contains(node: &Node, node_id: usize) -> bool {
 }
 
 /// Successful controls, in document order: named fields with a value.
-fn collect_fields(node: &Node, values: &HashMap<usize, String>, out: &mut Vec<(String, String)>) {
+fn collect_fields(
+    node: &Node,
+    values: &HashMap<usize, String>,
+    selections: &HashMap<usize, (String, String)>,
+    out: &mut Vec<(String, String)>,
+) {
     for child in &node.children {
         if let NodeType::Element(e) = &child.node_type {
             if let Some(name) = e.attributes.get("name").filter(|n| !n.is_empty()) {
                 let value = values
                     .get(&e.node_id)
                     .cloned()
+                    .or_else(|| selections.get(&e.node_id).map(|(_, value)| value.clone()))
                     .or_else(|| e.attributes.get("value").cloned())
                     .unwrap_or_default();
                 out.push((name.clone(), value));
             }
         }
-        collect_fields(child, values, out);
+        collect_fields(child, values, selections, out);
     }
 }
 
@@ -797,6 +896,26 @@ mod tests {
         assert_eq!(sent.action, "/search");
         // Spaces become `+`, and hidden fields are submitted too.
         assert_eq!(sent.query, "q=zero+browser&lang=hi");
+    }
+
+    /// A dropdown shows its choice, and submits that option's value.
+    #[test]
+    fn a_select_collapses_to_its_selected_option() {
+        let doc = super::Document::load(
+            "<form action=\"/s\"><input name=\"q\" value=\"x\">\
+             <select name=\"region\">\
+             <option value=\"us\">United States</option>\
+             <option value=\"in\" selected>India (en)</option>\
+             </select></form>",
+            "",
+        );
+        // The rendered text is the one choice, not every option.
+        let text = doc.page_text();
+        assert!(text.contains("India (en)"), "shows the selection: {text:?}");
+        assert!(!text.contains("United States"), "hides the rest: {text:?}");
+
+        let field = first_input(&doc);
+        assert_eq!(doc.submit(field).unwrap().query, "q=x&region=in");
     }
 
     #[test]
