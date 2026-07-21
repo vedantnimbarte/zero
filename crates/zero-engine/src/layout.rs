@@ -509,16 +509,31 @@ impl<'a> LayoutBox<'a> {
 
         let spec = match style.value("grid-template-columns") {
             Some(Value::Raw(spec)) => spec,
-            _ => return self.layout_block_children_gapped(fonts, images, gap),
+            // Sheets often set the tracks through the `grid-template` shorthand
+            // instead; without reading it the whole grid falls back to blocks.
+            _ => match shorthand_tracks(&style, Axis::Columns) {
+                Some(spec) => spec,
+                None => return self.layout_block_children_gapped(fonts, images, gap),
+            },
         };
         let columns = resolve_tracks(&spec, container.width, gap, ctx);
         if columns.is_empty() {
             return self.layout_block_children_gapped(fonts, images, gap);
         }
         // Explicit row sizes, if any; extra rows fall back to content height.
-        let row_sizes = match style.value("grid-template-rows") {
-            Some(Value::Raw(spec)) => resolve_tracks(&spec, container.height, gap, ctx),
-            _ => Vec::new(),
+        let row_spec = match style.value("grid-template-rows") {
+            Some(Value::Raw(spec)) => Some(spec),
+            _ => shorthand_tracks(&style, Axis::Rows),
+        };
+        let row_sizes = match row_spec {
+            Some(spec) => resolve_tracks(&spec, container.height, gap, ctx),
+            None => Vec::new(),
+        };
+
+        // Named areas, which pages use to lay out whole page columns.
+        let areas = match style.value("grid-template-areas") {
+            Some(Value::Raw(spec)) => parse_grid_areas(&spec),
+            _ => Default::default(),
         };
 
         // Assign every in-flow item a (row, column, span), honouring `grid-column`.
@@ -530,9 +545,21 @@ impl<'a> LayoutBox<'a> {
             if self.children[index].is_out_of_flow() {
                 continue;
             }
-            let (explicit_col, span) = match self.children[index].box_type {
-                BoxType::AnonymousBlock => (None, 1),
-                _ => parse_grid_span(self.children[index].get_style_node(), columns.len()),
+            // A named area pins the item outright; otherwise fall back to
+            // `grid-column` and auto-placement.
+            let placed_area = match self.children[index].box_type {
+                BoxType::AnonymousBlock => None,
+                _ => named_area(self.children[index].get_style_node(), &areas),
+            };
+            let (explicit_col, span) = match placed_area {
+                Some((area_row, area_col, area_span)) => {
+                    row = area_row;
+                    (Some(area_col), area_span)
+                }
+                None => match self.children[index].box_type {
+                    BoxType::AnonymousBlock => (None, 1),
+                    _ => parse_grid_span(self.children[index].get_style_node(), columns.len()),
+                },
             };
             let span = span.clamp(1, columns.len());
 
@@ -1443,6 +1470,72 @@ fn align_cross_axis(
 /// Read `grid-column` as (zero-based start, span).
 ///
 /// Accepts `span N`, `A / B`, `A / span N`, and a bare line number `A`.
+#[derive(Clone, Copy, PartialEq)]
+enum Axis {
+    Rows,
+    Columns,
+}
+
+/// Track sizes from the `grid-template` shorthand, which writes them as
+/// `rows / columns`. Area strings may appear before the slash, so only the
+/// track list on each side is taken.
+fn shorthand_tracks(style: &StyledNode, axis: Axis) -> Option<String> {
+    let Some(Value::Raw(spec)) = style.value("grid-template") else { return None };
+    let (rows, columns) = spec.split_once('/')?;
+    let text = match axis {
+        Axis::Rows => rows,
+        Axis::Columns => columns,
+    };
+    // Drop any quoted area strings; they are placement, not sizes.
+    let quotes: [char; 2] = ['"', '\''];
+    let text: String = text
+        .split(quotes)
+        .step_by(2)
+        .collect::<Vec<_>>()
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!text.is_empty()).then_some(text)
+}
+
+/// Where a named area sits: (row, column, column span).
+type Area = (usize, usize, usize);
+
+/// Parse `grid-template-areas: 'a a b' 'c c b'` into a placement per name.
+///
+/// Each quoted string is a row of cell names; a name repeated across cells
+/// spans them. `.` is an empty cell.
+///
+/// ponytail: only column spans are recorded. A name spanning several *rows*
+/// still lands on its first row, which is enough for the page layouts that use
+/// this — a full implementation would track row spans too.
+fn parse_grid_areas(spec: &str) -> std::collections::HashMap<String, Area> {
+    let mut areas: std::collections::HashMap<String, Area> = Default::default();
+    let quotes: [char; 2] = ['"', '\''];
+    for (row, line) in spec.split(quotes).filter(|s| !s.trim().is_empty()).enumerate() {
+        for (col, name) in line.split_whitespace().enumerate() {
+            if name == "." {
+                continue;
+            }
+            areas
+                .entry(name.to_string())
+                .and_modify(|(_, start, span)| *span = (col + 1).saturating_sub(*start).max(*span))
+                .or_insert((row, col, 1));
+        }
+    }
+    areas
+}
+
+/// The area a child asks for by name, if the container defines one.
+fn named_area(style: &StyledNode, areas: &std::collections::HashMap<String, Area>) -> Option<Area> {
+    match style.value("grid-area") {
+        Some(Value::Raw(name)) => areas.get(name.trim()).copied(),
+        Some(Value::Keyword(name)) => areas.get(name.trim()).copied(),
+        _ => None,
+    }
+}
+
 fn parse_grid_span(style: &StyledNode, columns: usize) -> (Option<usize>, usize) {
     let spec = match style.value("grid-column") {
         Some(Value::Raw(spec)) => spec,
@@ -1492,6 +1585,16 @@ pub fn resolve_tracks(spec: &str, available: f32, gap: f32, ctx: LengthContext) 
                 for _ in 0..count.min(1000) {
                     tokens.extend(pattern.iter().map(|p| p.to_string()));
                 }
+                rest = tail[1..].trim_start();
+                continue;
+            }
+        }
+        // `minmax(min, max)` sizes as its max, which is what decides the layout.
+        if let Some(after) = rest.strip_prefix("minmax(") {
+            if let Some(close) = after.find(')') {
+                let (inside, tail) = after.split_at(close);
+                let max = inside.rsplit(',').next().unwrap_or("").trim();
+                tokens.push(max.to_string());
                 rest = tail[1..].trim_start();
                 continue;
             }
@@ -1801,6 +1904,27 @@ mod tests {
     use crate::css::{Unit, Value};
     use crate::dom;
     use std::collections::HashMap;
+
+    #[test]
+    fn named_areas_place_items_by_name() {
+        let areas = parse_grid_areas("'notice notice' 'menu article' 'footer footer'");
+        // (row, column, column span)
+        assert_eq!(areas.get("notice"), Some(&(0, 0, 2)));
+        assert_eq!(areas.get("menu"), Some(&(1, 0, 1)));
+        assert_eq!(areas.get("article"), Some(&(1, 1, 1)));
+        assert_eq!(areas.get("footer"), Some(&(2, 0, 2)));
+        // A `.` cell names nothing.
+        assert!(parse_grid_areas("'. a'").get(".").is_none());
+    }
+
+    #[test]
+    fn minmax_tracks_size_by_their_maximum() {
+        let ctx = crate::css::LengthContext::default();
+        // minmax(0,1fr) behaves as 1fr: the fixed track takes its size, the rest
+        // of the space goes to the flexible one.
+        let tracks = resolve_tracks("200px minmax(0,1fr)", 600.0, 0.0, ctx);
+        assert_eq!(tracks, vec![200.0, 400.0]);
+    }
 
     #[test]
     fn lines_shift_by_their_leftover_space() {

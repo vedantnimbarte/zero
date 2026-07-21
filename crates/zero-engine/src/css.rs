@@ -185,6 +185,9 @@ const RAW_VALUE_PROPERTIES: &[&str] = &[
     "grid-template-rows",
     "grid-column",
     "grid-row",
+    "grid-area",
+    "grid-template-areas",
+    "grid-template",
     "box-shadow",
     "background-image",
 ];
