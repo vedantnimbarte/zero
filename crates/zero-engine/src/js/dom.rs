@@ -4,9 +4,13 @@
 //! and any writes are recorded as [`Mutation`]s that the engine applies afterwards.
 //! This keeps the DOM a plain tree instead of forcing `Rc<RefCell<..>>` everywhere.
 //!
-//! ponytail: a snapshot means scripts can't observe their own writes, and mutating
-//! an ancestor invalidates handles to its descendants. A live DOM with interior
-//! mutability is the upgrade, needed before event handlers make sense.
+//! Writes are mirrored back into the snapshot as they are recorded, so a script
+//! can set a class and then query for it within the same run.
+//!
+//! ponytail: only the modelled fields (text, class) are mirrored — a script that
+//! writes `innerHTML` and then queries for elements *inside* it still won't find
+//! them, because the new nodes don't exist until the run ends. A live DOM with
+//! interior mutability is the real fix.
 
 /// One element, addressable by its child-index path from the document root.
 #[derive(Clone, Default)]
@@ -31,6 +35,24 @@ impl DomView {
         self.elements.iter().position(|e| e.id == id)
     }
 
+    /// Element handles matching a CSS selector, in document order.
+    ///
+    /// Reuses the stylesheet parser, so whatever the cascade understands the
+    /// query API understands too.
+    ///
+    /// ponytail: simple selectors only (`tag`, `#id`, `.class`, and compounds).
+    /// A combinator like `div p` is dropped by the parser and matches nothing.
+    pub fn query(&self, selector: &str) -> Vec<usize> {
+        let sheet = crate::css::parse(format!("{selector} {{}}"));
+        let Some(rule) = sheet.rules.first() else { return Vec::new() };
+        self.elements
+            .iter()
+            .enumerate()
+            .filter(|(_, element)| rule.selectors.iter().any(|s| matches(element, s)))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
     pub fn find_by_tag(&self, tag: &str) -> Vec<usize> {
         let tag = tag.to_ascii_lowercase();
         self.elements
@@ -40,6 +62,19 @@ impl DomView {
             .map(|(i, _)| i)
             .collect()
     }
+}
+
+/// Does this element satisfy a parsed selector?
+fn matches(element: &ElementInfo, selector: &crate::css::Selector) -> bool {
+    let crate::css::Selector::Simple(simple) = selector;
+    if simple.tag_name.iter().any(|tag| &element.tag != tag) {
+        return false;
+    }
+    if simple.id.iter().any(|id| &element.id != id) {
+        return false;
+    }
+    let classes: Vec<&str> = element.class.split_whitespace().collect();
+    !simple.class.iter().any(|c| !classes.contains(&c.as_str()))
 }
 
 /// A pending change to an element, applied by the engine after the script runs.
