@@ -30,7 +30,7 @@ pub mod text;
 pub use css::Color;
 pub use layout::{ElementRect, LinkArea};
 pub use paint::Canvas;
-pub use resource::{DecodedImage, ResourceLoader};
+pub use resource::{DecodedImage, KeyValueStore, ResourceLoader};
 
 use dom::{Node, NodeType};
 use std::collections::HashMap;
@@ -73,8 +73,24 @@ impl Document {
         css_source: &str,
         loader: std::rc::Rc<dyn ResourceLoader>,
     ) -> Document {
+        Document::load_hosted(html_source, css_source, Some(loader), None)
+    }
+
+    /// Parse `html` and run its scripts with whatever host services are available.
+    /// Both are optional so tests and headless renders can skip them.
+    pub fn load_hosted(
+        html_source: &str,
+        css_source: &str,
+        loader: Option<std::rc::Rc<dyn ResourceLoader>>,
+        store: Option<std::rc::Rc<dyn KeyValueStore>>,
+    ) -> Document {
         let mut doc = Document::prepare(html_source, css_source);
-        doc.interp.set_loader(loader);
+        if let Some(loader) = loader {
+            doc.interp.set_loader(loader);
+        }
+        if let Some(store) = store {
+            doc.interp.set_store(store);
+        }
         doc.run_initial_scripts();
         doc
     }
