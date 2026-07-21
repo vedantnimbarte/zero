@@ -30,6 +30,53 @@ A **compatibility-bridge fallback** (an embedded engine behind a feature flag) i
 specified so early adopters are never fully blocked while our engine matures.
 See [`docs/03-ROADMAP.md`](docs/03-ROADMAP.md) for the honest timeline and risks.
 
+## Try it
+
+```sh
+cargo run                                  # opens the browser, restoring last session
+cargo run -- https://news.ycombinator.com  # open a URL
+cargo run -- examples/flex.html            # open a local file
+
+cargo run -- --shot https://… out.png      # screenshot the whole window, headless
+cargo run -- --png examples/x.html out.png # render just the page
+cargo run -- --png page.html out.png rust  # …and highlight a find-in-page query
+cargo run -- --ai https://…                # print the on-device page summary
+cargo run -- --history                     # dump stored history
+```
+
+**Keys:** `Ctrl+T` new tab · `Ctrl+W` close · `Ctrl+Tab` next · `Ctrl+L` clear address ·
+`Ctrl+F` find · `Ctrl+D` bookmark · `Ctrl+H` history · `Ctrl+B` bookmarks ·
+`Ctrl+I` AI panel · `Alt+←/→` back and forward.
+
+**Built-in pages:** `zero://newtab`, `zero://history`, `zero://bookmarks`.
+
+## What works today
+
+The engine renders real sites — Hacker News and DuckDuckGo results render close to
+correctly, including their own stylesheets, tables and forms.
+
+- **HTML**: tolerant parser, character references, raw-text and void elements
+- **CSS**: external `<link>` sheets, `@media` (type + width), descendant/child
+  selectors, the cascade with specificity, HTML presentation attributes
+  (`bgcolor`, `width`, `align`), named colours, `rgb()`/`hsl()`, alpha
+- **Layout**: block, inline, inline-block, flex (wrap/grow/justify/align), grid
+  (`repeat()`, `fr`, spans), tables (colspan/rowspan), out-of-flow positioning,
+  intrinsic sizing, `text-align`
+- **Text**: shaping via HarfBuzz with a font fallback chain — Latin, Indic
+  (Devanagari, Tamil, Telugu, Bengali and more) and CJK
+- **JavaScript**: own lexer, parser and interpreter — closures, classes with
+  `super`, `try/catch/finally`, `setTimeout`, DOM query and mutation, events
+- **Browser**: vertical tabs, session restore, history, bookmarks, find-in-page,
+  form submission and search, an on-device page assistant
+- **Privacy**: tracker/ad filtering (Adblock syntax), HTTPS-first, cookies and
+  `localStorage` partitioned per site, profile data encrypted at rest (DPAPI on
+  Windows; macOS and Linux backends are still to come)
+
+**Known limits.** Pseudo-classes (`:hover`), attribute selectors and `@import`
+are parsed but not applied. Sites built on fixed/sticky positioning overlap —
+Wikipedia's current skin is the clearest example. Layout and paint are
+single-threaded, and a page is painted in full rather than by viewport.
+
 ## The documents
 
 | Doc | What it covers |
