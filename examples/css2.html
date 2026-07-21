@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html><head><style>
+body { background: #0e0f12; color: #f2f3f5; padding: 24px; font-size: 16px; }
+h1 { color: #e5484d; font-size: 28px; }
+h2 { color: #9a9da6; font-size: 15px; }
+.pill { background: #30a46c; color: #0e0f12; width: 220px; padding: 14px; border-radius: 22px; }
+.card { background: #17181c; width: 420px; padding: 18px; border-radius: 14px; }
+.circle { background: #66ccff; width: 90px; height: 90px; border-radius: 50%; }
+.stage { background: #1f2127; height: 150px; position: relative; border-radius: 10px; }
+.badge { position: absolute; top: 16px; right: 16px; background: #e5484d; color: #fff; padding: 10px; border-radius: 8px; width: 120px; }
+.corner { position: absolute; bottom: 14px; left: 14px; background: #30a46c; color: #0e0f12; padding: 8px; border-radius: 8px; width: 140px; }
+</style></head><body>
+<h1>border-radius and position</h1>
+<h2>Rounded corners</h2>
+<div class="pill">rounded pill</div>
+<div class="card">a rounded card with 14px radius</div>
+<div class="circle"></div>
+<h2>Absolutely positioned children (top/right and bottom/left)</h2>
+<div class="stage">
+  <div class="badge">top right</div>
+  <div class="corner">bottom left</div>
+</div>
+</body></html>
