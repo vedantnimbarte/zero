@@ -18,6 +18,8 @@ pub struct Canvas {
 
 enum DisplayCommand {
     SolidColor(Color, Rect),
+    /// A rounded rectangle: same as SolidColor but with a corner radius.
+    RoundedColor(Color, Rect, f32),
     Text(TextFragment),
     Image(String, Rect), // image src, destination content box
 }
@@ -38,6 +40,40 @@ impl Canvas {
         for y in y0..y1 {
             for x in x0..x1 {
                 self.pixels[y * self.width + x] = color;
+            }
+        }
+    }
+
+    /// Fill a rounded rectangle with analytic anti-aliasing on the corner arcs.
+    fn paint_rounded(&mut self, color: Color, rect: Rect, radius: f32) {
+        let radius = radius.min(rect.width / 2.0).min(rect.height / 2.0).max(0.0);
+        let x0 = rect.x.clamp(0.0, self.width as f32) as usize;
+        let y0 = rect.y.clamp(0.0, self.height as f32) as usize;
+        let x1 = (rect.x + rect.width).clamp(0.0, self.width as f32) as usize;
+        let y1 = (rect.y + rect.height).clamp(0.0, self.height as f32) as usize;
+
+        // Corner centres: inside the rect by `radius` on each axis.
+        let (left, right) = (rect.x + radius, rect.x + rect.width - radius);
+        let (top, bottom) = (rect.y + radius, rect.y + rect.height - radius);
+
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+                // Distance outside the nearest corner circle, or 0 in the straight parts.
+                let dx = if px < left { left - px } else if px > right { px - right } else { 0.0 };
+                let dy = if py < top { top - py } else if py > bottom { py - bottom } else { 0.0 };
+                let coverage = if dx == 0.0 || dy == 0.0 {
+                    1.0
+                } else {
+                    // Soften across one pixel at the arc edge.
+                    (radius + 0.5 - (dx * dx + dy * dy).sqrt()).clamp(0.0, 1.0)
+                };
+                if coverage <= 0.0 {
+                    continue;
+                }
+                let idx = y * self.width + x;
+                let alpha = (coverage * 255.0) as u8;
+                self.pixels[idx] = blend(self.pixels[idx], color, alpha);
             }
         }
     }
@@ -119,6 +155,9 @@ pub fn paint(layout_root: &LayoutBox, bounds: Rect, fonts: Option<&FontSet>, ima
     for item in &display_list {
         match item {
             DisplayCommand::SolidColor(color, rect) => canvas.paint_solid(*color, *rect),
+            DisplayCommand::RoundedColor(color, rect, radius) => {
+                canvas.paint_rounded(*color, *rect, *radius)
+            }
             DisplayCommand::Text(frag) => {
                 if let Some(fonts) = fonts {
                     canvas.paint_text(frag, fonts);
@@ -167,9 +206,29 @@ fn image_src(layout_box: &LayoutBox) -> Option<String> {
 }
 
 fn render_background(list: &mut DisplayList, layout_box: &LayoutBox) {
-    if let Some(color) = get_color(layout_box, "background") {
-        list.push(DisplayCommand::SolidColor(color, layout_box.dimensions.border_box()));
+    let color = match get_color(layout_box, "background")
+        .or_else(|| get_color(layout_box, "background-color"))
+    {
+        Some(c) => c,
+        None => return,
+    };
+    let box_rect = layout_box.dimensions.border_box();
+    let radius = border_radius(layout_box, box_rect);
+    if radius > 0.0 {
+        list.push(DisplayCommand::RoundedColor(color, box_rect, radius));
+    } else {
+        list.push(DisplayCommand::SolidColor(color, box_rect));
     }
+}
+
+/// Resolve `border-radius`, with percentages relative to the box's smaller side.
+fn border_radius(layout_box: &LayoutBox, box_rect: Rect) -> f32 {
+    let style = match layout_box.box_type {
+        BoxType::BlockNode(s) | BoxType::InlineNode(s) => s,
+        BoxType::AnonymousBlock => return 0.0,
+    };
+    let base = box_rect.width.min(box_rect.height);
+    style.px("border-radius", base).unwrap_or(0.0).max(0.0)
 }
 
 fn render_borders(list: &mut DisplayList, layout_box: &LayoutBox) {
