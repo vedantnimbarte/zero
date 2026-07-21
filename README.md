@@ -61,8 +61,8 @@ correctly, including their own stylesheets, tables and forms.
   specificity, HTML presentation attributes (`bgcolor`, `width`, `align`),
   named colours, `rgb()`/`hsl()`, alpha
 - **Layout**: block, inline, inline-block, flex (wrap/grow/justify/align), grid
-  (`repeat()`, `fr`, spans), tables (colspan/rowspan), out-of-flow positioning,
-  intrinsic sizing, `text-align`
+  (`repeat()`, `fr`, `minmax()`, spans, named areas), tables (colspan/rowspan),
+  out-of-flow positioning, intrinsic sizing, `text-align`
 - **Text**: shaping via HarfBuzz with a font fallback chain — Latin, Indic
   (Devanagari, Tamil, Telugu, Bengali and more) and CJK
 - **JavaScript**: own lexer, parser and interpreter — closures, classes with
@@ -75,8 +75,8 @@ correctly, including their own stylesheets, tables and forms.
 
 **Known limits.** Pseudo-classes other than `:root` (so `:hover`), attribute
 selectors and `@import` are skipped — a rule using one is dropped rather than
-misapplied. Sites built on fixed/sticky positioning overlap —
-Wikipedia's current skin is the clearest example. Layout and paint are
+misapplied. Wikipedia's skin renders its columns correctly at
+wide window sizes but still overlaps its floating tools rail. Layout and paint are
 single-threaded, and a page is painted in full rather than by viewport.
 
 ## The documents
