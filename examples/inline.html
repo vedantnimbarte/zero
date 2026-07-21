@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html><head><style>
+body { background: #0e0f12; color: #f2f3f5; padding: 26px; font-size: 16px; }
+h1 { color: #e5484d; font-size: 26px; }
+h2 { color: #9a9da6; font-size: 13px; }
+p { padding: 6px; }
+.tag { background: #30a46c; color: #06251a; padding: 4px; border-radius: 6px; }
+.warn { background: #e5484d; color: #ffffff; padding: 4px; border-radius: 6px; }
+code { background: #23262e; color: #66ccff; padding: 3px; border-radius: 4px; }
+.hl { background: #f5a524; color: #241a00; padding: 3px; }
+</style></head><body>
+<h1>Inline element boxes</h1>
+<h2>Badges and pills flow with the text</h2>
+<p>Status <span class="tag">stable</span> and <span class="warn">deprecated</span> render as real boxes, sitting inline between words.</p>
+<h2>Inline code</h2>
+<p>Call <code>document.getElementById</code> then set <code>textContent</code> to update a node.</p>
+<h2>A highlight that wraps across lines</h2>
+<p><span class="hl">This highlighted span is deliberately long so that it wraps onto a second line, and each line should get its own painted background box rather than one giant rectangle.</span></p>
+</body></html>
