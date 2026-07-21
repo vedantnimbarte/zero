@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html><head><style>
+body { background: #0e0f12; color: #f2f3f5; padding: 26px; font-size: 15px; }
+h1 { color: #e5484d; font-size: 26px; }
+h2 { color: #9a9da6; font-size: 13px; }
+.field { background: #fff; color: #111; padding: 9px; border-radius: 6px; width: 340px; }
+.live { background: #17181c; padding: 12px; border-radius: 8px; width: 480px; }
+.ok { background: #30a46c; color: #06251a; padding: 12px; border-radius: 8px; width: 480px; }
+.warn { background: #e5484d; color: #fff; padding: 12px; border-radius: 8px; width: 480px; }
+</style></head><body>
+<h1>Live form events</h1>
+<h2>oninput updates as you type; onchange fires when you leave the field</h2>
+<input id="user" class="field" placeholder="username">
+<div id="count" class="live">0 characters</div>
+<div id="status" class="live">waiting for input</div>
+<h2>Committed value (onchange)</h2>
+<div id="committed" class="live">nothing committed yet</div>
+<script>
+  var user = document.getElementById('user');
+  var count = document.getElementById('count');
+  var status = document.getElementById('status');
+  var committed = document.getElementById('committed');
+
+  user.oninput = function () {
+    var v = user.value;
+    count.textContent = v.length + ' characters';
+    if (v.length < 3) {
+      status.className = 'warn';
+      status.textContent = 'too short - needs at least 3';
+    } else {
+      status.className = 'ok';
+      status.textContent = 'looks good: ' + v.toUpperCase();
+    }
+  };
+
+  user.addEventListener('change', function () {
+    committed.textContent = 'committed: ' + user.value;
+  });
+</script>
+</body></html>
