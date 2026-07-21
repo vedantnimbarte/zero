@@ -17,6 +17,7 @@ mod ai;
 mod app;
 mod blocker;
 mod cookies;
+mod crypto;
 mod fonts;
 mod localstore;
 mod net;

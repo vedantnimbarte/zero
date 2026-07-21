@@ -7,8 +7,8 @@
 //! trivially inspectable, and a corrupt line can be skipped instead of failing the
 //! whole file.
 //!
-//! ponytail: stored in the clear. The security doc calls for encryption at rest
-//! with the key in the OS keychain; that is a separate slice and NOT done yet.
+//! Files are encrypted at rest where the platform supports it — see
+//! [`crate::crypto`], which also explains where it does not.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -61,12 +61,12 @@ fn append_visit(dir: &Path, url: &str, title: &str) {
     }
     let file = dir.join("history.tsv");
     let line = format!("{}\t{}\t{}\n", now_secs(), url, title);
-    let existing = fs::read_to_string(&file).unwrap_or_default();
-    let _ = fs::write(file, existing + &line);
+    let existing = crate::crypto::read_file(&file).unwrap_or_default();
+    crate::crypto::write_file(&file, &(existing + &line));
 }
 
 fn read_history(dir: &Path) -> Vec<Visit> {
-    let text = fs::read_to_string(dir.join("history.tsv")).unwrap_or_default();
+    let text = crate::crypto::read_file(&dir.join("history.tsv")).unwrap_or_default();
     text.lines().filter_map(parse_visit).collect()
 }
 
@@ -99,11 +99,11 @@ fn write_session(dir: &Path, urls: &[String], active: usize) {
         out.push_str(&sanitize(url));
         out.push('\n');
     }
-    let _ = fs::write(dir.join("session.tsv"), out);
+    crate::crypto::write_file(&dir.join("session.tsv"), &out);
 }
 
 fn read_session(dir: &Path) -> Option<(Vec<String>, usize)> {
-    let text = fs::read_to_string(dir.join("session.tsv")).ok()?;
+    let text = crate::crypto::read_file(&dir.join("session.tsv"))?;
     let mut lines = text.lines();
     let active: usize = lines.next()?.trim().parse().unwrap_or(0);
     let urls: Vec<String> = lines.map(str::to_string).filter(|u| !u.is_empty()).collect();

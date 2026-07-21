@@ -3,8 +3,8 @@
 //! Each site gets its own file, so one origin can never read another's keys —
 //! the same partitioning rule the cookie jar follows.
 //!
-//! ponytail: written eagerly on every `setItem` (fine at these sizes), stored in
-//! the clear, and unbounded — no quota is enforced.
+//! ponytail: written eagerly on every `setItem` (fine at these sizes) and
+//! unbounded — no quota is enforced. Encrypted at rest via [`crate::crypto`].
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -34,7 +34,7 @@ impl SiteStore {
     pub fn for_site(site: &str) -> SiteStore {
         let file = file_for(site);
         let mut entries = BTreeMap::new();
-        if let Some(text) = file.as_ref().and_then(|f| fs::read_to_string(f).ok()) {
+        if let Some(text) = file.as_ref().and_then(|f| crate::crypto::read_file(f)) {
             for line in text.lines() {
                 if let Some((k, v)) = line.split_once('\t') {
                     entries.insert(k.to_string(), v.to_string());
@@ -48,7 +48,7 @@ impl SiteStore {
         let Some(file) = &self.file else { return };
         let text: String =
             self.entries.borrow().iter().map(|(k, v)| format!("{k}\t{v}\n")).collect();
-        let _ = fs::write(file, text);
+        crate::crypto::write_file(file, &text);
     }
 }
 

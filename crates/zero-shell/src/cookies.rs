@@ -114,11 +114,12 @@ impl CookieJar {
                 ));
             }
         }
-        let _ = fs::write(dir.join("cookies.tsv"), out);
+        // Cookies are credentials, so this is the file that most needs encrypting.
+        crate::crypto::write_file(&dir.join("cookies.tsv"), &out);
     }
 
     pub fn load(dir: &Path) -> CookieJar {
-        let text = fs::read_to_string(dir.join("cookies.tsv")).unwrap_or_default();
+        let text = crate::crypto::read_file(&dir.join("cookies.tsv")).unwrap_or_default();
         let mut jar = CookieJar::default();
         let now = now_secs();
         for line in text.lines() {
