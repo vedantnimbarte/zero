@@ -152,6 +152,8 @@ pub struct Output {
     pub errors: Vec<String>,
     /// DOM writes recorded by scripts, applied by the engine after the run.
     pub mutations: Vec<Mutation>,
+    /// `input.value = x` writes, as (node id, text).
+    pub field_writes: Vec<(usize, String)>,
 }
 
 pub struct Interp {
@@ -603,6 +605,12 @@ impl Interp {
                         map.borrow_mut().insert(property.clone(), v);
                     }
                     Value::Element(i) => match property.as_str() {
+                        // Field text lives in the document's form state, not the DOM.
+                        "value" => {
+                            if let Some(id) = self.node_id_of(i) {
+                                self.out.field_writes.push((id, v.to_display()));
+                            }
+                        }
                         "onclick" => {
                             if let Some(id) = self.node_id_of(i) {
                                 self.handlers.insert(id, v);
@@ -700,6 +708,8 @@ impl Interp {
             None => return Value::Undefined,
         };
         match property {
+            // A field's rendered text is its value (minus the caret).
+            "value" => Value::Str(element.text.trim_end_matches('|').to_string()),
             "textContent" | "innerText" | "innerHTML" => Value::Str(element.text.clone()),
             "id" => Value::Str(element.id.clone()),
             "tagName" => Value::Str(element.tag.to_ascii_uppercase()),
