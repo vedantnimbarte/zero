@@ -1,8 +1,8 @@
 //! Style: match CSS rules to DOM nodes and produce a styled tree (the cascade).
 
 use crate::css::{
-    LengthContext, Rule, Selector, SimpleSelector, Specificity, Stylesheet, Unit, Value,
-    DEFAULT_FONT_SIZE,
+    Combinator, LengthContext, Rule, Selector, SelectorPart, SimpleSelector, Specificity,
+    Stylesheet, Unit, Value, DEFAULT_FONT_SIZE,
 };
 use crate::dom::{ElementData, Node, NodeType};
 use std::collections::HashMap;
@@ -82,50 +82,106 @@ impl<'a> StyledNode<'a> {
     }
 }
 
-fn matches(elem: &ElementData, selector: &Selector) -> bool {
-    match *selector {
-        Selector::Simple(ref simple) => matches_simple_selector(elem, simple),
+/// What a selector needs to know about an element.
+///
+/// The style tree matches against parsed DOM nodes and `querySelectorAll`
+/// matches against the snapshot scripts see; both use the same matcher through
+/// this, so the two can never disagree about what a selector means.
+pub trait Matchable {
+    fn tag(&self) -> &str;
+    fn elem_id(&self) -> Option<&str>;
+    fn has_class(&self, class: &str) -> bool;
+}
+
+impl Matchable for ElementData {
+    fn tag(&self) -> &str {
+        &self.tag_name
+    }
+
+    fn elem_id(&self) -> Option<&str> {
+        self.id().map(String::as_str)
+    }
+
+    fn has_class(&self, class: &str) -> bool {
+        self.classes().contains(class)
     }
 }
 
-fn matches_simple_selector(elem: &ElementData, selector: &SimpleSelector) -> bool {
-    if selector.tag_name.iter().any(|name| elem.tag_name != *name) {
+/// Match a selector chain against an element, given its ancestors (root first).
+///
+/// Matching runs right to left: check the subject, then walk up looking for the
+/// ancestors the chain demands. That is the cheap direction — most elements fail
+/// on the subject and never look at the chain at all.
+///
+/// ponytail: a descendant combinator backtracks over every ancestor, so a
+/// pathological selector is quadratic in depth. Real sheets are two or three
+/// compounds deep; an ancestor bloom filter is the fix if it ever bites.
+pub fn matches<E: Matchable>(elem: &E, ancestors: &[&E], selector: &Selector) -> bool {
+    matches_chain(elem, ancestors, &selector.parts)
+}
+
+fn matches_chain<E: Matchable>(elem: &E, ancestors: &[&E], parts: &[SelectorPart]) -> bool {
+    let Some((subject, rest)) = parts.split_last() else { return true };
+    if !matches_simple_selector(elem, &subject.simple) {
         return false;
     }
-    if selector.id.iter().any(|id| elem.id() != Some(id)) {
+    if rest.is_empty() {
+        return true;
+    }
+    match subject.combinator {
+        Combinator::Child => match ancestors.split_last() {
+            Some((parent, above)) => matches_chain(*parent, above, rest),
+            None => false,
+        },
+        // Any ancestor may satisfy the rest of the chain; try the nearest first.
+        Combinator::Descendant => (0..ancestors.len())
+            .rev()
+            .any(|i| matches_chain(ancestors[i], &ancestors[..i], rest)),
+    }
+}
+
+fn matches_simple_selector<E: Matchable>(elem: &E, selector: &SimpleSelector) -> bool {
+    if selector.tag_name.iter().any(|name| elem.tag() != name) {
         return false;
     }
-    let elem_classes = elem.classes();
-    if selector
-        .class
-        .iter()
-        .any(|class| !elem_classes.contains(&class.as_str()))
-    {
+    if selector.id.iter().any(|id| elem.elem_id() != Some(id.as_str())) {
         return false;
     }
-    true
+    !selector.class.iter().any(|class| !elem.has_class(class))
 }
 
 type MatchedRule<'a> = (Specificity, &'a Rule);
 
-fn match_rule<'a>(elem: &ElementData, rule: &'a Rule) -> Option<MatchedRule<'a>> {
+fn match_rule<'a>(
+    elem: &ElementData,
+    ancestors: &[&ElementData],
+    rule: &'a Rule,
+) -> Option<MatchedRule<'a>> {
     rule.selectors
         .iter()
-        .find(|selector| matches(elem, selector))
+        .find(|selector| matches(elem, ancestors, selector))
         .map(|selector| (selector.specificity(), rule))
 }
 
-fn matching_rules<'a>(elem: &ElementData, stylesheet: &'a Stylesheet) -> Vec<MatchedRule<'a>> {
+fn matching_rules<'a>(
+    elem: &ElementData,
+    ancestors: &[&ElementData],
+    stylesheet: &'a Stylesheet,
+) -> Vec<MatchedRule<'a>> {
     stylesheet
         .rules
         .iter()
-        .filter_map(|rule| match_rule(elem, rule))
+        .filter_map(|rule| match_rule(elem, ancestors, rule))
         .collect()
 }
 
-fn specified_values(elem: &ElementData, stylesheet: &Stylesheet) -> PropertyMap {
+fn specified_values(
+    elem: &ElementData,
+    ancestors: &[&ElementData],
+    stylesheet: &Stylesheet,
+) -> PropertyMap {
     let mut values = HashMap::new();
-    let mut rules = matching_rules(elem, stylesheet);
+    let mut rules = matching_rules(elem, ancestors, stylesheet);
     // Apply low specificity first so high specificity overrides it.
     rules.sort_by(|&(a, _), &(b, _)| a.cmp(&b));
     for (_, rule) in rules {
@@ -141,16 +197,17 @@ fn specified_values(elem: &ElementData, stylesheet: &Stylesheet) -> PropertyMap 
 const INHERITED_PROPERTIES: [&str; 2] = ["color", "font-size"];
 
 pub fn style_tree<'a>(root: &'a Node, stylesheet: &'a Stylesheet) -> StyledNode<'a> {
-    style_tree_inner(root, stylesheet, &HashMap::new())
+    style_tree_inner(root, stylesheet, &HashMap::new(), &mut Vec::new())
 }
 
 fn style_tree_inner<'a>(
     root: &'a Node,
     stylesheet: &'a Stylesheet,
     inherited: &PropertyMap,
+    ancestors: &mut Vec<&'a ElementData>,
 ) -> StyledNode<'a> {
     let mut specified = match root.node_type {
-        NodeType::Element(ref elem) => specified_values(elem, stylesheet),
+        NodeType::Element(ref elem) => specified_values(elem, ancestors, stylesheet),
         NodeType::Text(_) => HashMap::new(),
     };
     for prop in INHERITED_PROPERTIES {
@@ -175,14 +232,73 @@ fn style_tree_inner<'a>(
         _ => parent_font,
     };
     specified.insert("font-size".to_string(), Value::Length(font_px, Unit::Px));
-    let children = root
+    // Children see this element as their nearest ancestor.
+    if let NodeType::Element(ref elem) = root.node_type {
+        ancestors.push(elem);
+    }
+    let children: Vec<StyledNode> = root
         .children
         .iter()
-        .map(|child| style_tree_inner(child, stylesheet, &specified))
+        .map(|child| style_tree_inner(child, stylesheet, &specified, ancestors))
         .collect();
+    if matches!(root.node_type, NodeType::Element(_)) {
+        ancestors.pop();
+    }
     StyledNode {
         node: root,
         specified_values: specified,
         children,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Colour of the element found at `path` (child indices from the root).
+    fn color_at(html: &str, css: &str, path: &[usize]) -> Option<Value> {
+        let dom = crate::html::parse(html.to_string());
+        let sheet = crate::css::parse(css.to_string());
+        let styled = style_tree(&dom, &sheet);
+        let mut node = &styled;
+        for i in path {
+            node = &node.children[*i];
+        }
+        node.value("color")
+    }
+
+    const RED: Value = Value::ColorValue(crate::css::Color { r: 255, g: 0, b: 0, a: 255 });
+
+    #[test]
+    fn descendant_selectors_match_at_any_depth() {
+        let html = "<body><nav><div><a>deep</a></div></nav><a>outside</a></body>";
+        let css = "nav a { color: #ff0000; }";
+        // Nested inside <nav>, however deep.
+        assert_eq!(color_at(html, css, &[0, 0, 0]), Some(RED));
+        // The same tag outside <nav> is untouched.
+        assert_eq!(color_at(html, css, &[1]), None);
+    }
+
+    #[test]
+    fn child_selectors_require_the_immediate_parent() {
+        let html = "<body><nav><a>direct</a><div><a>grandchild</a></div></nav></body>";
+        let css = "nav > a { color: #ff0000; }";
+        assert_eq!(color_at(html, css, &[0, 0]), Some(RED));
+        assert_eq!(color_at(html, css, &[0, 1, 0]), None);
+    }
+
+    #[test]
+    fn a_longer_chain_outranks_a_shorter_one() {
+        // Both match; `main p` is more specific than `p`, whatever the order.
+        let html = "<body><main><p>text</p></main></body>";
+        let css = "main p { color: #ff0000; } p { color: #0000ff; }";
+        assert_eq!(color_at(html, css, &[0, 0, 0]), Some(RED));
+    }
+
+    #[test]
+    fn a_chain_that_runs_out_of_ancestors_does_not_match() {
+        let html = "<body><a>lonely</a></body>";
+        assert_eq!(color_at(html, "nav a { color: #ff0000; }", &[0]), None);
+        assert_eq!(color_at(html, "nav > a { color: #ff0000; }", &[0]), None);
     }
 }

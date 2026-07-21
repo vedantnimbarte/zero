@@ -23,9 +23,26 @@ pub struct Rule {
     pub media: Option<String>,
 }
 
+/// A selector is a chain of compounds read left to right, e.g. `nav > ul li`.
+/// The last part is the *subject* — the element the rule actually styles.
 #[derive(Debug)]
-pub enum Selector {
-    Simple(SimpleSelector),
+pub struct Selector {
+    pub parts: Vec<SelectorPart>,
+}
+
+#[derive(Debug)]
+pub struct SelectorPart {
+    pub simple: SimpleSelector,
+    /// How this part relates to the one on its left. Ignored on the first part.
+    pub combinator: Combinator,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Combinator {
+    /// A space: any ancestor.
+    Descendant,
+    /// `>`: the immediate parent.
+    Child,
 }
 
 #[derive(Debug)]
@@ -33,6 +50,13 @@ pub struct SimpleSelector {
     pub tag_name: Option<String>,
     pub id: Option<String>,
     pub class: Vec<String>,
+}
+
+impl SimpleSelector {
+    /// True for `*` or for a compound we failed to read anything out of.
+    pub fn is_empty(&self) -> bool {
+        self.tag_name.is_none() && self.id.is_none() && self.class.is_empty()
+    }
 }
 
 #[derive(Debug)]
@@ -97,13 +121,20 @@ pub struct Color {
 pub type Specificity = (usize, usize, usize);
 
 impl Selector {
+    /// Specificity sums over the whole chain, so `nav a` beats a bare `a`.
     pub fn specificity(&self) -> Specificity {
-        let Selector::Simple(ref s) = *self;
-        (
-            s.id.iter().count(),
-            s.class.len(),
-            s.tag_name.iter().count(),
-        )
+        self.parts.iter().fold((0, 0, 0), |(ids, classes, tags), part| {
+            (
+                ids + part.simple.id.iter().count(),
+                classes + part.simple.class.len(),
+                tags + part.simple.tag_name.iter().count(),
+            )
+        })
+    }
+
+    /// The element this selector styles, ignoring its ancestor conditions.
+    pub fn subject(&self) -> Option<&SimpleSelector> {
+        self.parts.last().map(|part| &part.simple)
     }
 }
 
@@ -343,8 +374,38 @@ impl Parser {
     fn parse_selectors(&mut self) -> Option<Vec<Selector>> {
         let mut selectors = Vec::new();
         loop {
-            selectors.push(Selector::Simple(self.parse_simple_selector()));
-            self.consume_whitespace();
+            let mut parts = vec![SelectorPart {
+                simple: self.parse_simple_selector(),
+                combinator: Combinator::Descendant, // ignored on the first part
+            }];
+            // Keep taking compounds until the rule body or the next selector.
+            loop {
+                let start = self.pos;
+                self.consume_whitespace();
+                let spaced = self.pos > start;
+                let combinator = match self.next_char_or('\0') {
+                    '>' => {
+                        self.consume_char();
+                        self.consume_whitespace();
+                        Combinator::Child
+                    }
+                    ',' | '{' | '\0' => break,
+                    // A space then another compound is a descendant selector.
+                    // Anything else (`:hover`, `[attr]`) we do not support, and
+                    // must drop rather than silently treat as a match.
+                    _ if spaced => Combinator::Descendant,
+                    _ => {
+                        self.skip_block();
+                        return None;
+                    }
+                };
+                parts.push(SelectorPart { simple: self.parse_simple_selector(), combinator });
+            }
+            if parts.iter().any(|part| part.simple.is_empty()) {
+                self.skip_block(); // an empty compound means we mis-read something
+                return None;
+            }
+            selectors.push(Selector { parts });
             match self.next_char_or('\0') {
                 ',' => {
                     self.consume_char();
@@ -647,10 +708,30 @@ mod tests {
              .ok { color: #123456; width: 50%; padding: 8px; }"
                 .to_string(),
         );
-        // `.ok`, plus the rule inside the media block — the complex selectors go.
-        assert_eq!(s.rules.len(), 2);
-        let ok = s.rules.iter().find(|r| r.media.is_none()).expect("the plain rule");
+        // Kept: the media rule, `div > p`, and `.ok`. Dropped: the `:hover` one,
+        // since applying a hover style unconditionally would be worse than
+        // ignoring the rule.
+        assert_eq!(s.rules.len(), 3);
+        let ok = s
+            .rules
+            .iter()
+            .find(|r| r.selectors.iter().any(|sel| sel.specificity() == (0, 1, 0)))
+            .expect("the .ok rule");
         // color + width(%) + padding all understood now.
         assert_eq!(ok.declarations.len(), 3);
+    }
+
+    #[test]
+    fn parses_descendant_and_child_chains() {
+        let s = parse("nav ul > li a { color: #ff0000; } .x{color:#000000;}".to_string());
+        assert_eq!(s.rules.len(), 2);
+        let chain = &s.rules[0].selectors[0];
+        assert_eq!(chain.parts.len(), 4);
+        assert_eq!(chain.parts[0].simple.tag_name.as_deref(), Some("nav"));
+        assert_eq!(chain.parts[2].combinator, Combinator::Child); // ul > li
+        assert_eq!(chain.parts[3].combinator, Combinator::Descendant); // li a
+        assert_eq!(chain.parts[3].simple.tag_name.as_deref(), Some("a"));
+        // Four tag compounds, so it outranks any single-tag rule.
+        assert_eq!(chain.specificity(), (0, 0, 4));
     }
 }

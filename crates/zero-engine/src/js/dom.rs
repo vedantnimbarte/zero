@@ -50,8 +50,25 @@ impl DomView {
         self.elements
             .iter()
             .enumerate()
-            .filter(|(_, element)| rule.selectors.iter().any(|s| matches(element, s)))
+            .filter(|(i, element)| {
+                let ancestors = self.ancestors_of(*i);
+                rule.selectors
+                    .iter()
+                    .any(|selector| crate::style::matches(*element, &ancestors, selector))
+            })
             .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// The ancestors of an element, outermost first.
+    ///
+    /// The snapshot is flat, but each element carries its path from the root, so
+    /// an ancestor is exactly an element whose path is a prefix of this one's.
+    fn ancestors_of(&self, index: usize) -> Vec<&ElementInfo> {
+        let path = &self.elements[index].path;
+        self.elements
+            .iter()
+            .filter(|other| other.path.len() < path.len() && path.starts_with(&other.path))
             .collect()
     }
 
@@ -66,17 +83,18 @@ impl DomView {
     }
 }
 
-/// Does this element satisfy a parsed selector?
-fn matches(element: &ElementInfo, selector: &crate::css::Selector) -> bool {
-    let crate::css::Selector::Simple(simple) = selector;
-    if simple.tag_name.iter().any(|tag| &element.tag != tag) {
-        return false;
+impl crate::style::Matchable for ElementInfo {
+    fn tag(&self) -> &str {
+        &self.tag
     }
-    if simple.id.iter().any(|id| &element.id != id) {
-        return false;
+
+    fn elem_id(&self) -> Option<&str> {
+        Some(&self.id)
     }
-    let classes: Vec<&str> = element.class.split_whitespace().collect();
-    !simple.class.iter().any(|c| !classes.contains(&c.as_str()))
+
+    fn has_class(&self, class: &str) -> bool {
+        self.class.split_whitespace().any(|c| c == class)
+    }
 }
 
 /// A pending change to an element, applied by the engine after the script runs.
