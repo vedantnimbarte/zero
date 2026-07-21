@@ -8,12 +8,16 @@
 //! are plain maps and only a handful of built-in methods exist.
 
 use super::dom::{DomView, Mutation};
+use crate::resource::ResourceLoader;
 use super::parser::{Expr, Stmt};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
 type EnvRef = Rc<RefCell<Env>>;
+
+/// Marks an error as a JS `throw` (catchable) rather than an engine failure.
+const THROW_TAG: &str = "\u{1}throw\u{1}";
 
 /// One lexical scope, linked to the scope enclosing it.
 pub struct Env {
@@ -80,6 +84,8 @@ pub struct FuncData {
     pub body: Vec<Stmt>,
     /// The scope this function was created in — the essence of a closure.
     closure: EnvRef,
+    /// Receiver bound at call time for `obj.method()` and class instances.
+    this: Option<Box<Value>>,
 }
 
 impl Value {
@@ -115,7 +121,7 @@ impl Value {
         }
     }
 
-    fn as_number(&self) -> f64 {
+    pub fn as_number(&self) -> f64 {
         match self {
             Value::Num(n) => *n,
             Value::Str(s) => s.trim().parse().unwrap_or(f64::NAN),
@@ -131,6 +137,9 @@ enum Flow {
     Normal,
     Return(Value),
 }
+
+/// A JavaScript exception travelling up the stack, distinct from an engine error.
+pub struct Thrown(pub Value);
 
 #[derive(Default)]
 pub struct Output {
@@ -148,6 +157,11 @@ pub struct Interp {
     dom: DomView,
     /// Click handlers, keyed by stable element node_id so they survive re-renders.
     handlers: HashMap<usize, Value>,
+    /// Callbacks queued by setTimeout, ordered by delay then insertion.
+    timers: Vec<(f64, usize, Value)>,
+    timer_seq: usize,
+    /// Supplied by the embedder so `fetch` can reach the network.
+    loader: Option<Rc<dyn ResourceLoader>>,
     pub out: Output,
 }
 
@@ -164,7 +178,13 @@ impl Interp {
 
     pub fn with_dom(dom: DomView) -> Interp {
         let env = Env::root();
-        Env::define(&env, "console".into(), namespace(&[("log", "console.log")]));
+        Env::define(
+            &env,
+            "console".into(),
+            namespace(&[("log", "console.log"), ("error", "console.log")]),
+        );
+        Env::define(&env, "setTimeout".into(), Value::Native("setTimeout"));
+        Env::define(&env, "fetch".into(), Value::Native("fetch"));
         Env::define(
             &env,
             "document".into(),
@@ -173,7 +193,16 @@ impl Interp {
                 ("getElementById", "document.getElementById"),
             ]),
         );
-        Interp { env, depth: 0, dom, handlers: HashMap::new(), out: Output::default() }
+        Interp {
+            env,
+            depth: 0,
+            dom,
+            handlers: HashMap::new(),
+            timers: Vec::new(),
+            timer_seq: 0,
+            loader: None,
+            out: Output::default(),
+        }
     }
 
     pub fn run(&mut self, program: &[Stmt]) {
@@ -194,6 +223,11 @@ impl Interp {
                 }
             }
         }
+    }
+
+    /// Give scripts network access through the embedder.
+    pub fn set_loader(&mut self, loader: Rc<dyn ResourceLoader>) {
+        self.loader = Some(loader);
     }
 
     /// Refresh the snapshot after the document changed, so later events see new text.
@@ -222,7 +256,33 @@ impl Interp {
     }
 
     fn make_function(&self, params: Vec<String>, body: Vec<Stmt>) -> Value {
-        Value::Func(Rc::new(FuncData { params, body, closure: self.env.clone() }))
+        Value::Func(Rc::new(FuncData { params, body, closure: self.env.clone(), this: None }))
+    }
+
+    /// Same function, but called with `receiver` as `this`.
+    fn bind_this(f: &Rc<FuncData>, receiver: Value) -> Value {
+        Value::Func(Rc::new(FuncData {
+            params: f.params.clone(),
+            body: f.body.clone(),
+            closure: f.closure.clone(),
+            this: Some(Box::new(receiver)),
+        }))
+    }
+
+    /// Run every queued timer callback, in delay order. Timers scheduled by a
+    /// timer run on the next drain, so a self-rescheduling callback can't hang us.
+    pub fn run_timers(&mut self) -> bool {
+        if self.timers.is_empty() {
+            return false;
+        }
+        let mut due = std::mem::take(&mut self.timers);
+        due.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        for (_, _, callback) in due {
+            if let Err(e) = self.call(callback, Vec::new()) {
+                self.out.errors.push(e);
+            }
+        }
+        true
     }
 
     /// Run `body` in a fresh child scope, restoring the previous scope afterwards.
@@ -319,6 +379,47 @@ impl Interp {
                 Env::define(&self.env, name.clone(), f);
                 Ok(Flow::Normal)
             }
+            Stmt::Throw(expr) => {
+                let v = self.eval(expr)?;
+                // Exceptions ride the error channel, tagged so `catch` can recover.
+                Err(format!("{THROW_TAG}{}", v.to_display()))
+            }
+            Stmt::Try { body, param, catch, finally } => {
+                let result = self.exec_body(body);
+                let outcome = match result {
+                    Err(e) => {
+                        let message = e.strip_prefix(THROW_TAG).unwrap_or(&e).to_string();
+                        let saved = self.env.clone();
+                        self.env = Env::child(&saved);
+                        if let Some(name) = param {
+                            Env::define(&self.env, name.clone(), Value::Str(message));
+                        }
+                        let caught = self.exec_body(catch);
+                        self.env = saved;
+                        caught
+                    }
+                    ok => ok,
+                };
+                // `finally` runs regardless, and its own failure wins.
+                if !finally.is_empty() {
+                    self.exec_body(finally)?;
+                }
+                outcome
+            }
+            Stmt::ClassDecl { name, methods } => {
+                // A class is modelled as an object of methods; `new` copies it and
+                // binds `this`. No prototype chain or inheritance.
+                let mut map = HashMap::new();
+                for (method, params, body) in methods {
+                    map.insert(method.clone(), self.make_function(params.clone(), body.clone()));
+                }
+                Env::define(
+                    &self.env,
+                    name.clone(),
+                    Value::Object(Rc::new(RefCell::new(map))),
+                );
+                Ok(Flow::Normal)
+            }
         }
     }
 
@@ -342,6 +443,15 @@ impl Interp {
                 Env::get(&self.env, name).ok_or_else(|| format!("{name} is not defined"))
             }
             Expr::Func { params, body } => Ok(self.make_function(params.clone(), body.clone())),
+            Expr::This => Ok(Env::get(&self.env, "this").unwrap_or(Value::Undefined)),
+            Expr::New { callee, args } => {
+                let class = self.eval(callee)?;
+                let mut values = Vec::with_capacity(args.len());
+                for a in args {
+                    values.push(self.eval(a)?);
+                }
+                self.construct(class, values)
+            }
             Expr::ArrayLit(items) => {
                 let mut values = Vec::with_capacity(items.len());
                 for item in items {
@@ -416,6 +526,11 @@ impl Interp {
                         return Ok(result);
                     }
                     let f = self.get_property(&receiver, property);
+                    // `obj.method()` binds the receiver so the body can use `this`.
+                    let f = match f {
+                        Value::Func(ref data) => Interp::bind_this(data, receiver),
+                        other => other,
+                    };
                     return self.call(f, values);
                 }
                 let f = self.eval(callee)?;
@@ -542,6 +657,32 @@ impl Interp {
         }
     }
 
+    /// `new C(...)`: copy the class's methods onto a fresh object, bind `this`,
+    /// then run `constructor` if present.
+    fn construct(&mut self, class: Value, args: Vec<Value>) -> Result<Value, String> {
+        let methods = match class {
+            Value::Object(ref map) => map.borrow().clone(),
+            other => return Err(format!("{} is not a constructor", other.to_display())),
+        };
+        let instance = Value::Object(Rc::new(RefCell::new(HashMap::new())));
+        if let Value::Object(ref map) = instance {
+            for (name, method) in &methods {
+                let bound = match method {
+                    Value::Func(data) => Interp::bind_this(data, instance.clone()),
+                    other => other.clone(),
+                };
+                map.borrow_mut().insert(name.clone(), bound);
+            }
+        }
+        if let Some(ctor) = methods.get("constructor") {
+            if let Value::Func(data) = ctor {
+                let bound = Interp::bind_this(data, instance.clone());
+                self.call(bound, args)?;
+            }
+        }
+        Ok(instance)
+    }
+
     fn call(&mut self, callee: Value, args: Vec<Value>) -> Result<Value, String> {
         match callee {
             Value::Native(name) => {
@@ -549,6 +690,34 @@ impl Interp {
                 match name {
                     "console.log" => self.out.console.push(text),
                     "document.write" => self.out.writes.push_str(&text),
+                    "setTimeout" => {
+                        // No real clock: callbacks queue and the embedder drains them.
+                        let delay = args.get(1).map(Value::as_number).unwrap_or(0.0);
+                        if let Some(callback) = args.first() {
+                            self.timer_seq += 1;
+                            let seq = self.timer_seq;
+                            self.timers.push((delay, seq, callback.clone()));
+                            return Ok(Value::Num(seq as f64));
+                        }
+                        return Ok(Value::Undefined);
+                    }
+                    "fetch" => {
+                        // ponytail: synchronous, and returns {ok, status, text} rather
+                        // than a Promise — there is no event loop to resolve one yet.
+                        let body = self
+                            .loader
+                            .as_ref()
+                            .and_then(|l| l.load(&text))
+                            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+                        let mut response = HashMap::new();
+                        response.insert("ok".into(), Value::Bool(body.is_some()));
+                        response.insert(
+                            "status".into(),
+                            Value::Num(if body.is_some() { 200.0 } else { 0.0 }),
+                        );
+                        response.insert("text".into(), Value::Str(body.unwrap_or_default()));
+                        return Ok(Value::Object(Rc::new(RefCell::new(response))));
+                    }
                     "document.getElementById" => {
                         return Ok(match self.dom.find_by_id(&text) {
                             Some(i) => Value::Element(i),
@@ -566,6 +735,9 @@ impl Interp {
                 // Calls run in a child of the *defining* scope, not the calling one.
                 let saved = self.env.clone();
                 self.env = Env::child(&f.closure);
+                if let Some(receiver) = &f.this {
+                    Env::define(&self.env, "this".into(), (**receiver).clone());
+                }
                 for (i, param) in f.params.iter().enumerate() {
                     Env::define(
                         &self.env,
