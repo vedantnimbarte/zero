@@ -61,6 +61,8 @@ pub struct Document {
     form_values: HashMap<usize, String>,
     /// The focused text field, if any.
     focused: Option<usize>,
+    /// The field's text when it gained focus, so `change` only fires on a real edit.
+    focus_baseline: String,
     pub console: Vec<String>,
 }
 
@@ -92,6 +94,7 @@ impl Document {
             next_node_id: 1, // 0 means "unassigned"
             form_values: HashMap::new(),
             focused: None,
+            focus_baseline: String::new(),
             console: Vec::new(),
         };
         doc.assign_node_ids();
@@ -154,13 +157,18 @@ impl Document {
             return false;
         }
         self.focused = Some(node_id);
+        self.focus_baseline = self.form_values.get(&node_id).cloned().unwrap_or_default();
         self.refresh_fields();
         true
     }
 
+    /// Drop focus, firing `change` if the value actually moved while focused.
     pub fn blur(&mut self) {
-        if self.focused.take().is_some() {
-            self.refresh_fields();
+        let Some(id) = self.focused.take() else { return };
+        self.refresh_fields();
+        let current = self.form_values.get(&id).cloned().unwrap_or_default();
+        if current != self.focus_baseline {
+            self.dispatch_event(id, "change");
         }
     }
 
@@ -173,6 +181,7 @@ impl Document {
         let Some(id) = self.focused else { return false };
         self.form_values.entry(id).or_default().push_str(text);
         self.refresh_fields();
+        self.dispatch_event(id, "input");
         true
     }
 
@@ -180,6 +189,7 @@ impl Document {
         let Some(id) = self.focused else { return false };
         self.form_values.entry(id).or_default().pop();
         self.refresh_fields();
+        self.dispatch_event(id, "input");
         true
     }
 
@@ -211,7 +221,12 @@ impl Document {
     /// Fire an element's click handler, applying whatever it changed.
     /// Returns true if a handler ran (so the embedder knows to repaint).
     pub fn click(&mut self, node_id: usize) -> bool {
-        if !self.interp.dispatch_click(node_id) {
+        self.dispatch_event(node_id, "click")
+    }
+
+    /// Run a handler and apply everything it changed.
+    fn dispatch_event(&mut self, node_id: usize, event: &str) -> bool {
+        if !self.interp.dispatch(node_id, event) {
             return false;
         }
         self.absorb_script_output();
@@ -506,6 +521,7 @@ fn build_dom_view(root: &Node) -> js::DomView {
                 path: path.clone(),
                 node_id: e.node_id,
                 id: e.id().cloned().unwrap_or_default(),
+                class: e.attributes.get("class").cloned().unwrap_or_default(),
                 tag: e.tag_name.clone(),
                 text: text_content(node),
             });
@@ -535,11 +551,23 @@ fn apply_mutations(root: &mut Node, mutations: &[js::Mutation]) {
     }
     let view = build_dom_view(root);
     for mutation in mutations {
+        // Restyling only touches an attribute, so handle it before the child swaps.
+        if let js::Mutation::SetClass(i, class) = mutation {
+            if let Some(path) = view.elements.get(*i).map(|e| e.path.clone()) {
+                if let Some(node) = node_at(root, &path) {
+                    if let NodeType::Element(ref mut e) = node.node_type {
+                        e.attributes.insert("class".to_string(), class.clone());
+                    }
+                }
+            }
+            continue;
+        }
         let (index, replacement) = match mutation {
             js::Mutation::SetText(i, text) => (*i, vec![dom::text(text.clone())]),
             js::Mutation::SetHtml(i, html) => {
                 (*i, html::parse(format!("<div>{html}</div>")).children)
             }
+            js::Mutation::SetClass(..) => continue, // handled above
         };
         let path = match view.elements.get(index) {
             Some(e) => e.path.clone(),
