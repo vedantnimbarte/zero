@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <style>
+        body { background: #0e0f12; color: #f2f3f5; padding: 32px; font-size: 18px; }
+        h1 { color: #e5484d; font-size: 30px; }
+        .btn { background: #e5484d; color: #ffffff; width: 260px; padding: 16px; }
+        .btn2 { background: #66ccff; color: #0e0f12; width: 260px; padding: 16px; }
+        .panel { background: #17181c; width: 620px; padding: 18px; }
+        .note { color: #9a9da6; font-size: 15px; }
+    </style>
+</head>
+<body>
+    <h1>Click things</h1>
+    <div class="note">Click the buttons below - handlers run in Zero's own JS engine.</div>
+
+    <div id="inc" class="btn">Increment counter</div>
+    <div id="reset" class="btn2">Reset</div>
+    <div id="out" class="panel">count = 0</div>
+
+    <script>
+        var count = 0;
+        var out = document.getElementById('out');
+
+        function render() {
+            out.textContent = 'count = ' + count + '  (squares: ' + squares().join(', ') + ')';
+        }
+
+        function squares() {
+            var list = [];
+            for (var i = 1; i <= count; i++) { list.push(i * i); }
+            return list;
+        }
+
+        document.getElementById('inc').onclick = function () {
+            count = count + 1;
+            render();
+        };
+
+        document.getElementById('reset').addEventListener('click', function () {
+            count = 0;
+            out.textContent = 'count = 0';
+        });
+    </script>
+</body>
+</html>
