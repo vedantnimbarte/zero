@@ -10,6 +10,15 @@ use std::collections::HashMap;
 /// knowing anything about networking or the filesystem.
 pub trait ResourceLoader {
     fn load(&self, url: &str) -> Option<Vec<u8>>;
+
+    /// Fetch several resources at once, in the order given.
+    ///
+    /// The engine asks for everything a page needs in one call so an embedder
+    /// can fetch them concurrently — over a real network this dominates render
+    /// time. The default is sequential, so a simple loader need not implement it.
+    fn load_all(&self, urls: &[String]) -> Vec<Option<Vec<u8>>> {
+        urls.iter().map(|url| self.load(url)).collect()
+    }
 }
 
 /// Key/value storage for scripts (`localStorage`), supplied by the embedder.

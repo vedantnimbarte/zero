@@ -684,18 +684,26 @@ pub fn is_text_field(tag: &str) -> bool {
 /// splits its CSS that way still renders under-styled. One more pass over the
 /// parsed sheet would fix it.
 fn collect_linked_css(node: &Node, loader: &dyn ResourceLoader, out: &mut String) {
+    let mut hrefs = Vec::new();
+    collect_stylesheet_hrefs(node, &mut hrefs);
+    for bytes in loader.load_all(&hrefs).into_iter().flatten() {
+        if let Ok(text) = String::from_utf8(bytes) {
+            out.push('\n');
+            out.push_str(&text);
+        }
+    }
+}
+
+fn collect_stylesheet_hrefs(node: &Node, out: &mut Vec<String>) {
     if let NodeType::Element(ref e) = node.node_type {
         if e.tag_name == "link" && is_stylesheet(e) {
-            if let Some(href) = e.attributes.get("href") {
-                if let Some(text) = loader.load(href).and_then(|b| String::from_utf8(b).ok()) {
-                    out.push('\n');
-                    out.push_str(&text);
-                }
+            if let Some(href) = e.attributes.get("href").filter(|h| !h.is_empty()) {
+                out.push(href.clone());
             }
         }
     }
     for child in &node.children {
-        collect_linked_css(child, loader, out);
+        collect_stylesheet_hrefs(child, out);
     }
 }
 
@@ -707,20 +715,31 @@ fn is_stylesheet(element: &dom::ElementData) -> bool {
     })
 }
 
+/// Sources are gathered first and requested in one batch, so an embedder can
+/// fetch them concurrently instead of one blocking round trip at a time.
 fn collect_and_load_images(node: &Node, loader: &dyn ResourceLoader, out: &mut ImageMap) {
+    let mut srcs = Vec::new();
+    collect_image_srcs(node, &mut srcs);
+    for (src, bytes) in srcs.iter().zip(loader.load_all(&srcs)) {
+        if let Some(img) = bytes.and_then(|b| resource::decode_image(&b)) {
+            out.insert(src.clone(), img);
+        }
+    }
+}
+
+/// Every distinct `<img src>`, in document order.
+fn collect_image_srcs(node: &Node, out: &mut Vec<String>) {
     if let NodeType::Element(ref e) = node.node_type {
         if e.tag_name == "img" {
-            if let Some(src) = e.attributes.get("src") {
-                if !out.contains_key(src) {
-                    if let Some(img) = loader.load(src).and_then(|b| resource::decode_image(&b)) {
-                        out.insert(src.clone(), img);
-                    }
+            if let Some(src) = e.attributes.get("src").filter(|s| !s.is_empty()) {
+                if !out.contains(src) {
+                    out.push(src.clone());
                 }
             }
         }
     }
     for child in &node.children {
-        collect_and_load_images(child, loader, out);
+        collect_image_srcs(child, out);
     }
 }
 
