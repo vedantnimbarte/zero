@@ -56,7 +56,7 @@ fn main() {
     };
 
     if ai_mode {
-        let doc = zero_engine::Document::load(&html, &css);
+        let doc = zero_engine::Document::load_with(&html, &css, std::rc::Rc::new(ShellLoader::new(address.clone())));
         let ctx = ai::PageContext {
             url: address,
             text: doc.page_text(),

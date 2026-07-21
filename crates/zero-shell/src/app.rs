@@ -87,7 +87,7 @@ impl Tab {
         Tab {
             history: vec![address.clone()],
             address,
-            doc: zero_engine::Document::load(&html, &css),
+            doc: zero_engine::Document::load_with(&html, &css, Rc::new(ShellLoader::new(String::new()))),
             element_rects: Vec::new(),
             history_index: 0,
             scroll_y: 0.0,
@@ -363,8 +363,10 @@ impl App {
         // An HTTPS upgrade can change the URL, so adopt whatever actually loaded.
         tab.address = fetched.url;
         tab.secure = fetched.secure;
-        // A new page means a new document and a fresh JS runtime.
-        tab.doc = zero_engine::Document::load(&fetched.body, "");
+        // A new page means a new document and a fresh JS runtime. The loader goes
+        // in so page scripts can fetch relative to this URL.
+        let loader = Rc::new(ShellLoader::new(tab.address.clone()));
+        tab.doc = zero_engine::Document::load_with(&fetched.body, "", loader);
         tab.scroll_y = 0.0;
         tab.page_canvas = None; // force re-render of the new page
         let title = tab.address.clone();
