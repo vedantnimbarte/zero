@@ -510,8 +510,7 @@ impl<'a> LayoutBox<'a> {
             return;
         }
 
-        // Each item starts at its base size (explicit width, else content width),
-        // then leftover space is shared out in proportion to flex-grow.
+        // Each item starts at its base size (explicit width, else content width).
         struct Item {
             base: f32,
             grow: f32,
@@ -524,8 +523,10 @@ impl<'a> LayoutBox<'a> {
                 _ => {
                     let style = child.get_style_node();
                     let ctx = style.length_context(container.width);
+                    // Base is the OUTER width, so gaps and free space line up with
+                    // what layout actually produces (a border box, not content).
                     let base = match style.value("width") {
-                        Some(v @ Value::Length(..)) => v.resolve(ctx),
+                        Some(v @ Value::Length(..)) => v.resolve(ctx) + horizontal_edges(style, ctx),
                         _ => max_content_width(style, fonts, images).min(container.width),
                     };
                     // `flex: 1` and `flex-grow: 1` both mean "take a share".
@@ -539,34 +540,81 @@ impl<'a> LayoutBox<'a> {
             })
             .collect();
 
-        let total_gap = gap * count.saturating_sub(1) as f32;
-        let used: f32 = items.iter().map(|i| i.base).sum();
-        let leftover = container.width - used - total_gap;
-        let total_grow: f32 = items.iter().map(|i| i.grow).sum();
+        let wrap = matches!(style.value("flex-wrap"), Some(Value::Keyword(ref k)) if k.starts_with("wrap"));
+        let justify = style.value("justify-content").and_then(keyword_of).unwrap_or_default();
+        let align = style.value("align-items").and_then(keyword_of).unwrap_or_default();
 
-        let mut cursor_x = container.x;
-        let mut tallest = 0.0_f32;
-        for (i, child) in self.children.iter_mut().enumerate() {
-            if child.is_out_of_flow() {
-                continue; // positioned later, once the container's size is final
+        // Group items into lines. Without wrapping everything shares one line.
+        let flow: Vec<usize> =
+            (0..count).filter(|&i| !self.children[i].is_out_of_flow()).collect();
+        let mut lines: Vec<Vec<usize>> = Vec::new();
+        let mut current: Vec<usize> = Vec::new();
+        let mut line_width = 0.0_f32;
+        for &i in &flow {
+            let next = line_width + items[i].base + if current.is_empty() { 0.0 } else { gap };
+            if wrap && !current.is_empty() && next > container.width {
+                lines.push(std::mem::take(&mut current));
+                line_width = items[i].base;
+            } else {
+                line_width = next;
             }
-            let mut width = items[i].base;
-            if leftover > 0.0 && total_grow > 0.0 {
-                width += leftover * items[i].grow / total_grow;
-            } else if leftover < 0.0 && used > 0.0 {
-                width += leftover * (items[i].base / used); // shrink proportionally
-            }
-            // Each item gets a containing block that is exactly its slot, so an
-            // `auto` width fills the slot rather than the whole container.
-            let mut slot: Dimensions = Default::default();
-            slot.content =
-                Rect { x: cursor_x, y: container.y, width: width.max(0.0), height: 0.0 };
-            child.layout(slot, fonts, images);
-            let item = child.dimensions.margin_box();
-            cursor_x += item.width + gap;
-            tallest = tallest.max(item.height);
+            current.push(i);
         }
-        self.dimensions.content.height = tallest;
+        if !current.is_empty() {
+            lines.push(current);
+        }
+
+        let mut cursor_y = container.y;
+        let mut total_height = 0.0_f32;
+
+        for (line_index, line) in lines.iter().enumerate() {
+            let total_gap = gap * line.len().saturating_sub(1) as f32;
+            let used: f32 = line.iter().map(|&i| items[i].base).sum();
+            let leftover = container.width - used - total_gap;
+            let total_grow: f32 = line.iter().map(|&i| items[i].grow).sum();
+
+            // Widths first, so justify-content knows how much space is really free.
+            let widths: Vec<f32> = line
+                .iter()
+                .map(|&i| {
+                    let mut w = items[i].base;
+                    if leftover > 0.0 && total_grow > 0.0 {
+                        w += leftover * items[i].grow / total_grow;
+                    } else if leftover < 0.0 && used > 0.0 {
+                        w += leftover * (items[i].base / used); // shrink proportionally
+                    }
+                    w.max(0.0)
+                })
+                .collect();
+
+            let free = (container.width - widths.iter().sum::<f32>() - total_gap).max(0.0);
+            let (offset, between) = distribute(&justify, free, line.len());
+
+            let mut cursor_x = container.x + offset;
+            let mut tallest = 0.0_f32;
+            for (slot_index, &i) in line.iter().enumerate() {
+                let mut slot: Dimensions = Default::default();
+                slot.content =
+                    Rect { x: cursor_x, y: cursor_y, width: widths[slot_index], height: 0.0 };
+                self.children[i].layout(slot, fonts, images);
+                let placed = self.children[i].dimensions.margin_box();
+                cursor_x += placed.width + gap + between;
+                tallest = tallest.max(placed.height);
+            }
+
+            // Cross-axis alignment happens once the line's height is known.
+            for &i in line.iter() {
+                align_cross_axis(&mut self.children[i], &align, cursor_y, tallest, fonts, images);
+            }
+
+            cursor_y += tallest;
+            total_height += tallest;
+            if line_index + 1 < lines.len() {
+                cursor_y += gap;
+                total_height += gap;
+            }
+        }
+        self.dimensions.content.height = total_height;
     }
 
     fn calculate_block_height(&mut self, containing_block: Dimensions) {
@@ -643,6 +691,83 @@ fn collect_inline_text(bx: &LayoutBox, default_size: f32, href: Option<&str>, ou
     }
     for child in &bx.children {
         collect_inline_text(child, default_size, current_href.as_deref(), out);
+    }
+}
+
+/// Horizontal margin + border + padding for an element, in px.
+fn horizontal_edges(style: &StyledNode, ctx: LengthContext) -> f32 {
+    let zero = Value::Length(0.0, Unit::Px);
+    [
+        ("margin-left", "margin"),
+        ("margin-right", "margin"),
+        ("border-left-width", "border-width"),
+        ("border-right-width", "border-width"),
+        ("padding-left", "padding"),
+        ("padding-right", "padding"),
+    ]
+    .iter()
+    .map(|(name, short)| style.lookup(name, short, &zero).resolve(ctx))
+    .sum()
+}
+
+/// The keyword form of a value, if it is one.
+fn keyword_of(value: Value) -> Option<String> {
+    match value {
+        Value::Keyword(k) => Some(k),
+        _ => None,
+    }
+}
+
+/// Leading offset and extra spacing between items for a `justify-content` mode.
+fn distribute(mode: &str, free: f32, items: usize) -> (f32, f32) {
+    if items == 0 || free <= 0.0 {
+        return (0.0, 0.0);
+    }
+    match mode {
+        "center" => (free / 2.0, 0.0),
+        "flex-end" | "end" | "right" => (free, 0.0),
+        "space-between" if items > 1 => (0.0, free / (items - 1) as f32),
+        "space-around" => (free / (items * 2) as f32, free / items as f32),
+        "space-evenly" => (free / (items + 1) as f32, free / (items + 1) as f32),
+        _ => (0.0, 0.0), // flex-start, and space-* with a single item
+    }
+}
+
+/// Place a flex item within its line on the cross axis.
+///
+/// ponytail: `stretch` just sets the box height rather than re-running layout,
+/// so a stretched item's own children keep their original positions.
+fn align_cross_axis(
+    child: &mut LayoutBox,
+    mode: &str,
+    line_top: f32,
+    line_height: f32,
+    fonts: Option<&FontSet>,
+    images: &ImageMap,
+) {
+    let outer = child.dimensions.margin_box();
+    let slack = line_height - outer.height;
+    match mode {
+        "center" | "flex-end" | "end" if slack > 0.0 => {
+            let shift = if mode == "center" { slack / 2.0 } else { slack };
+            let mut slot: Dimensions = Default::default();
+            slot.content = Rect {
+                x: outer.x,
+                y: line_top + shift,
+                width: child.dimensions.content.width
+                    + child.dimensions.padding.left
+                    + child.dimensions.padding.right,
+                height: 0.0,
+            };
+            // Re-run layout so descendants move with the box.
+            let width = child.dimensions.content.width;
+            slot.content.width = width;
+            child.layout(slot, fonts, images);
+        }
+        // `stretch` is the default: fill the line's height.
+        "flex-start" | "start" | "baseline" => {}
+        _ if slack > 0.0 => child.dimensions.content.height += slack,
+        _ => {}
     }
 }
 
@@ -733,13 +858,7 @@ pub fn max_content_width(
         return 0.0;
     }
     let ctx = style.length_context(0.0);
-    let edges = ["margin-left", "margin-right", "padding-left", "padding-right"]
-        .iter()
-        .map(|name| {
-            let short = if name.starts_with("margin") { "margin" } else { "padding" };
-            style.lookup(name, short, &Value::Length(0.0, Unit::Px)).resolve(ctx)
-        })
-        .sum::<f32>();
+    let edges = horizontal_edges(style, ctx);
 
     // An explicit, absolute width settles it.
     if let Some(Value::Length(w, Unit::Px)) = style.value("width") {
@@ -959,6 +1078,49 @@ mod tests {
         let placed = laid.children[0].dimensions.margin_box();
         assert_eq!(placed.x, 900.0 - 20.0 - 100.0); // right edge is 20 from the container's
         assert_eq!(placed.y, 200.0 - 10.0 - 40.0); // bottom edge is 10 from the container's
+    }
+
+    #[test]
+    fn justify_content_distributes_free_space() {
+        // 3 items of 100 in a 500 container leaves 200 free.
+        assert_eq!(distribute("flex-start", 200.0, 3), (0.0, 0.0));
+        assert_eq!(distribute("center", 200.0, 3), (100.0, 0.0));
+        assert_eq!(distribute("flex-end", 200.0, 3), (200.0, 0.0));
+        assert_eq!(distribute("space-between", 200.0, 3), (0.0, 100.0));
+        assert_eq!(distribute("space-evenly", 200.0, 3), (50.0, 50.0));
+        // A lone item has no gaps to spread into.
+        assert_eq!(distribute("space-between", 200.0, 1), (0.0, 0.0));
+    }
+
+    #[test]
+    fn flex_wrap_breaks_items_onto_new_lines() {
+        let node = dom::elem("div".into(), HashMap::new(), vec![]);
+        // Items need a height, or every line would sit at the same y.
+        let item = |w: f32| {
+            let mut v = HashMap::new();
+            v.insert("display".to_string(), Value::Keyword("block".into()));
+            v.insert("width".to_string(), Value::Length(w, Unit::Px));
+            v.insert("height".to_string(), Value::Length(50.0, Unit::Px));
+            StyledNode { node: &node, specified_values: v, children: vec![] }
+        };
+        let mut values = HashMap::new();
+        values.insert("display".to_string(), Value::Keyword("flex".into()));
+        values.insert("flex-wrap".to_string(), Value::Keyword("wrap".into()));
+        let root = StyledNode {
+            node: &node,
+            specified_values: values,
+            children: vec![item(200.0), item(200.0), item(200.0)],
+        };
+        let mut viewport: Dimensions = Default::default();
+        viewport.content.width = 450.0; // fits two per line
+
+        let laid = layout_tree(&root, viewport, None, &ImageMap::new());
+        let ys: Vec<f32> = laid.children.iter().map(|c| c.dimensions.content.y).collect();
+        // First two share a line; the third wraps below them.
+        assert_eq!(ys[0], ys[1]);
+        assert!(ys[2] > ys[1], "third item should wrap, got {ys:?}");
+        let xs: Vec<f32> = laid.children.iter().map(|c| c.dimensions.content.x).collect();
+        assert_eq!(xs[2], xs[0], "wrapped item restarts at the line start");
     }
 
     #[test]
