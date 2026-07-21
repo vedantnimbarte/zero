@@ -192,6 +192,11 @@ impl Document {
         self.focused.is_some()
     }
 
+    /// Which field has focus, so the embedder can act on it (submit, say).
+    pub fn focused_node(&self) -> Option<usize> {
+        self.focused
+    }
+
     /// Append typed text to the focused field.
     pub fn insert_text(&mut self, text: &str) -> bool {
         let Some(id) = self.focused else { return false };
@@ -218,6 +223,34 @@ impl Document {
     /// The current text of a field, for the embedder or tests.
     pub fn field_value(&self, node_id: usize) -> Option<&str> {
         self.form_values.get(&node_id).map(String::as_str)
+    }
+
+    /// Submit the form containing `node_id`, as pressing Enter in a field does.
+    ///
+    /// Returns where to navigate; the embedder owns the actual navigation since
+    /// only it knows about URLs and the network.
+    ///
+    /// ponytail: GET only, which is what search boxes use. POST needs a request
+    /// body the [`ResourceLoader`] cannot express yet.
+    pub fn submit(&self, node_id: usize) -> Option<Submission> {
+        let form = find_form(&self.root, node_id)?;
+        let element = match &form.node_type {
+            NodeType::Element(e) => e,
+            NodeType::Text(_) => return None,
+        };
+        if element.attributes.get("method").is_some_and(|m| m.eq_ignore_ascii_case("post")) {
+            return None;
+        }
+        let mut fields = Vec::new();
+        collect_fields(form, &self.form_values, &mut fields);
+        Some(Submission {
+            action: element.attributes.get("action").cloned().unwrap_or_default(),
+            query: fields
+                .iter()
+                .map(|(k, v)| format!("{}={}", percent_encode(k), percent_encode(v)))
+                .collect::<Vec<_>>()
+                .join("&"),
+        })
     }
 
     fn run_initial_scripts(&mut self) {
@@ -604,6 +637,72 @@ fn node_at<'a>(root: &'a mut Node, path: &[usize]) -> Option<&'a mut Node> {
 }
 
 /// Gather the text inside every `<script>` element into one JS source string.
+/// Where a submitted form wants to go. The action is whatever the markup said,
+/// so the embedder still has to resolve it against the page URL.
+#[derive(Debug, PartialEq)]
+pub struct Submission {
+    pub action: String,
+    pub query: String,
+}
+
+/// The nearest `<form>` ancestor of `node_id`, if any. Walks down the path to
+/// the field, remembering the last form seen, so nested forms resolve inward.
+fn find_form(root: &Node, node_id: usize) -> Option<&Node> {
+    let is_form = |n: &Node| matches!(&n.node_type, NodeType::Element(e) if e.tag_name == "form");
+    let mut best = None;
+    let mut node = root;
+    loop {
+        if is_form(node) {
+            best = Some(node);
+        }
+        match node.children.iter().find(|c| contains(c, node_id)) {
+            Some(child) => node = child,
+            None => return best,
+        }
+    }
+}
+
+/// Whether `node_id` is this node or below it.
+fn contains(node: &Node, node_id: usize) -> bool {
+    match &node.node_type {
+        NodeType::Element(e) if e.node_id == node_id => true,
+        _ => node.children.iter().any(|c| contains(c, node_id)),
+    }
+}
+
+/// Successful controls, in document order: named fields with a value.
+fn collect_fields(node: &Node, values: &HashMap<usize, String>, out: &mut Vec<(String, String)>) {
+    for child in &node.children {
+        if let NodeType::Element(e) = &child.node_type {
+            if let Some(name) = e.attributes.get("name").filter(|n| !n.is_empty()) {
+                let value = values
+                    .get(&e.node_id)
+                    .cloned()
+                    .or_else(|| e.attributes.get("value").cloned())
+                    .unwrap_or_default();
+                out.push((name.clone(), value));
+            }
+        }
+        collect_fields(child, values, out);
+    }
+}
+
+/// Percent-encode a query component. Unreserved characters pass through and
+/// spaces become `+`, matching how browsers encode form data.
+pub fn percent_encode(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
 fn collect_script_text(node: &Node, out: &mut String) {
     if let NodeType::Element(ref e) = node.node_type {
         if e.tag_name == "script" && !e.attributes.contains_key("src") {
@@ -655,11 +754,63 @@ fn collect_style_text(node: &Node, out: &mut String) {
 
 #[cfg(test)]
 mod tests {
+    use super::{Node, NodeType};
+
+    /// Node ids of every element with this tag, in document order.
+    fn ids_of(node: &Node, tag: &str, out: &mut Vec<usize>) {
+        if let NodeType::Element(e) = &node.node_type {
+            if e.tag_name == tag {
+                out.push(e.node_id);
+            }
+        }
+        node.children.iter().for_each(|c| ids_of(c, tag, out));
+    }
+
+    fn first_input(doc: &super::Document) -> usize {
+        let mut ids = Vec::new();
+        ids_of(&doc.root, "input", &mut ids);
+        ids[0]
+    }
+
     #[test]
     fn render_produces_correctly_sized_canvas() {
         let engine = super::Engine::shapes_only();
         let canvas = engine.render("<div></div>", "div { background: #112233; }", 40.0, 30.0);
         assert_eq!((canvas.width, canvas.height), (40, 30));
         assert_eq!(canvas.pixels.len(), 40 * 30);
+    }
+
+    /// A search box: type into a field nested inside the form, press Enter.
+    #[test]
+    fn submitting_a_field_builds_a_get_query() {
+        let mut doc = super::Document::load(
+            "<form action=\"/search\"><div>\
+             <input name=\"q\"><input type=\"hidden\" name=\"lang\" value=\"hi\">\
+             </div></form>",
+            "",
+        );
+        let field = first_input(&doc);
+        assert!(doc.focus(field));
+        doc.insert_text("zero browser");
+
+        let sent = doc.submit(field).expect("form found from a nested field");
+        assert_eq!(sent.action, "/search");
+        // Spaces become `+`, and hidden fields are submitted too.
+        assert_eq!(sent.query, "q=zero+browser&lang=hi");
+    }
+
+    #[test]
+    fn fields_outside_a_form_do_not_submit() {
+        let mut doc = super::Document::load("<input name=\"q\">", "");
+        let field = first_input(&doc);
+        assert_eq!(doc.submit(field), None);
+    }
+
+    #[test]
+    fn encoding_escapes_what_would_break_a_url() {
+        assert_eq!(super::percent_encode("a&b=c d/e"), "a%26b%3Dc+d%2Fe");
+        assert_eq!(super::percent_encode("hindi-~_."), "hindi-~_.");
+        // Non-ASCII goes out as UTF-8 bytes.
+        assert_eq!(super::percent_encode("हि"), "%E0%A4%B9%E0%A4%BF");
     }
 }
