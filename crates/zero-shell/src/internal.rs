@@ -55,6 +55,32 @@ fn wrap(title: &str, body: &str) -> String {
     format!("<html><head>{STYLE}</head><body><h1>{title}</h1>{body}</body></html>")
 }
 
+/// The page's own markup, as Zero received it.
+///
+/// Lines become separate blocks and leading spaces become non-breaking ones:
+/// the engine collapses whitespace like any HTML renderer, so indentation has
+/// to survive as content rather than as formatting.
+pub fn source_page(url: &str, source: &str) -> String {
+    let lines: String = source
+        .lines()
+        .map(|line| {
+            let indent = line.len() - line.trim_start().len();
+            let spaces = "\u{a0}".repeat(indent);
+            format!("<div class=\"ln\">{spaces}{}</div>", escape(line.trim_start()))
+        })
+        .collect();
+    format!(
+        "<html><head>{SOURCE_STYLE}</head><body>\
+         <div class=\"head\">Source of {}</div>{lines}</body></html>",
+        escape(url)
+    )
+}
+
+const SOURCE_STYLE: &str = "<style>\
+    body{background:#0e0f12;color:#c9ccd3;padding:20px;font-size:13px;}\
+    .head{color:#6b7280;padding:8px;}\
+    </style>";
+
 /// The start page: one search field, and the sites actually used most.
 ///
 /// The search box is an ordinary GET form, so it goes through the same
@@ -193,6 +219,20 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_view_keeps_indentation_and_escapes_markup() {
+        let page = source_page("https://a.com", "<div>\n  <p>hi</p>\n</div>");
+        // One block per line, so whitespace collapsing cannot run them together.
+        assert_eq!(page.matches("class=\"ln\"").count(), 3);
+        // Markup is shown, not interpreted.
+        assert!(page.contains("&lt;p&gt;hi&lt;/p&gt;"), "{page}");
+        assert!(!page.contains("<p>hi</p>"));
+        // Two leading spaces survive as non-breaking spaces.
+        assert!(page.contains("\u{a0}\u{a0}&lt;p&gt;"), "{page}");
+        // The URL is escaped too.
+        assert!(source_page("https://a.com/<x>", "x").contains("&lt;x&gt;"));
+    }
 
     #[test]
     fn recognises_internal_targets() {

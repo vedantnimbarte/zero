@@ -171,6 +171,8 @@ struct Tab {
     matches: Vec<zero_engine::layout::Rect>,
     /// Whether the last render's stylesheet reacted to the cursor at all.
     uses_hover: bool,
+    /// The markup this page was built from, kept for view-source.
+    source: String,
     /// Shared with this tab's document so its subresource cache outlives a
     /// single render — the engine re-asks for images and stylesheets each time.
     loader: Rc<ShellLoader>,
@@ -181,6 +183,7 @@ struct Tab {
 impl Tab {
     fn new(address: String, html: String, css: String) -> Tab {
         let loader = Rc::new(ShellLoader::new(address.clone()));
+        let source = html.clone();
         let doc = zero_engine::Document::load_hosted(
             &html,
             &css,
@@ -201,6 +204,7 @@ impl Tab {
             links: Vec::new(),
             matches: Vec::new(),
             uses_hover: false,
+            source,
             cache_w: 0,
             cache_h: 0,
         }
@@ -499,6 +503,7 @@ impl App {
                 "i" => self.toggle_assistant(),
                 "d" => self.toggle_bookmark(),
                 "f" => self.open_find(),
+                "u" => self.view_source(),
                 "l" => self.tab_mut().address.clear(), // ready for a new address
                 "h" => self.go_to("zero://history".into()),
                 "b" => self.go_to("zero://bookmarks".into()),
@@ -678,6 +683,7 @@ impl App {
             Some(tab.loader.clone()),
             Some(store),
         );
+        tab.source = fetched.body;
         tab.matches.clear();
         tab.scroll_y = 0.0;
         tab.page_canvas = None; // force re-render of the new page
@@ -814,6 +820,24 @@ impl App {
             .filter(|r| px >= r.x && px <= r.x + r.width && py >= r.y && py <= r.y + r.height)
             .map(|r| r.node_id)
             .next_back()
+    }
+
+    /// Open the current page's markup in a new tab.
+    ///
+    /// It goes through the engine like any other page, so what you read is what
+    /// Zero was actually served — useful when a site renders unexpectedly.
+    fn view_source(&mut self) {
+        let (address, source) = {
+            let tab = self.tab();
+            (tab.address.clone(), tab.source.clone())
+        };
+        if source.is_empty() {
+            return;
+        }
+        let html = crate::internal::source_page(&address, &source);
+        self.tabs.push(Tab::new(format!("view-source:{address}"), html, String::new()));
+        self.active = self.tabs.len() - 1;
+        self.request_redraw();
     }
 
     // --- find in page ---
