@@ -249,6 +249,38 @@ mod tests {
     }
 
     #[test]
+    fn text_fields_accept_typing_and_are_readable_from_script() {
+        let mut doc = crate::Document::load(
+            "<html><body><input id='q' value='ab'><div id='out'>-</div>\
+             <script>\
+               var q = document.getElementById('q');\
+               q.onclick = function() { document.getElementById('out').textContent = 'saw:' + q.value; };\
+             </script></body></html>",
+            "",
+        );
+        // html, body, input(3), div(4), script(5)
+        assert!(doc.focus(3), "input should be focusable");
+        assert!(doc.insert_text("cd"));
+        assert!(doc.backspace());
+        assert_eq!(doc.field_value(3), Some("abc"));
+
+        // A script reads the typed value, not the original attribute.
+        doc.blur();
+        assert!(doc.click(3));
+        assert!(doc.text_of(4).contains("saw:abc"), "got {:?}", doc.text_of(4));
+    }
+
+    #[test]
+    fn script_can_set_a_field_value() {
+        let mut doc = crate::Document::load(
+            "<html><body><input id='q' value='old'>\
+             <script>document.getElementById('q').value = 'new';</script></body></html>",
+            "",
+        );
+        assert_eq!(doc.field_value(3), Some("new"));
+    }
+
+    #[test]
     fn missing_element_is_null_not_an_error() {
         let out = run("var el = document.getElementById('nope'); console.log(el);");
         assert!(out.errors.is_empty(), "{:?}", out.errors);
