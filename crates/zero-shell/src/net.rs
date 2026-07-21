@@ -146,9 +146,19 @@ pub fn normalize_target(s: &str) -> String {
         s.to_string()
     } else if s.contains('.') && !s.contains(' ') {
         format!("https://{s}")
-    } else {
+    } else if s.is_empty() {
         s.to_string()
+    } else {
+        search_url(s)
     }
+}
+
+/// Anything that isn't an address is a search.
+///
+/// DuckDuckGo's HTML endpoint is the default because it needs no JavaScript and
+/// does not profile the user — the same reasoning as docs/04-SECURITY-PRIVACY.md.
+pub fn search_url(query: &str) -> String {
+    format!("https://duckduckgo.com/html/?q={}", zero_engine::percent_encode(query))
 }
 
 /// A loaded document, plus the URL it actually came from and whether the

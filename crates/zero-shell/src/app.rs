@@ -46,12 +46,6 @@ const TOOLBAR_CSS: &str = "body{background:#1f2127;color:#f2f3f5;font-size:15px;
 
 const AI_CSS: &str = "body{background:#141519;color:#c9ccd3;font-size:14px;}      #head{background:#26282f;color:#f2f3f5;padding:12px;height:20px;}      .line{padding:2px;} .src{color:#6b7280;padding:10px;}";
 
-const NEW_TAB_HTML: &str = "<html><head><style>\
-    body{background:#0e0f12;color:#f2f3f5;padding:48px;font-size:18px;}\
-    h1{color:#e5484d;font-size:40px;}\
-    </style></head><body><h1>Zero</h1>\
-    <p>Type a URL above and press Enter.</p></body></html>";
-
 /// Where the scrollbar thumb sits within the page area, as (offset, height).
 /// `None` when the content fits and no scrollbar is warranted.
 fn scrollbar_thumb(content: f32, viewport: f32, scroll: f32) -> Option<(f32, f32)> {
@@ -71,6 +65,21 @@ fn scroll_for_cursor(content: f32, viewport: f32, y: f32) -> f32 {
     let travel = (viewport - thumb).max(1.0);
     let ratio = ((y - thumb / 2.0) / travel).clamp(0.0, 1.0);
     ratio * (content - viewport)
+}
+
+/// Where a submitted form navigates to, given the page it was submitted from.
+fn submission_url(address: &str, sent: &zero_engine::Submission) -> String {
+    // An empty action means "this page", whose own query the new one replaces.
+    let base = match sent.action.is_empty() {
+        true => address.split('?').next().unwrap_or(address).to_string(),
+        false => resolve_url(address, &sent.action),
+    };
+    match sent.query.is_empty() {
+        true => base,
+        // An action may already carry a query string of its own.
+        false if base.contains('?') => format!("{base}&{}", sent.query),
+        false => format!("{base}?{}", sent.query),
+    }
 }
 
 fn escape(s: &str) -> String {
@@ -149,7 +158,10 @@ impl Tab {
     }
 
     fn blank() -> Tab {
-        Tab::new(String::new(), NEW_TAB_HTML.to_string(), String::new())
+        let address = "zero://newtab".to_string();
+        let mut tab = Tab::new(address.clone(), crate::internal::page(&address), String::new());
+        tab.address = address; // shown in the bar, and reloadable like any page
+        tab
     }
 }
 
@@ -334,7 +346,7 @@ impl App {
                     true
                 }
                 Key::Named(NamedKey::Enter) => {
-                    self.tab_mut().doc.blur();
+                    self.submit_focused_form();
                     true
                 }
                 _ => match &event.text {
@@ -612,6 +624,16 @@ impl App {
     }
 
     /// Act on a toolbar button, if the cursor is over one.
+    /// Enter in a field submits its form, if it is in one; otherwise it just
+    /// leaves the field, which is what a lone input does.
+    fn submit_focused_form(&mut self) {
+        let sent = self.tab().doc.focused_node().and_then(|id| self.tab().doc.submit(id));
+        self.tab_mut().doc.blur();
+        let Some(sent) = sent else { return };
+        let target = submission_url(&self.tab().address, &sent);
+        self.go_to(target);
+    }
+
     /// Save the current page, or unsave it if it is already bookmarked.
     fn toggle_bookmark(&mut self) {
         let url = self.tab().address.clone();
@@ -801,6 +823,29 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn form_submission_targets() {
+        let sent = |action: &str, query: &str| zero_engine::Submission {
+            action: action.into(),
+            query: query.into(),
+        };
+        // Relative action against the page's directory.
+        assert_eq!(
+            submission_url("https://a.com/docs/x.html", &sent("/find", "q=hi")),
+            "https://a.com/find?q=hi"
+        );
+        // An action with its own query keeps it and appends.
+        assert_eq!(
+            submission_url("https://a.com/", &sent("/s?lang=hi", "q=zero")),
+            "https://a.com/s?lang=hi&q=zero"
+        );
+        // No action: back to this page, replacing the query it already had.
+        assert_eq!(
+            submission_url("https://a.com/s?q=old", &sent("", "q=new")),
+            "https://a.com/s?q=new"
+        );
+    }
 
     #[test]
     fn no_scrollbar_when_content_fits() {
