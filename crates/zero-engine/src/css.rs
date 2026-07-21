@@ -189,6 +189,159 @@ const RAW_VALUE_PROPERTIES: &[&str] = &[
     "background-image",
 ];
 
+/// The named colours worth carrying, plus `transparent`.
+///
+/// ponytail: CSS defines 148 names; these are the ones that actually show up.
+/// An unknown name falls through to a keyword and the declaration is ignored,
+/// which leaves the element at its inherited colour rather than a wrong one.
+const NAMED_COLORS: &[(&str, u32)] = &[
+    ("transparent", 0x00000000),
+    ("black", 0x000000ff),
+    ("silver", 0xc0c0c0ff),
+    ("gray", 0x808080ff),
+    ("grey", 0x808080ff),
+    ("white", 0xffffffff),
+    ("maroon", 0x800000ff),
+    ("red", 0xff0000ff),
+    ("purple", 0x800080ff),
+    ("fuchsia", 0xff00ffff),
+    ("magenta", 0xff00ffff),
+    ("green", 0x008000ff),
+    ("lime", 0x00ff00ff),
+    ("olive", 0x808000ff),
+    ("yellow", 0xffff00ff),
+    ("navy", 0x000080ff),
+    ("blue", 0x0000ffff),
+    ("teal", 0x008080ff),
+    ("aqua", 0x00ffffff),
+    ("cyan", 0x00ffffff),
+    ("orange", 0xffa500ff),
+    ("pink", 0xffc0cbff),
+    ("brown", 0xa52a2aff),
+    ("gold", 0xffd700ff),
+    ("beige", 0xf5f5dcff),
+    ("ivory", 0xfffff0ff),
+    ("khaki", 0xf0e68cff),
+    ("lavender", 0xe6e6faff),
+    ("salmon", 0xfa8072ff),
+    ("tan", 0xd2b48cff),
+    ("violet", 0xee82eeff),
+    ("indigo", 0x4b0082ff),
+    ("crimson", 0xdc143cff),
+    ("coral", 0xff7f50ff),
+    ("tomato", 0xff6347ff),
+    ("turquoise", 0x40e0d0ff),
+    ("plum", 0xdda0ddff),
+    ("orchid", 0xda70d6ff),
+    ("wheat", 0xf5deb3ff),
+    ("snow", 0xfffafaff),
+    ("azure", 0xf0ffffff),
+    ("darkgray", 0xa9a9a9ff),
+    ("darkgrey", 0xa9a9a9ff),
+    ("lightgray", 0xd3d3d3ff),
+    ("lightgrey", 0xd3d3d3ff),
+    ("dimgray", 0x696969ff),
+    ("dimgrey", 0x696969ff),
+    ("lightblue", 0xadd8e6ff),
+    ("darkblue", 0x00008bff),
+    ("lightgreen", 0x90ee90ff),
+    ("darkgreen", 0x006400ff),
+    ("darkred", 0x8b0000ff),
+    ("whitesmoke", 0xf5f5f5ff),
+    ("gainsboro", 0xdcdcdcff),
+    ("steelblue", 0x4682b4ff),
+    ("skyblue", 0x87ceebff),
+    ("royalblue", 0x4169e1ff),
+    ("firebrick", 0xb22222ff),
+    ("chocolate", 0xd2691eff),
+    ("goldenrod", 0xdaa520ff),
+    ("seagreen", 0x2e8b57ff),
+    ("slategray", 0x708090ff),
+    ("slategrey", 0x708090ff),
+];
+
+fn named_color(name: &str) -> Option<Value> {
+    let name = name.to_ascii_lowercase();
+    NAMED_COLORS.iter().find(|(n, _)| *n == name).map(|(_, rgba)| {
+        Value::ColorValue(Color {
+            r: (rgba >> 24) as u8,
+            g: (rgba >> 16) as u8,
+            b: (rgba >> 8) as u8,
+            a: *rgba as u8,
+        })
+    })
+}
+
+/// `rgb()`, `rgba()`, `hsl()` and `hsla()`, in both the comma and the modern
+/// space-separated form (`rgb(0 0 0 / 50%)`).
+fn parse_color_function(s: &str) -> Option<Value> {
+    let (name, rest) = s.split_once('(')?;
+    let body = rest.strip_suffix(')')?;
+    let name = name.trim().to_ascii_lowercase();
+    // Both separators mean the same thing, and `/` only ever precedes alpha.
+    let parts: Vec<&str> =
+        body.split([',', '/', ' ']).map(str::trim).filter(|p| !p.is_empty()).collect();
+    if parts.len() < 3 {
+        return None;
+    }
+    let alpha = match parts.get(3) {
+        Some(a) => (parse_alpha(a)? * 255.0).round().clamp(0.0, 255.0) as u8,
+        None => 255,
+    };
+    let color = match name.as_str() {
+        "rgb" | "rgba" => {
+            let channel = |p: &str| -> Option<u8> {
+                let value = match p.strip_suffix('%') {
+                    Some(pct) => pct.trim().parse::<f32>().ok()? / 100.0 * 255.0,
+                    None => p.parse::<f32>().ok()?,
+                };
+                Some(value.round().clamp(0.0, 255.0) as u8)
+            };
+            Color {
+                r: channel(parts[0])?,
+                g: channel(parts[1])?,
+                b: channel(parts[2])?,
+                a: alpha,
+            }
+        }
+        "hsl" | "hsla" => {
+            let hue = parts[0].trim_end_matches("deg").parse::<f32>().ok()?;
+            let pct = |p: &str| p.trim_end_matches('%').parse::<f32>().ok().map(|v| v / 100.0);
+            let (r, g, b) = hsl_to_rgb(hue, pct(parts[1])?, pct(parts[2])?);
+            Color { r, g, b, a: alpha }
+        }
+        _ => return None,
+    };
+    Some(Value::ColorValue(color))
+}
+
+/// Alpha is a 0-1 number or a percentage.
+fn parse_alpha(text: &str) -> Option<f32> {
+    match text.strip_suffix('%') {
+        Some(pct) => pct.trim().parse::<f32>().ok().map(|v| v / 100.0),
+        None => text.parse::<f32>().ok(),
+    }
+}
+
+fn hsl_to_rgb(hue: f32, saturation: f32, lightness: f32) -> (u8, u8, u8) {
+    let hue = hue.rem_euclid(360.0) / 60.0;
+    let saturation = saturation.clamp(0.0, 1.0);
+    let lightness = lightness.clamp(0.0, 1.0);
+    let chroma = (1.0 - (2.0 * lightness - 1.0).abs()) * saturation;
+    let second = chroma * (1.0 - (hue % 2.0 - 1.0).abs());
+    let (r, g, b) = match hue as u32 {
+        0 => (chroma, second, 0.0),
+        1 => (second, chroma, 0.0),
+        2 => (0.0, chroma, second),
+        3 => (0.0, second, chroma),
+        4 => (second, 0.0, chroma),
+        _ => (chroma, 0.0, second),
+    };
+    let base = lightness - chroma / 2.0;
+    let byte = |v: f32| ((v + base) * 255.0).round().clamp(0.0, 255.0) as u8;
+    (byte(r), byte(g), byte(b))
+}
+
 /// Interpret a raw value string, returning `None` for anything unsupported.
 fn classify_value(s: &str) -> Option<Value> {
     if s.is_empty() {
@@ -196,6 +349,14 @@ fn classify_value(s: &str) -> Option<Value> {
     }
     if let Some(hex) = s.strip_prefix('#') {
         return parse_hex_color(hex);
+    }
+    if s.contains('(') && !s.starts_with("linear-gradient(") {
+        if let Some(color) = parse_color_function(s) {
+            return Some(color);
+        }
+    }
+    if let Some(color) = named_color(s) {
+        return Some(color);
     }
     // Functions we interpret later (gradients) are kept verbatim.
     if s.starts_with("linear-gradient(") {
@@ -719,6 +880,35 @@ mod tests {
             .expect("the .ok rule");
         // color + width(%) + padding all understood now.
         assert_eq!(ok.declarations.len(), 3);
+    }
+
+    #[test]
+    fn parses_named_colors_and_color_functions() {
+        let color = |text: &str| match classify_value(text) {
+            Some(Value::ColorValue(c)) => Some((c.r, c.g, c.b, c.a)),
+            _ => None,
+        };
+        assert_eq!(color("red"), Some((255, 0, 0, 255)));
+        assert_eq!(color("WhiteSmoke"), Some((245, 245, 245, 255)));
+        // `transparent` is a colour with zero alpha, not a missing value.
+        assert_eq!(color("transparent"), Some((0, 0, 0, 0)));
+
+        assert_eq!(color("rgb(18, 52, 86)"), Some((18, 52, 86, 255)));
+        assert_eq!(color("rgba(0,0,0,0.5)"), Some((0, 0, 0, 128)));
+        // The modern space-separated form, with a percentage alpha.
+        assert_eq!(color("rgb(255 0 0 / 50%)"), Some((255, 0, 0, 128)));
+        assert_eq!(color("rgb(100%, 0%, 0%)"), Some((255, 0, 0, 255)));
+
+        assert_eq!(color("hsl(0, 100%, 50%)"), Some((255, 0, 0, 255)));
+        assert_eq!(color("hsl(120, 100%, 50%)"), Some((0, 255, 0, 255)));
+        assert_eq!(color("hsl(0, 0%, 100%)"), Some((255, 255, 255, 255)));
+        assert_eq!(color("hsla(240, 100%, 50%, 1)"), Some((0, 0, 255, 255)));
+
+        // Nonsense stays unsupported rather than becoming a wrong colour.
+        assert_eq!(color("rgb(1, 2)"), None);
+        assert_eq!(color("notacolor"), None);
+        // A keyword that is not a colour still parses as a keyword.
+        assert_eq!(classify_value("block"), Some(Value::Keyword("block".into())));
     }
 
     #[test]

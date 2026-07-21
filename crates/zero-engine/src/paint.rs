@@ -55,14 +55,25 @@ impl Canvas {
         }
     }
 
+    /// Fill a rect, blending when the colour is translucent.
+    ///
+    /// Overwriting regardless of alpha would paint `transparent` as solid black
+    /// and every `rgba()` overlay as opaque.
     fn paint_solid(&mut self, color: Color, rect: Rect) {
+        if color.a == 0 {
+            return;
+        }
         let x0 = rect.x.clamp(0.0, self.width as f32) as usize;
         let y0 = rect.y.clamp(0.0, self.height as f32) as usize;
         let x1 = (rect.x + rect.width).clamp(0.0, self.width as f32) as usize;
         let y1 = (rect.y + rect.height).clamp(0.0, self.height as f32) as usize;
         for y in y0..y1 {
             for x in x0..x1 {
-                self.pixels[y * self.width + x] = color;
+                let idx = y * self.width + x;
+                self.pixels[idx] = match color.a {
+                    255 => color,
+                    _ => blend(self.pixels[idx], color, 255),
+                };
             }
         }
     }
