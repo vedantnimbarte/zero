@@ -10,6 +10,8 @@ use super::lexer::{Kw, Tok};
 pub enum Expr {
     /// `a, b, c` — every part runs, the last one is the value.
     Sequence(Vec<Expr>),
+    /// `/pattern/flags`
+    Regex { pattern: String, flags: String },
     Num(f64),
     Str(String),
     Bool(bool),
@@ -546,6 +548,7 @@ impl Parser {
         match self.next() {
             Tok::Num(n) => Ok(Expr::Num(n)),
             Tok::Str(s) => Ok(Expr::Str(s)),
+            Tok::Regex(pattern, flags) => Ok(Expr::Regex { pattern, flags }),
             Tok::Ident(name) => Ok(Expr::Ident(name)),
             Tok::Kw(Kw::True) => Ok(Expr::Bool(true)),
             Tok::Kw(Kw::False) => Ok(Expr::Bool(false)),

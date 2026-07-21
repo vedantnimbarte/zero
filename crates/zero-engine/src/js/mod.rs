@@ -4,6 +4,7 @@
 //! A bytecode VM with inline caches (Phase 2) and a baseline JIT (Phase 3) come later.
 
 pub mod dom;
+pub mod regex;
 pub mod interp;
 pub mod lexer;
 pub mod parser;
@@ -241,6 +242,24 @@ mod tests {
         let out = run("console.log(typeof nothingHere, typeof document, typeof 1, typeof 'a');");
         assert_eq!(out.errors, Vec::<String>::new());
         assert_eq!(out.console, ["undefined object number string"]);
+    }
+
+    #[test]
+    fn regex_literals_run() {
+        // A `/` after an operator opens a regex; after a value it divides.
+        let out = run(r"console.log(/\d+/.test('abc123'), /^x/.test('abc'), 10 / 2);");
+        assert_eq!(out.errors, Vec::<String>::new());
+        assert_eq!(out.console, ["true false 5"]);
+
+        let out = run(r"console.log('a1b22c'.replace(/\d+/g, '-'));");
+        assert_eq!(out.console, ["a-b-c"]);
+
+        let out = run(r"console.log('one, two,three'.split(/,\s*/).length);");
+        assert_eq!(out.console, ["3"]);
+
+        // Syntax the matcher cannot honour is refused, not guessed at.
+        let out = run("console.log(/(?<n>a)/.test('a'));");
+        assert!(out.errors.iter().any(|e| e.contains("unsupported regular expression")), "{:?}", out.errors);
     }
 
     #[test]

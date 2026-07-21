@@ -86,6 +86,8 @@ pub enum Value {
     Array(Rc<RefCell<Vec<Value>>>),
     /// A handle into the document snapshot (see [`super::dom`]).
     Element(usize),
+    /// A compiled regular expression (see [`super::regex`]).
+    Regex(Rc<super::regex::Regex>),
 }
 
 pub struct FuncData {
@@ -108,6 +110,7 @@ impl Value {
                 }
             }
             Value::Str(s) => s.clone(),
+            Value::Regex(re) => format!("/{}/{}", re.source, re.flags),
             Value::Bool(b) => b.to_string(),
             Value::Null => "null".into(),
             Value::Undefined => "undefined".into(),
@@ -556,6 +559,11 @@ impl Interp {
     fn eval(&mut self, expr: &Expr) -> Result<Value, String> {
         match expr {
             Expr::Num(n) => Ok(Value::Num(*n)),
+            Expr::Regex { pattern, flags } => match super::regex::Regex::new(pattern, flags) {
+                Some(re) => Ok(Value::Regex(Rc::new(re))),
+                // Refusing is better than matching the wrong thing silently.
+                None => Err(format!("unsupported regular expression /{pattern}/{flags}")),
+            },
             Expr::Str(s) => Ok(Value::Str(s.clone())),
             Expr::Bool(b) => Ok(Value::Bool(*b)),
             Expr::Null => Ok(Value::Null),
@@ -847,6 +855,48 @@ impl Interp {
                 }
                 Value::Undefined
             }
+            // Regex methods, and the string methods that accept one.
+            (Value::Regex(re), "test") => {
+                Value::Bool(re.is_match(&args.first().map(Value::to_display).unwrap_or_default()))
+            }
+            (Value::Str(s), "replace" | "replaceAll") => match args.first() {
+                Some(Value::Regex(re)) => {
+                    let with = args.get(1).map(Value::to_display).unwrap_or_default();
+                    Value::Str(re.replace(s, &with))
+                }
+                Some(needle) => {
+                    let needle = needle.to_display();
+                    let with = args.get(1).map(Value::to_display).unwrap_or_default();
+                    Value::Str(match method {
+                        "replaceAll" => s.replace(&needle, &with),
+                        _ => s.replacen(&needle, &with, 1),
+                    })
+                }
+                None => Value::Str(s.clone()),
+            },
+            (Value::Str(s), "split") => {
+                let parts: Vec<Value> = match args.first() {
+                    Some(Value::Regex(re)) => {
+                        re.split(s).into_iter().map(Value::Str).collect()
+                    }
+                    Some(sep) => s
+                        .split(&sep.to_display())
+                        .map(|p| Value::Str(p.to_string()))
+                        .collect(),
+                    None => vec![Value::Str(s.clone())],
+                };
+                Value::Array(Rc::new(RefCell::new(parts)))
+            }
+            (Value::Str(s), "match") => match args.first() {
+                Some(Value::Regex(re)) => match re.find(s) {
+                    Some((start, end)) => {
+                        let hit: String = s.chars().skip(start).take(end - start).collect();
+                        Value::Array(Rc::new(RefCell::new(vec![Value::Str(hit)])))
+                    }
+                    None => Value::Null,
+                },
+                _ => Value::Null,
+            },
             (Value::Str(s), "toUpperCase") => Value::Str(s.to_uppercase()),
             (Value::Str(s), "toLowerCase") => Value::Str(s.to_lowercase()),
             _ => return Ok(None),
@@ -1080,7 +1130,9 @@ fn type_name(value: &Value) -> &'static str {
         Value::Bool(_) => "boolean",
         Value::Undefined => "undefined",
         Value::Func(_) | Value::Native(_) => "function",
-        Value::Null | Value::Object(_) | Value::Array(_) | Value::Element(_) => "object",
+        Value::Null | Value::Object(_) | Value::Array(_) | Value::Element(_) | Value::Regex(_) => {
+            "object"
+        }
     }
 }
 

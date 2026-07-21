@@ -1,12 +1,15 @@
 //! JavaScript tokenizer.
 //!
-//! ponytail: no regex literals, template literals, or ASI subtleties — semicolons
-//! and newlines are both treated as statement separators by the parser.
+//! ponytail: no template literals or ASI subtleties — semicolons and newlines
+//! are both treated as statement separators by the parser.
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Tok {
     Num(f64),
     Str(String),
+    /// A regex literal, as (pattern, flags). Kept apart from division by what
+    /// came before it — see [`starts_value`].
+    Regex(String, String),
     Ident(String),
     Kw(Kw),
     Op(String),
@@ -64,15 +67,28 @@ fn keyword(word: &str) -> Option<Kw> {
     })
 }
 
-/// Longest-first so `===` wins over `==` over `=`.
-/// Longest first: the lexer takes the first match, so `>>>` must be tried
-/// before `>>`, and `>>` before `>`.
+/// Longest first: the lexer takes the first match, so `>>>=` must be tried
+/// before `>>>`, and `>>` before `>`.
 const OPERATORS: &[&str] = &[
     ">>>=", "===", "!==", ">>>", "**=", "<<=", ">>=", "&&=", "||=", "??=", "==", "!=", "<=", ">=",
     "&&", "||", "??", "?.", "++", "--", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "**", "<<",
     ">>", "+", "-", "*", "/", "%", "=", "<", ">", "!", "&", "|", "^", "~", "(", ")", "{", "}", "[",
     "]", ",", ";", ".", ":", "?",
 ];
+
+/// Could this token end an expression? If so the next `/` is division.
+///
+/// This is the standard trick for a lexer with no parser feedback: after a
+/// value (a number, name, `)` or `]`) a slash divides; after an operator or the
+/// start of input it opens a regex.
+fn starts_value(previous: Option<&Tok>) -> bool {
+    match previous {
+        Some(Tok::Num(_)) | Some(Tok::Str(_)) | Some(Tok::Regex(..)) | Some(Tok::Ident(_)) => true,
+        Some(Tok::Kw(kw)) => matches!(kw, Kw::This | Kw::True | Kw::False | Kw::Null | Kw::Undefined),
+        Some(Tok::Op(op)) => matches!(op.as_str(), ")" | "]" | "}" | "++" | "--"),
+        _ => false,
+    }
+}
 
 pub fn tokenize(src: &str) -> Result<Vec<Tok>, String> {
     let chars: Vec<char> = src.chars().collect();
@@ -84,6 +100,44 @@ pub fn tokenize(src: &str) -> Result<Vec<Tok>, String> {
 
         if c.is_whitespace() {
             i += 1;
+            continue;
+        }
+        // A `/` is division after something that can end an expression, and the
+        // start of a regex otherwise: `a / b` versus `split(/,/)`.
+        if c == '/' && !starts_value(out.last()) && chars.get(i + 1) != Some(&'/')
+            && chars.get(i + 1) != Some(&'*')
+        {
+            let mut pattern = String::new();
+            let mut j = i + 1;
+            let mut in_class = false; // a `/` inside [...] does not close it
+            while j < chars.len() {
+                match chars[j] {
+                    '\\' if j + 1 < chars.len() => {
+                        pattern.push(chars[j]);
+                        pattern.push(chars[j + 1]);
+                        j += 2;
+                        continue;
+                    }
+                    '[' => in_class = true,
+                    ']' => in_class = false,
+                    '/' if !in_class => break,
+                    c if c == char::from(10) => return Err("unterminated regex".to_string()),
+                    _ => {}
+                }
+                pattern.push(chars[j]);
+                j += 1;
+            }
+            if j >= chars.len() {
+                return Err("unterminated regex".to_string());
+            }
+            j += 1; // closing slash
+            let mut flags = String::new();
+            while j < chars.len() && chars[j].is_ascii_alphabetic() {
+                flags.push(chars[j]);
+                j += 1;
+            }
+            out.push(Tok::Regex(pattern, flags));
+            i = j;
             continue;
         }
         // Comments
@@ -154,7 +208,8 @@ pub fn tokenize(src: &str) -> Result<Vec<Tok>, String> {
             continue;
         }
         // Operators
-        let rest: String = chars[i..].iter().take(3).collect();
+        // Wide enough for the longest operator, or `>>>=` could never match.
+        let rest: String = chars[i..].iter().take(4).collect();
         match OPERATORS.iter().find(|op| rest.starts_with(**op)) {
             Some(op) => {
                 out.push(Tok::Op((*op).to_string()));
