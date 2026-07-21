@@ -240,11 +240,10 @@ impl<'a> LayoutBox<'a> {
         Some((w, h))
     }
 
-    /// Grid layout: place items into a fixed column track list, wrapping to new rows.
+    /// Grid layout: place items into a track grid, honouring explicit placement.
     ///
-    /// ponytail: supports `grid-template-columns` with px/%/fr/`repeat()` plus `gap`.
-    /// No explicit placement, named lines, `grid-template-rows`, or alignment;
-    /// each row is sized to its tallest item.
+    /// ponytail: no named lines, `grid-area`, `auto-fit/minmax`, or alignment.
+    /// Rows beyond `grid-template-rows` are sized to their tallest item.
     fn layout_grid_children(&mut self, fonts: Option<&FontSet>, images: &ImageMap) {
         let style = self.get_style_node();
         let container = self.dimensions.content;
@@ -259,31 +258,99 @@ impl<'a> LayoutBox<'a> {
         if columns.is_empty() {
             return self.layout_block_children_gapped(fonts, images, gap);
         }
+        // Explicit row sizes, if any; extra rows fall back to content height.
+        let row_sizes = match style.value("grid-template-rows") {
+            Some(Value::Raw(spec)) => resolve_tracks(&spec, container.height, gap, ctx),
+            _ => Vec::new(),
+        };
 
-        let mut cursor_y = container.y;
-        let mut row_height = 0.0_f32;
-        let mut column = 0usize;
-        let mut stacked = 0.0_f32;
+        // Assign every in-flow item a (row, column, span), honouring `grid-column`.
+        let mut placements: Vec<(usize, usize, usize, usize)> = Vec::new(); // (index,row,col,span)
+        let mut occupied: Vec<Vec<bool>> = Vec::new();
+        let (mut row, mut col) = (0usize, 0usize);
 
-        for child in &mut self.children {
-            if child.is_out_of_flow() {
+        for index in 0..self.children.len() {
+            if self.children[index].is_out_of_flow() {
                 continue;
             }
-            if column == columns.len() {
-                // Row finished: drop below the tallest item in it.
-                cursor_y += row_height + gap;
-                stacked += row_height + gap;
-                row_height = 0.0;
-                column = 0;
+            let (explicit_col, span) = match self.children[index].box_type {
+                BoxType::AnonymousBlock => (None, 1),
+                _ => parse_grid_span(self.children[index].get_style_node(), columns.len()),
+            };
+            let span = span.clamp(1, columns.len());
+
+            // Find the next free slot that fits the span.
+            loop {
+                while occupied.len() <= row {
+                    occupied.push(vec![false; columns.len()]);
+                }
+                let start = explicit_col.unwrap_or(col);
+                let fits = start + span <= columns.len()
+                    && (start..start + span).all(|c| !occupied[row][c]);
+                if fits {
+                    for c in start..start + span {
+                        occupied[row][c] = true;
+                    }
+                    placements.push((index, row, start, span));
+                    col = if explicit_col.is_some() { col } else { start + span };
+                    if col >= columns.len() {
+                        row += 1;
+                        col = 0;
+                    }
+                    break;
+                }
+                // Slot taken or item too wide for the remainder: try the next row.
+                row += 1;
+                col = 0;
+                if explicit_col.is_none() && span > columns.len() {
+                    break; // cannot ever fit
+                }
             }
-            let x = container.x + columns[..column].iter().sum::<f32>() + gap * column as f32;
-            let mut slot: Dimensions = Default::default();
-            slot.content = Rect { x, y: cursor_y, width: columns[column], height: 0.0 };
-            child.layout(slot, fonts, images);
-            row_height = row_height.max(child.dimensions.margin_box().height);
-            column += 1;
         }
-        self.dimensions.content.height = stacked + row_height;
+
+        // Lay each item out in its cell, then size rows to their tallest member.
+        let mut row_heights: Vec<f32> = vec![0.0; occupied.len()];
+        for &(index, r, c, span) in &placements {
+            let width = columns[c..c + span].iter().sum::<f32>() + gap * (span - 1) as f32;
+            let x = container.x + columns[..c].iter().sum::<f32>() + gap * c as f32;
+            let mut slot: Dimensions = Default::default();
+            slot.content = Rect { x, y: container.y, width, height: 0.0 };
+            self.children[index].layout(slot, fonts, images);
+            let h = self.children[index].dimensions.margin_box().height;
+            if r < row_heights.len() {
+                row_heights[r] = row_heights[r].max(h);
+            }
+        }
+        for (r, height) in row_heights.iter_mut().enumerate() {
+            if let Some(explicit) = row_sizes.get(r) {
+                if *explicit > 0.0 {
+                    *height = *explicit;
+                }
+            }
+        }
+
+        // Re-run each item now that its row's y position is known.
+        for &(index, r, c, span) in &placements {
+            let y = container.y
+                + row_heights[..r].iter().sum::<f32>()
+                + gap * r as f32;
+            let width = columns[c..c + span].iter().sum::<f32>() + gap * (span - 1) as f32;
+            let x = container.x + columns[..c].iter().sum::<f32>() + gap * c as f32;
+            let mut slot: Dimensions = Default::default();
+            slot.content = Rect { x, y, width, height: 0.0 };
+            self.children[index].layout(slot, fonts, images);
+            if let Some(explicit) = row_sizes.get(r) {
+                if *explicit > 0.0 {
+                    self.children[index].dimensions.content.height = *explicit
+                        - self.children[index].dimensions.padding.top
+                        - self.children[index].dimensions.padding.bottom;
+                }
+            }
+        }
+
+        let rows = row_heights.len();
+        self.dimensions.content.height =
+            row_heights.iter().sum::<f32>() + gap * rows.saturating_sub(1) as f32;
     }
 
     /// Lay out inline children (text) as wrapped lines, producing text fragments
@@ -771,6 +838,35 @@ fn align_cross_axis(
     }
 }
 
+/// Read `grid-column` as (zero-based start, span).
+///
+/// Accepts `span N`, `A / B`, `A / span N`, and a bare line number `A`.
+fn parse_grid_span(style: &StyledNode, columns: usize) -> (Option<usize>, usize) {
+    let spec = match style.value("grid-column") {
+        Some(Value::Raw(spec)) => spec,
+        Some(Value::Number(n)) => return (Some((n as usize).saturating_sub(1)), 1),
+        _ => return (None, 1),
+    };
+    let spec = spec.trim();
+    if let Some(rest) = spec.strip_prefix("span ") {
+        return (None, rest.trim().parse::<usize>().unwrap_or(1));
+    }
+    let mut parts = spec.split('/').map(str::trim);
+    let start = parts.next().and_then(|p| p.parse::<usize>().ok());
+    let span = match parts.next() {
+        Some(end) if end.starts_with("span ") => {
+            end[5..].trim().parse::<usize>().unwrap_or(1)
+        }
+        Some(end) => match (start, end.parse::<usize>().ok()) {
+            (Some(a), Some(b)) if b > a => b - a,
+            _ => 1,
+        },
+        None => 1,
+    };
+    let start = start.map(|line| line.saturating_sub(1)).filter(|s| *s < columns);
+    (start, span.max(1))
+}
+
 /// Expand a `grid-template-columns` track list into concrete pixel widths.
 ///
 /// Handles `repeat(n, <tracks>)`, lengths, and `fr` units, which share whatever
@@ -1051,6 +1147,49 @@ mod tests {
         assert_eq!(resolve_tracks("repeat(3, 1fr)", 920.0, 20.0, ctx), vec![293.33334; 3]);
         // A fixed track keeps its size; fr splits what's left (600 - 200 - 10 = 390).
         assert_eq!(resolve_tracks("200px 1fr 2fr", 600.0, 5.0, ctx), vec![200.0, 130.0, 260.0]);
+    }
+
+    #[test]
+    fn grid_spans_flow_onto_the_next_row() {
+        let node = dom::elem("div".into(), HashMap::new(), vec![]);
+        let cell = |span: Option<&str>| {
+            let mut v = HashMap::new();
+            v.insert("display".to_string(), Value::Keyword("block".into()));
+            v.insert("height".to_string(), Value::Length(50.0, Unit::Px));
+            if let Some(s) = span {
+                v.insert("grid-column".to_string(), Value::Raw(s.to_string()));
+            }
+            StyledNode { node: &node, specified_values: v, children: vec![] }
+        };
+        let mut values = HashMap::new();
+        values.insert("display".to_string(), Value::Keyword("grid".into()));
+        values.insert(
+            "grid-template-columns".to_string(),
+            Value::Raw("repeat(4, 1fr)".to_string()),
+        );
+        // span2, single, single -> fills row 0; span3 must start row 1.
+        let root = StyledNode {
+            node: &node,
+            specified_values: values,
+            children: vec![cell(Some("span 2")), cell(None), cell(None), cell(Some("span 3"))],
+        };
+        let mut viewport: Dimensions = Default::default();
+        viewport.content.width = 400.0; // 4 columns of 100
+
+        let laid = layout_tree(&root, viewport, None, &ImageMap::new());
+        let xs: Vec<f32> = laid.children.iter().map(|c| c.dimensions.content.x).collect();
+        let ys: Vec<f32> = laid.children.iter().map(|c| c.dimensions.content.y).collect();
+        let ws: Vec<f32> = laid.children.iter().map(|c| c.dimensions.content.width).collect();
+
+        assert_eq!(ws[0], 200.0, "span 2 covers two 100px tracks");
+        assert_eq!(ws[3], 300.0, "span 3 covers three tracks");
+        assert_eq!(xs, vec![0.0, 200.0, 300.0, 0.0]);
+        // Row 0 holds the first three; the span-3 item wraps to row 1.
+        assert_eq!(ys[0], ys[1]);
+        assert_eq!(ys[1], ys[2]);
+        assert_eq!(ys[3], 50.0, "second row starts below a 50px first row");
+        // The container must report both rows, or following content overlaps it.
+        assert_eq!(laid.dimensions.content.height, 100.0);
     }
 
     #[test]

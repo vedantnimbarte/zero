@@ -138,7 +138,14 @@ fn is_ident(c: char) -> bool {
 
 /// Properties whose values are lists we parse later, not single tokens.
 const RAW_VALUE_PROPERTIES: &[&str] =
-    &["grid-template-columns", "grid-template-rows", "box-shadow", "background-image"];
+    &[
+    "grid-template-columns",
+    "grid-template-rows",
+    "grid-column",
+    "grid-row",
+    "box-shadow",
+    "background-image",
+];
 
 /// Interpret a raw value string, returning `None` for anything unsupported.
 fn classify_value(s: &str) -> Option<Value> {
