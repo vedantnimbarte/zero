@@ -365,11 +365,40 @@ pub struct Fetched {
 }
 
 /// ponytail: blocking call on the UI thread — fine for now; move off-thread if it stalls.
-fn try_fetch(url: &str) -> Option<String> {
+/// Fetch a page, returning the reason on failure so the user can be told one.
+///
+/// A 4xx or 5xx still carries a body — sites serve real pages for "not found"
+/// — so the server's page is shown rather than replaced with our own.
+fn try_fetch(url: &str) -> Result<String, String> {
     eprintln!("fetching {url} ...");
-    let response = with_cookies(url, agent().get(url)).call().ok()?;
+    let response = match with_cookies(url, agent().get(url)).call() {
+        Ok(response) => response,
+        Err(ureq::Error::Status(code, response)) => {
+            absorb_cookies(url, &response);
+            let status = format!("{code} {}", response.status_text().to_string());
+            return match response.into_string() {
+                Ok(body) if !body.trim().is_empty() => Ok(body),
+                _ => Err(format!("the server replied {status}")),
+            };
+        }
+        Err(e) => return Err(describe(&e.to_string())),
+    };
     absorb_cookies(url, &response);
-    response.into_string().ok()
+    response.into_string().map_err(|e| format!("the reply could not be read ({e})"))
+}
+
+/// A transport failure in words a person can act on.
+fn describe(text: &str) -> String {
+    let lower = text.to_lowercase();
+    if lower.contains("dns") || lower.contains("resolve") {
+        "that address could not be found".to_string()
+    } else if lower.contains("timed out") || lower.contains("timeout") {
+        "the site took too long to reply".to_string()
+    } else if lower.contains("certificate") || lower.contains("tls") {
+        "the secure connection could not be established".to_string()
+    } else {
+        text.to_string()
+    }
 }
 
 /// Load a page, preferring HTTPS.
@@ -390,32 +419,50 @@ pub fn load_target(target: &str) -> Fetched {
     set_partition(target);
     if !is_url(target) {
         let body = fs::read_to_string(target)
-            .unwrap_or_else(|e| error_page("Cannot open", &format!("{target}: {e}")));
+            .unwrap_or_else(|e| error_page(target, &e.to_string()));
         return Fetched { url: target.to_string(), body, secure: true }; // local: no network
     }
 
     if let Some(rest) = target.strip_prefix("http://") {
         let upgraded = format!("https://{rest}");
-        if let Some(body) = try_fetch(&upgraded) {
+        if let Ok(body) = try_fetch(&upgraded) {
             return Fetched { url: upgraded, body, secure: true };
         }
         eprintln!("HTTPS upgrade failed for {target}; falling back to cleartext");
-        let body = try_fetch(target)
-            .unwrap_or_else(|| error_page("Failed to load", target));
+        let body = try_fetch(target).unwrap_or_else(|why| error_page(target, &why));
         return Fetched { url: target.to_string(), body, secure: false };
     }
 
-    let body = try_fetch(target).unwrap_or_else(|| error_page("Failed to load", target));
+    let body = try_fetch(target).unwrap_or_else(|why| error_page(target, &why));
     Fetched { url: target.to_string(), body, secure: true }
 }
 
-fn error_page(title: &str, detail: &str) -> String {
-    format!("<html><body><h1>{title}</h1><p>{detail}</p></body></html>")
+/// The page shown when a load fails. It says what went wrong and what the user
+/// can do, rather than restating the URL they just typed.
+fn error_page(target: &str, why: &str) -> String {
+    let escape = |text: &str| text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    format!(
+        "<html><head><style>         body{{background:#0e0f12;color:#f2f3f5;padding:64px;font-size:15px;}}         h1{{color:#e5484d;font-size:26px;}}         .why{{background:#17181c;padding:16px;border-radius:8px;color:#c9ccd3;}}         .url{{color:#6b7280;padding:8px;}}         .hint{{color:#9a9da6;padding:8px;}}         </style></head><body>         <h1>This page did not load</h1>         <div class=\"why\">Zero tried to reach it, but {}.</div>         <div class=\"url\">{}</div>         <div class=\"hint\">Check the address, or press R to try again.</div>         </body></html>",
+        escape(why),
+        escape(target)
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failures_are_described_in_plain_words() {
+        assert_eq!(describe("Dns Failed: resolve host"), "that address could not be found");
+        assert_eq!(describe("io: timed out reading"), "the site took too long to reply");
+        assert_eq!(
+            describe("Invalid TLS certificate"),
+            "the secure connection could not be established"
+        );
+        // Anything we cannot classify is passed through rather than invented.
+        assert_eq!(describe("connection refused"), "connection refused");
+    }
 
     #[test]
     fn batches_spread_requests_across_hosts() {
