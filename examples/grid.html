@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html><head><style>
+body { background: #0e0f12; color: #f2f3f5; padding: 24px; font-size: 15px; }
+h1 { color: #e5484d; font-size: 28px; }
+h2 { color: #9a9da6; font-size: 14px; }
+.g3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+.g4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+.shell { display: grid; grid-template-columns: 200px 1fr; gap: 14px; }
+.cell { background: #17181c; padding: 14px; border-radius: 10px; }
+.side { background: #e5484d; color: #fff; padding: 14px; border-radius: 10px; }
+.tile { background: #30a46c; color: #0e0f12; padding: 14px; border-radius: 8px; }
+</style></head><body>
+<h1>CSS Grid</h1>
+<h2>repeat(3, 1fr) with gap - wraps to a second row</h2>
+<div class="g3">
+  <div class="cell">one</div>
+  <div class="cell">two</div>
+  <div class="cell">three</div>
+  <div class="cell">four wraps onto the next row automatically</div>
+  <div class="cell">five</div>
+</div>
+<h2>200px sidebar + 1fr content</h2>
+<div class="shell">
+  <div class="side">fixed 200px</div>
+  <div class="cell">the fr track absorbs the remaining width</div>
+</div>
+<h2>repeat(4, 1fr)</h2>
+<div class="g4">
+  <div class="tile">a</div><div class="tile">b</div><div class="tile">c</div><div class="tile">d</div>
+</div>
+</body></html>
