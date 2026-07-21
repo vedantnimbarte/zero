@@ -63,7 +63,11 @@ fn main() {
 
 fn render_to_png(engine: &Engine, html: &str, css: &str, out_path: &str, base: &str) {
     let loader = ShellLoader::new(base.to_string());
-    let canvas = engine.render_page(html, css, 800.0, 600.0, &loader).canvas;
+    let page = engine.render_page(html, css, 800.0, 600.0, &loader);
+    for line in &page.console {
+        eprintln!("[js] {line}");
+    }
+    let canvas = page.canvas;
     let buffer: Vec<u8> = canvas.pixels.iter().flat_map(|c| [c.r, c.g, c.b, c.a]).collect();
     let img = image::RgbaImage::from_raw(canvas.width as u32, canvas.height as u32, buffer)
         .expect("pixel buffer size mismatch");

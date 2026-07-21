@@ -405,6 +405,9 @@ impl App {
                     &loader,
                 );
                 tab.blocked_count = loader.blocked.get();
+                for line in &page.console {
+                    eprintln!("[js] {line}");
+                }
                 tab.page_canvas = Some(page.canvas);
                 tab.links = page.links;
                 tab.cache_w = content_w;
