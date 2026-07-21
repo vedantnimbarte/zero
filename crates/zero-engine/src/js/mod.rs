@@ -106,6 +106,72 @@ mod tests {
     }
 
     #[test]
+    fn classes_bind_this_and_construct_instances() {
+        let out = run(
+            "class Counter {
+                 constructor(start) { this.n = start; }
+                 bump(by) { this.n = this.n + by; return this.n; }
+             }
+             var a = new Counter(10);
+             var b = new Counter(100);
+             a.bump(5);
+             console.log(a.bump(1));
+             console.log(b.bump(1));",
+        );
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        // Instances keep separate state, and `this` resolves inside methods.
+        assert_eq!(out.console, vec!["16", "101"]);
+    }
+
+    #[test]
+    fn this_works_on_object_methods() {
+        let out = run(
+            "var obj = { name: 'Zero', greet: function() { return 'hi ' + this.name; } };
+             console.log(obj.greet());",
+        );
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(out.console, vec!["hi Zero"]);
+    }
+
+    #[test]
+    fn try_catch_recovers_and_finally_always_runs() {
+        let out = run(
+            "try { throw 'boom'; console.log('unreachable'); }
+             catch (e) { console.log('caught ' + e); }
+             finally { console.log('cleanup'); }
+             console.log('after');",
+        );
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(out.console, vec!["caught boom", "cleanup", "after"]);
+    }
+
+    #[test]
+    fn try_catch_also_recovers_from_runtime_errors() {
+        let out = run("try { missing(); } catch (e) { console.log('recovered'); }");
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(out.console, vec!["recovered"]);
+    }
+
+    #[test]
+    fn set_timeout_queues_callbacks_in_delay_order() {
+        let mut interp = interp::Interp::new();
+        let program = parser::parse(
+            lexer::tokenize(
+                "setTimeout(function(){ console.log('late'); }, 50);
+                 setTimeout(function(){ console.log('early'); }, 5);
+                 console.log('sync');",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        interp.run(&program);
+        assert_eq!(interp.out.console, vec!["sync"]); // nothing fired yet
+        assert!(interp.run_timers());
+        assert_eq!(interp.out.console, vec!["sync", "early", "late"]);
+        assert!(!interp.run_timers()); // queue drained
+    }
+
+    #[test]
     fn document_write_is_captured() {
         let out = run("document.write('<p>hi</p>');");
         assert_eq!(out.writes, "<p>hi</p>");

@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html><head><style>
+body { background: #0e0f12; color: #f2f3f5; padding: 28px; font-size: 16px; }
+h1 { color: #e5484d; font-size: 28px; }
+.grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; }
+.card { background: #17181c; padding: 14px; border-radius: 10px; }
+.ok { background: #30a46c; color: #0e0f12; padding: 14px; border-radius: 10px; }
+</style></head><body>
+<h1>Modern JavaScript</h1>
+<div class="grid" id="out"></div>
+<script>
+  class Account {
+    constructor(owner, balance) { this.owner = owner; this.balance = balance; }
+    deposit(amount) { this.balance = this.balance + amount; return this.balance; }
+    label() { return this.owner + ': ' + this.balance; }
+  }
+
+  var rows = [];
+  var a = new Account('Priya', 100);
+  var b = new Account('Arjun', 40);
+  a.deposit(50);
+  b.deposit(5);
+  rows.push('<div class="ok">' + a.label() + '</div>');
+  rows.push('<div class="ok">' + b.label() + '</div>');
+
+  try {
+    throw 'insufficient funds';
+  } catch (e) {
+    rows.push('<div class="card">caught: ' + e + '</div>');
+  } finally {
+    rows.push('<div class="card">finally always runs</div>');
+  }
+
+  var obj = { name: 'Zero', describe: function () { return 'this.name = ' + this.name; } };
+  rows.push('<div class="card">' + obj.describe() + '</div>');
+
+  setTimeout(function () {
+    var el = document.getElementById('out');
+    el.innerHTML = rows.join('') + '<div class="card">setTimeout callback ran</div>';
+  }, 0);
+</script>
+</body></html>
