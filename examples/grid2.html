@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html><head><style>
+body { background: #0e0f12; color: #f2f3f5; padding: 22px; font-size: 14px; }
+h1 { color: #e5484d; font-size: 26px; }
+h2 { color: #9a9da6; font-size: 13px; }
+.g { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+.rows { display: grid; grid-template-columns: repeat(3, 1fr); grid-template-rows: 90px 50px; gap: 10px; }
+.c { background: #2f333d; padding: 12px; border-radius: 8px; }
+.wide2 { grid-column: span 2; background: #30a46c; color: #0e0f12; padding: 12px; border-radius: 8px; }
+.wide3 { grid-column: span 3; background: #e5484d; color: #fff; padding: 12px; border-radius: 8px; }
+.at3 { grid-column: 3 / 5; background: #66ccff; color: #0e0f12; padding: 12px; border-radius: 8px; }
+</style></head><body>
+<h1>Grid placement and rows</h1>
+<h2>span 2 / span 3 in a 4-column grid</h2>
+<div class="g">
+  <div class="wide2">span 2</div>
+  <div class="c">one</div>
+  <div class="c">two</div>
+  <div class="wide3">span 3</div>
+  <div class="c">three</div>
+</div>
+<h2>explicit placement: grid-column 3 / 5</h2>
+<div class="g">
+  <div class="c">a</div>
+  <div class="at3">columns 3-4</div>
+  <div class="c">b</div>
+  <div class="c">c</div>
+</div>
+<h2>grid-template-rows: 90px 50px</h2>
+<div class="rows">
+  <div class="c">tall row</div><div class="c">tall row</div><div class="c">tall row</div>
+  <div class="c">short row</div><div class="c">short row</div><div class="c">short row</div>
+</div>
+</body></html>
