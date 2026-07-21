@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html><head><style>
+body { background: #0e0f12; color: #f2f3f5; padding: 26px; font-size: 15px; }
+h1 { color: #e5484d; font-size: 26px; }
+h2 { color: #9a9da6; font-size: 14px; }
+.row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+.grad1 { background: linear-gradient(to bottom, #e5484d, #7c2d91); padding: 26px; border-radius: 14px; color: #fff; }
+.grad2 { background: linear-gradient(to right, #30a46c, #66ccff); padding: 26px; border-radius: 14px; color: #06251a; }
+.grad3 { background: linear-gradient(to bottom, #f5a524, #e5484d, #7c2d91); padding: 26px; border-radius: 14px; color: #fff; }
+.shadow { background: #1f2127; padding: 22px; border-radius: 14px; box-shadow: 0px 8px 24px #000000cc; }
+.bar { background: linear-gradient(to right, #0e0f12, #30a46c); height: 26px; border-radius: 13px; }
+</style></head><body>
+<h1>Gradients and shadows</h1>
+<h2>linear-gradient: vertical, horizontal, and three stops</h2>
+<div class="row">
+  <div class="grad1">to bottom</div>
+  <div class="grad2">to right</div>
+  <div class="grad3">three stops</div>
+</div>
+<h2>box-shadow</h2>
+<div class="shadow">a card with a soft drop shadow</div>
+<h2>gradient bar</h2>
+<div class="bar"></div>
+</body></html>
