@@ -34,19 +34,93 @@ const AI_PANEL_W: u32 = 320;
 const SCROLLBAR_W: u32 = 12;
 /// The right-hand strip of a tab row that closes it.
 const CLOSE_W: u32 = 32;
+/// How much horizontal room one toolbar button takes: glyph box plus padding.
+const BUTTON_SPAN: u32 = 40;
 
-const TOOLBAR_CSS: &str = "body{background:#1f2127;color:#f2f3f5;font-size:15px;} \
-     #bar{padding:9px;height:30px;} \
-     .btn{display:inline-block;background:#2b2e37;color:#f2f3f5;width:30px;padding:7px;\
-          border-radius:6px;} \
-     .off{display:inline-block;background:#24262d;color:#5f636d;width:30px;padding:7px;\
-          border-radius:6px;} \
-     .on{display:inline-block;background:#f5a524;color:#241a00;width:30px;padding:7px;\
-         border-radius:6px;} \
-     .addr{display:inline-block;background:#141519;color:#f2f3f5;padding:7px;\
-           border-radius:6px;}";
+/// One palette for the whole browser, so the chrome and the built-in pages are
+/// recognisably the same product. Named rather than repeated hex, so a change
+/// lands everywhere at once.
+pub mod theme {
+    pub const CANVAS: &str = "#0e0f12"; // the deepest layer, behind pages
+    pub const CHROME: &str = "#121317"; // sidebar
+    pub const BAR: &str = "#16181d"; // toolbar
+    pub const SURFACE: &str = "#1e2027"; // buttons, cards, the address pill
+    pub const HOVER: &str = "#282b34";
+    pub const TEXT: &str = "#e8eaed";
+    pub const MUTED: &str = "#8b919b";
+    pub const FAINT: &str = "#5f646e";
+    pub const ACCENT: &str = "#e5484d"; // the mark, and the active tab
+    pub const SAVED: &str = "#f5a524"; // a bookmarked page
+    pub const LINK: &str = "#66ccff";
+}
 
-const AI_CSS: &str = "body{background:#141519;color:#c9ccd3;font-size:14px;}      #head{background:#26282f;color:#f2f3f5;padding:12px;height:20px;}      .line{padding:2px;} .src{color:#6b7280;padding:10px;}";
+/// The glyphs the chrome draws with. Kept in one place because each one has to
+/// exist somewhere in the font chain — see `fonts::load_system_fonts`.
+mod icon {
+    pub const BACK: &str = "\u{2190}"; // ←
+    pub const FORWARD: &str = "\u{2192}"; // →
+    pub const RELOAD: &str = "\u{21bb}"; // ↻
+    pub const STAR_EMPTY: &str = "\u{2606}"; // ☆
+    pub const STAR_FULL: &str = "\u{2605}"; // ★
+    pub const BOOKMARKS: &str = "\u{25a4}"; // ▤
+    pub const FIND: &str = "\u{2315}"; // ⌕
+    pub const CLOSE: &str = "\u{00d7}"; // ×
+    pub const ADD: &str = "\u{ff0b}"; // ＋
+    pub const SECURE: &str = "\u{1f512}"; // 🔒
+    pub const INSECURE: &str = "\u{26a0}"; // ⚠
+    pub const SHIELD: &str = "\u{25c6}"; // ◆
+}
+
+/// Toolbar styling. Buttons are a fixed square so their glyphs sit centred
+/// rather than lopsided, and the address pill is given the width left over —
+/// without it the pill cannot share a line with the buttons and wraps out of
+/// the bar entirely.
+fn toolbar_css(width: u32) -> String {
+    // Five buttons, the bar's own padding, and the pill's padding. `width` here
+    // is a content width, so anything not subtracted pushes the pill onto a
+    // second line that the 48px-tall bar then clips away.
+    let addr_width = width.saturating_sub(BUTTON_SPAN * 5 + 44).max(80);
+    {
+        format!(
+            "body{{background:{bar};color:{text};font-size:15px;}} \
+             #bar{{padding:8px;height:28px;}} \
+             .btn{{display:inline-block;background:{surface};color:{text};width:24px;\
+                  padding:6px;border-radius:8px;text-align:center;}} \
+             .off{{display:inline-block;background:{bar};color:{faint};width:24px;\
+                  padding:6px;border-radius:8px;text-align:center;}} \
+             .on{{display:inline-block;background:{surface};color:{saved};width:24px;\
+                 padding:6px;border-radius:8px;text-align:center;}} \
+             .hot{{background:{hover};}} \
+             .addr{{display:inline-block;background:{surface};color:{text};padding:7px;\
+                   border-radius:9px;width:{addr_width}px;}} \
+             .lock{{color:{muted};}} .warn{{color:{saved};}} .hint{{color:{faint};}}",
+            bar = theme::BAR,
+            text = theme::TEXT,
+            surface = theme::SURFACE,
+            hover = theme::HOVER,
+            faint = theme::FAINT,
+            saved = theme::SAVED,
+            muted = theme::MUTED,
+        )
+    }
+}
+
+fn ai_css() -> &'static str {
+    static CSS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CSS.get_or_init(|| {
+        format!(
+            "body{{background:{chrome};color:{muted};font-size:14px;}} \
+             #head{{background:{surface};color:{text};padding:12px;height:20px;}} \
+             .line{{padding:3px;color:{text};}} \
+             .src{{color:{faint};padding:12px;font-size:13px;}}",
+            chrome = theme::CHROME,
+            surface = theme::SURFACE,
+            text = theme::TEXT,
+            muted = theme::MUTED,
+            faint = theme::FAINT,
+        )
+    })
+}
 
 /// Where the scrollbar thumb sits within the page area, as (offset, height).
 /// `None` when the content fits and no scrollbar is warranted.
@@ -738,42 +812,64 @@ impl App {
 
     fn toolbar_html(&self) -> String {
         let tab = self.tab();
-        let lock = if tab.secure { "" } else { "Not secure - " };
-        let shield = if tab.blocked_count > 0 {
-            format!("  -  {} blocked", tab.blocked_count)
-        } else {
-            String::new()
+        // The padlock is the one claim the address bar makes, so it says plainly
+        // when a page arrived over cleartext.
+        let lock = match tab.secure {
+            true => format!("<span class=\"lock\">{} </span>", icon::SECURE),
+            false => format!("<span class=\"warn\">{} not secure </span>", icon::INSECURE),
         };
-        // Disabled buttons get a dim class, so the chrome reflects real state.
-        let back = if tab.history_index > 0 { "btn" } else { "off" };
-        let fwd = if tab.history_index + 1 < tab.history.len() { "btn" } else { "off" };
-        // A lit star means this page is already bookmarked.
-        let star = if storage::is_bookmarked(&tab.address) { "on" } else { "btn" };
+        let shield = match tab.blocked_count {
+            0 => String::new(),
+            n => format!(" <span class=\"hint\">{} {n}</span>", icon::SHIELD),
+        };
+        // Disabled buttons get a dim class and the hovered one lights up, so the
+        // chrome reflects both what is possible and what the cursor is on.
+        let hovered = self.hovered_button();
+        let lit = |id: &str, base: &str| match hovered.as_deref() == Some(id) {
+            true => format!("{base} hot"),
+            false => base.to_string(),
+        };
+        let back = lit("back", if tab.history_index > 0 { "btn" } else { "off" });
+        let fwd = lit(
+            "fwd",
+            if tab.history_index + 1 < tab.history.len() { "btn" } else { "off" },
+        );
+        let reload = lit("reload", "btn");
+        let marks = lit("marks", "btn");
+        // A filled star means this page is already bookmarked.
+        let bookmarked = storage::is_bookmarked(&tab.address);
+        let star = lit("star", if bookmarked { "on" } else { "btn" });
         // With the find bar open it replaces the address, since it owns typing.
         if let Some(query) = &self.find {
             let count = tab.matches.len();
             let hits = match (query.is_empty(), count) {
-                (true, _) => String::new(),
-                (false, 0) => "  -  no matches".to_string(),
-                (false, n) => format!("  -  {n} matches  -  Enter for next"),
+                (true, _) => "type to search this page".to_string(),
+                (false, 0) => "no matches".to_string(),
+                (false, n) => format!("{n} matches - Enter for next, Esc to close"),
             };
             return format!(
                 "<html><body><div id=\"bar\">\
-                 <span id=\"back\" class=\"off\">/</span>\
-                 <span id=\"addr\" class=\"addr\">Find: {}|{hits}</span>\
+                 <span class=\"btn\">{}</span>\
+                 <span id=\"addr\" class=\"addr\">{}| <span class=\"hint\">{hits}</span></span>\
                  </div></body></html>",
+                icon::FIND,
                 escape(query)
             );
         }
         format!(
             "<html><body><div id=\"bar\">\
-             <span id=\"back\" class=\"{back}\">&lt;</span>\
-             <span id=\"fwd\" class=\"{fwd}\">&gt;</span>\
-             <span id=\"reload\" class=\"btn\">R</span>\
-             <span id=\"star\" class=\"{star}\">*</span>\
-             <span id=\"marks\" class=\"btn\">B</span>\
+             <span id=\"back\" class=\"{back}\">{}</span>\
+             <span id=\"fwd\" class=\"{fwd}\">{}</span>\
+             <span id=\"reload\" class=\"{reload}\">{}</span>\
+             <span id=\"star\" class=\"{star}\">{}</span>\
+             <span id=\"marks\" class=\"{marks}\">{}</span>\
              <span id=\"addr\" class=\"addr\">{lock}{}|{shield}</span>\
              </div></body></html>",
+            icon::BACK,
+            icon::FORWARD,
+            icon::RELOAD,
+            if bookmarked { icon::STAR_FULL } else { icon::STAR_EMPTY },
+            icon::BOOKMARKS,
             escape(&tab.address)
         )
     }
@@ -902,6 +998,30 @@ impl App {
         self.request_redraw();
     }
 
+    /// Which toolbar button the cursor is over, so it can light up.
+    ///
+    /// The chrome is a separate document from the page and has no hover state of
+    /// its own, so the class is decided here from the boxes the last frame
+    /// reported and baked into the markup.
+    fn hovered_button(&self) -> Option<String> {
+        let (cx, cy) = self.cursor;
+        if cy >= TOOLBAR_H as f32 || cx < SIDEBAR_W as f32 {
+            return None;
+        }
+        let local_x = cx - SIDEBAR_W as f32;
+        self.toolbar_rects
+            .iter()
+            .filter(|r| {
+                !r.id.is_empty()
+                    && local_x >= r.x
+                    && local_x <= r.x + r.width
+                    && cy >= r.y
+                    && cy <= r.y + r.height
+            })
+            .map(|r| r.id.clone())
+            .next_back()
+    }
+
     fn handle_toolbar_click(&mut self, x: f32, y: f32) -> bool {
         let local_x = x - SIDEBAR_W as f32;
         let hit = self
@@ -938,37 +1058,61 @@ impl App {
     }
 
     fn sidebar_html(&self) -> String {
+        // The row under the cursor lifts, so the rail responds like a real one.
+        let hovered = match sidebar_hit(self.cursor.0, self.cursor.1, self.tabs.len()) {
+            SidebarHit::Select(row) | SidebarHit::Close(row) => Some(row),
+            _ => None,
+        };
+        let new_tab_hot = matches!(
+            sidebar_hit(self.cursor.0, self.cursor.1, self.tabs.len()),
+            SidebarHit::NewTab
+        );
         let rows: String = self
             .tabs
             .iter()
             .enumerate()
             .map(|(i, t)| {
-                let class = if i == self.active { "tab active" } else { "tab" };
+                let class = match (i == self.active, hovered == Some(i)) {
+                    (true, _) => "tab active",
+                    (false, true) => "tab hot",
+                    (false, false) => "tab",
+                };
                 let label = label_for(&t.doc.title(), &t.address);
                 // The x sits in the row's right margin, where clicks close the tab.
                 format!(
-                    "<div class=\"{class}\"><span class=\"name\">{}</span>                     <span class=\"x\">&times;</span></div>",
-                    escape(&label)
+                    "<div class=\"{class}\"><span class=\"name\">{}</span>                     <span class=\"x\">{}</span></div>",
+                    escape(&label),
+                    icon::CLOSE,
                 )
             })
             .collect();
+        let new_class = if new_tab_hot { "tab new hot" } else { "tab new" };
         format!(
-            "<html><body><div id=\"head\">ZERO</div>{rows}             <div class=\"tab new\">+  New tab</div></body></html>"
+            "<html><body><div id=\"head\">zero</div>{rows}             <div class=\"{new_class}\">{}  New tab</div></body></html>",
+            icon::ADD,
         )
     }
 
     /// Height is injected so the sidebar background fills the window.
     fn sidebar_css(height: u32) -> String {
         format!(
-            "body{{background:#141519;color:#c9ccd3;font-size:14px;height:{height}px;}} \
-             #head{{color:#6b7280;padding:12px;height:20px;}} \
-             .tab{{padding:10px;height:20px;}} \
-             .active{{background:#26282f;color:#ffffff;}} \
-             .new{{color:#6b7280;}} \
+            "body{{background:{chrome};color:{muted};font-size:14px;height:{height}px;}} \
+             #head{{color:{accent};padding:12px;height:20px;font-size:16px;}} \
+             .tab{{padding:10px;height:20px;border-radius:8px;}} \
+             .hot{{background:{hover};color:{text};}} \
+             .active{{background:{surface};color:{text};}} \
+             .new{{color:{faint};}} \
              .name{{display:inline-block;width:{name}px;}} \
-             .x{{display:inline-block;width:{close}px;color:#6b7280;text-align:right;}}",
+             .x{{display:inline-block;width:{close}px;color:{faint};text-align:right;}}",
             name = SIDEBAR_W - CLOSE_W - 24, // 24 = the row's left+right padding
             close = CLOSE_W - 8,
+            chrome = theme::CHROME,
+            surface = theme::SURFACE,
+            hover = theme::HOVER,
+            text = theme::TEXT,
+            muted = theme::MUTED,
+            faint = theme::FAINT,
+            accent = theme::ACCENT,
         )
     }
 
@@ -1021,7 +1165,7 @@ impl App {
             self.engine.render(&self.sidebar_html(), &Self::sidebar_css(h), sw as f32, h as f32);
         let toolbar_page = self.engine.render_page(
             &self.toolbar_html(),
-            TOOLBAR_CSS,
+            &toolbar_css(content_w),
             content_w as f32,
             tb as f32,
             &crate::net::ShellLoader::new(String::new()),
@@ -1029,7 +1173,7 @@ impl App {
         self.toolbar_rects = toolbar_page.element_rects;
         let toolbar = toolbar_page.canvas;
         let ai_panel = if aw > 0 {
-            Some(self.engine.render(&self.ai_html(), AI_CSS, aw as f32, h as f32))
+            Some(self.engine.render(&self.ai_html(), ai_css(), aw as f32, h as f32))
         } else {
             None
         };
