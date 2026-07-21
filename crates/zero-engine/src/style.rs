@@ -180,7 +180,7 @@ fn specified_values(
     ancestors: &[&ElementData],
     stylesheet: &Stylesheet,
 ) -> PropertyMap {
-    let mut values = HashMap::new();
+    let mut values = presentation_hints(elem);
     let mut rules = matching_rules(elem, ancestors, stylesheet);
     // Apply low specificity first so high specificity overrides it.
     rules.sort_by(|&(a, _), &(b, _)| a.cmp(&b));
@@ -190,6 +190,51 @@ fn specified_values(
         }
     }
     values
+}
+
+/// Styling that comes from HTML attributes rather than CSS.
+///
+/// Older pages carry their whole design this way — Hacker News's orange header
+/// is a `bgcolor` attribute, not a stylesheet. These are the lowest priority
+/// input to the cascade, so any CSS rule still overrides them.
+fn presentation_hints(elem: &ElementData) -> PropertyMap {
+    let mut hints = PropertyMap::new();
+    let attr = |name: &str| elem.attributes.get(name).map(|v| v.trim().to_string());
+
+    if let Some(color) = attr("bgcolor").and_then(|v| parse_attr_color(&v)) {
+        hints.insert("background-color".to_string(), color);
+    }
+    // `text` colours a whole document; `color` belongs to <font>.
+    for name in ["text", "color"] {
+        if let Some(color) = attr(name).and_then(|v| parse_attr_color(&v)) {
+            hints.insert("color".to_string(), color);
+        }
+    }
+    for name in ["width", "height"] {
+        if let Some(length) = attr(name).and_then(|v| parse_attr_length(&v)) {
+            hints.insert(name.to_string(), length);
+        }
+    }
+    hints
+}
+
+/// An attribute colour may be a bare hex value (`bgcolor="ff6600"`) as well as
+/// the CSS forms.
+fn parse_attr_color(value: &str) -> Option<Value> {
+    // Only a real colour counts: `bgcolor="ff6600"` parses as a keyword
+    // otherwise, and a keyword here would silently mean "no background".
+    match crate::css::parse_value(value) {
+        Some(Value::ColorValue(color)) => Some(Value::ColorValue(color)),
+        _ => crate::css::parse_color_token(value),
+    }
+}
+
+/// `width="120"` means pixels; `width="85%"` is a percentage.
+fn parse_attr_length(value: &str) -> Option<Value> {
+    match value.strip_suffix('%') {
+        Some(number) => number.trim().parse().ok().map(|n| Value::Length(n, Unit::Percent)),
+        None => value.parse().ok().map(|n| Value::Length(n, Unit::Px)),
+    }
 }
 
 /// Properties that flow from parent to child when the child doesn't set them.
@@ -268,6 +313,29 @@ mod tests {
     }
 
     const RED: Value = Value::ColorValue(crate::css::Color { r: 255, g: 0, b: 0, a: 255 });
+
+    #[test]
+    fn html_attributes_style_elements_but_css_still_wins() {
+        let html = "<body><td bgcolor=\"#ff6600\" width=\"85%\">head</td>                    <td bgcolor=\"ff6600\">bare hex</td>                    <td bgcolor=\"#ff6600\" class=\"over\">overridden</td></body>";
+        let orange = Value::ColorValue(crate::css::Color { r: 255, g: 102, b: 0, a: 255 });
+
+        let dom = crate::html::parse(html.to_string());
+        let sheet = crate::css::parse(".over { background-color: #000000; }".to_string());
+        let styled = style_tree(&dom, &sheet);
+
+        assert_eq!(styled.children[0].value("background-color"), Some(orange.clone()));
+        assert_eq!(
+            styled.children[0].value("width"),
+            Some(Value::Length(85.0, Unit::Percent))
+        );
+        // Attributes may omit the `#`, which CSS never allows.
+        assert_eq!(styled.children[1].value("background-color"), Some(orange));
+        // A stylesheet beats a presentation hint.
+        assert_eq!(
+            styled.children[2].value("background-color"),
+            Some(Value::ColorValue(crate::css::Color { r: 0, g: 0, b: 0, a: 255 }))
+        );
+    }
 
     #[test]
     fn descendant_selectors_match_at_any_depth() {

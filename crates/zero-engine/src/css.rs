@@ -342,6 +342,12 @@ fn hsl_to_rgb(hue: f32, saturation: f32, lightness: f32) -> (u8, u8, u8) {
     (byte(r), byte(g), byte(b))
 }
 
+/// Interpret a single CSS value, for callers outside the parser (HTML
+/// presentation attributes carry CSS-shaped values).
+pub fn parse_value(text: &str) -> Option<Value> {
+    classify_value(text.trim())
+}
+
 /// Interpret a raw value string, returning `None` for anything unsupported.
 fn classify_value(s: &str) -> Option<Value> {
     if s.is_empty() {
