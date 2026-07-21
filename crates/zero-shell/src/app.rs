@@ -814,9 +814,11 @@ impl App {
         let tab = self.tab();
         // The padlock is the one claim the address bar makes, so it says plainly
         // when a page arrived over cleartext.
-        let lock = match tab.secure {
-            true => format!("<span class=\"lock\">{} </span>", icon::SECURE),
-            false => format!("<span class=\"warn\">{} not secure </span>", icon::INSECURE),
+        // A built-in page made no connection at all, so it claims nothing.
+        let lock = match (crate::internal::is_internal(&tab.address), tab.secure) {
+            (true, _) => String::new(),
+            (false, true) => format!("<span class=\"lock\">{} </span>", icon::SECURE),
+            (false, false) => format!("<span class=\"warn\">{} not secure </span>", icon::INSECURE),
         };
         let shield = match tab.blocked_count {
             0 => String::new(),

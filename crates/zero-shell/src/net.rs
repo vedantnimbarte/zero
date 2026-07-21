@@ -440,11 +440,17 @@ pub fn load_target(target: &str) -> Fetched {
 /// The page shown when a load fails. It says what went wrong and what the user
 /// can do, rather than restating the URL they just typed.
 fn error_page(target: &str, why: &str) -> String {
+    use crate::app::theme;
     let escape = |text: &str| text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
     format!(
-        "<html><head><style>         body{{background:#0e0f12;color:#f2f3f5;padding:64px;font-size:15px;}}         h1{{color:#e5484d;font-size:26px;}}         .why{{background:#17181c;padding:16px;border-radius:8px;color:#c9ccd3;}}         .url{{color:#6b7280;padding:8px;}}         .hint{{color:#9a9da6;padding:8px;}}         </style></head><body>         <h1>This page did not load</h1>         <div class=\"why\">Zero tried to reach it, but {}.</div>         <div class=\"url\">{}</div>         <div class=\"hint\">Check the address, or press R to try again.</div>         </body></html>",
+        "<html><head><style>         body{{background:{canvas};color:{text};padding:64px;font-size:15px;}}         h1{{color:{text};font-size:26px;padding:6px;}}         .why{{background:{surface};padding:20px;border-radius:10px;color:{text};}}         .url{{color:{faint};padding:10px;}}         .hint{{color:{muted};padding:10px;}}         </style></head><body>         <h1>This page did not load</h1>         <div class=\"why\">Zero tried to reach it, but {}.</div>         <div class=\"url\">{}</div>         <div class=\"hint\">Check the address, or press the reload button to try again.</div>         </body></html>",
         escape(why),
-        escape(target)
+        escape(target),
+        canvas = theme::CANVAS,
+        surface = theme::SURFACE,
+        text = theme::TEXT,
+        muted = theme::MUTED,
+        faint = theme::FAINT,
     )
 }
 
