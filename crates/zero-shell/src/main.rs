@@ -19,6 +19,7 @@ mod blocker;
 mod cookies;
 mod crypto;
 mod fonts;
+mod internal;
 mod localstore;
 mod net;
 mod storage;
@@ -51,7 +52,7 @@ fn main() {
             let css = fs::read_to_string("examples/test.css").expect("read css");
             (html, css, "examples/test.html".to_string())
         }
-        Some(target) if is_url(&target) => {
+        Some(target) if is_url(&target) || internal::is_internal(&target) => {
             let fetched = load_target(&target);
             (fetched.body, String::new(), fetched.url)
         }

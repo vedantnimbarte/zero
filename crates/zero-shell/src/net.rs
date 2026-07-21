@@ -142,7 +142,7 @@ pub fn resolve_url(base: &str, src: &str) -> String {
 /// Turn address-bar text into something loadable: keep URLs/paths, else assume https.
 pub fn normalize_target(s: &str) -> String {
     let s = s.trim();
-    if is_url(s) || std::path::Path::new(s).exists() {
+    if crate::internal::is_internal(s) || is_url(s) || std::path::Path::new(s).exists() {
         s.to_string()
     } else if s.contains('.') && !s.contains(' ') {
         format!("https://{s}")
@@ -173,6 +173,14 @@ fn try_fetch(url: &str) -> Option<String> {
 /// cleartext if the secure attempt actually fails — so users get encryption by
 /// default without breaking sites that genuinely have no HTTPS.
 pub fn load_target(target: &str) -> Fetched {
+    // Built-in pages never touch the network.
+    if crate::internal::is_internal(target) {
+        return Fetched {
+            url: target.to_string(),
+            body: crate::internal::page(target),
+            secure: true,
+        };
+    }
     // Cookies are keyed by the site being visited, so set that before fetching.
     set_partition(target);
     if !is_url(target) {
