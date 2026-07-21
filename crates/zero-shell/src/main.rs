@@ -10,12 +10,15 @@
 //! Usage:
 //!   zero [target] [css]              # window   (target = file or URL)
 //!   zero --png [target] [css] [out]  # headless PNG
+//!   zero --ai [target]               # headless assistant report
 
+mod ai;
 mod app;
 mod blocker;
 mod fonts;
 mod net;
 
+use ai::Assistant;
 use net::{is_url, load_target, ShellLoader};
 use std::fs;
 use zero_engine::Engine;
@@ -23,7 +26,8 @@ use zero_engine::Engine;
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let png_mode = args.first().map(|a| a == "--png").unwrap_or(false);
-    if png_mode {
+    let ai_mode = args.first().map(|a| a == "--ai").unwrap_or(false);
+    if png_mode || ai_mode {
         args.remove(0);
     }
     let mut args = args.into_iter().peekable();
@@ -50,6 +54,22 @@ fn main() {
             (html, css, target)
         }
     };
+
+    if ai_mode {
+        let doc = zero_engine::Document::load(&html, &css);
+        let ctx = ai::PageContext {
+            url: address,
+            text: doc.page_text(),
+            headings: doc.headings(),
+            blocked_trackers: 0,
+            secure: true,
+        };
+        let assistant = ai::LocalAssistant;
+        println!("{}", assistant.respond(&ctx));
+        println!("
+[{}]", assistant.provenance());
+        return;
+    }
 
     let engine = fonts::build_engine();
 
