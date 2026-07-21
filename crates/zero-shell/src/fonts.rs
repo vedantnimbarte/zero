@@ -5,22 +5,36 @@ use std::fs;
 use zero_engine::Engine;
 
 /// Every candidate that exists, in priority order, forming a fallback chain:
-/// a good Latin font first, then broad-coverage Indic fonts.
+/// a good Latin font first, then Indic, then CJK. A script with no font in the
+/// chain renders as empty boxes, so breadth here is what stops the web looking
+/// broken outside Latin text.
 fn load_system_fonts() -> Vec<Vec<u8>> {
     const CANDIDATES: &[&str] = &[
         // Windows
         "C:/Windows/Fonts/segoeui.ttf",
         "C:/Windows/Fonts/Nirmala.ttf", // Devanagari/Tamil/Telugu/Bengali/...
+        "C:/Windows/Fonts/msyh.ttc",    // Simplified Chinese
+        "C:/Windows/Fonts/msjh.ttc",    // Traditional Chinese
+        "C:/Windows/Fonts/YuGothR.ttc", // Japanese
+        "C:/Windows/Fonts/malgun.ttf",  // Korean
         "C:/Windows/Fonts/arial.ttf",
         // macOS
         "/System/Library/Fonts/Supplemental/Arial.ttf",
         "/System/Library/Fonts/Supplemental/Devanagari Sangam MN.ttc",
+        "/System/Library/Fonts/PingFang.ttc",         // Chinese
+        "/System/Library/Fonts/Hiragino Sans GB.ttc", // Japanese
+        "/System/Library/Fonts/Supplemental/AppleGothic.ttf", // Korean
         "/Library/Fonts/Arial.ttf",
         // Linux
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
         "/usr/share/fonts/TTF/DejaVuSans.ttf",
     ];
+    // ponytail: every candidate is read into memory at startup, and CJK fonts
+    // are tens of megabytes. Mapping them lazily (or on first miss) is the fix
+    // if footprint starts to matter.
     CANDIDATES.iter().filter_map(|p| fs::read(p).ok()).collect()
 }
 
