@@ -680,6 +680,20 @@ impl<'a> LayoutBox<'a> {
         let mut fragments: Vec<TextFragment> = Vec::new();
         let mut link_areas: Vec<LinkArea> = Vec::new();
 
+        // An anonymous block has no style of its own, but white-space inherits,
+        // so its inline children carry what its parent asked for.
+        let styled = match self.box_type {
+            BoxType::BlockNode(styled) | BoxType::InlineNode(styled) => Some(styled),
+            BoxType::AnonymousBlock => self.children.iter().find_map(|child| match child.box_type {
+                BoxType::BlockNode(styled) | BoxType::InlineNode(styled) => Some(styled),
+                BoxType::AnonymousBlock => None,
+            }),
+        };
+        let preserve_whitespace = matches!(
+            styled.and_then(|s| s.value("white-space")),
+            Some(Value::Keyword(ref k)) if k == "pre" || k == "pre-wrap"
+        );
+
         // Flatten the inline subtree into a stream of text runs and element
         // boundaries, carrying the nearest ancestor link's href with each run.
         let mut pieces: Vec<InlinePiece> = Vec::new();
@@ -787,6 +801,59 @@ impl<'a> LayoutBox<'a> {
 
             let word_height = piece.size * 1.25;
             let (_, space_w) = shape_run(&fonts.entries[0], " ", piece.size);
+
+            // `white-space: pre` keeps the text exactly as written: newlines end
+            // lines and runs of spaces survive, which is the whole point of a
+            // code block.
+            //
+            // ponytail: each line is shaped as one run, so font fallback happens
+            // per line rather than per word — fine for code, less so for a
+            // preformatted block mixing scripts. `pre-wrap` does not wrap yet.
+            if preserve_whitespace {
+                for (i, line) in piece.text.split('\n').enumerate() {
+                    if i > 0 {
+                        for boxed in open.iter_mut() {
+                            boxed.height = boxed.height.max(line_height.max(word_height));
+                            inline_boxes.push(boxed.close(cursor_x));
+                            boxed.start_x = start_x;
+                            boxed.line_y = cursor_y + line_height.max(word_height);
+                            boxed.height = 0.0;
+                        }
+                        cursor_y += line_height.max(word_height);
+                        cursor_x = start_x;
+                        line_height = 0.0;
+                    }
+                    line_height = line_height.max(word_height);
+                    placed_any = true;
+                    if line.is_empty() {
+                        continue; // a blank line still occupies its height
+                    }
+                    let font_index = fonts.pick(line);
+                    let (glyphs, width) = shape_run(&fonts.entries[font_index], line, piece.size);
+                    fragments.push(TextFragment {
+                        glyphs,
+                        text: line.to_string(),
+                        width,
+                        x: cursor_x,
+                        y: cursor_y,
+                        size: piece.size,
+                        color: piece.color,
+                        font_index,
+                    });
+                    if let Some(href) = &piece.href {
+                        link_areas.push(LinkArea {
+                            href: href.clone(),
+                            x: cursor_x,
+                            y: cursor_y,
+                            width,
+                            height: word_height,
+                        });
+                    }
+                    cursor_x += width;
+                }
+                pending_space = false;
+                continue;
+            }
 
             // Only space, tab and newline collapse in CSS. A non-breaking space
             // is an ordinary character that happens to look like a space, so it
@@ -1843,6 +1910,11 @@ fn line_shift(line_right: f32, content_right: f32, factor: f32) -> f32 {
     (content_right - line_right).max(0.0) * factor
 }
 
+/// A text node holding nothing but collapsible whitespace.
+fn is_whitespace_text(style_node: &StyledNode) -> bool {
+    matches!(&style_node.node.node_type, NodeType::Text(text) if text.trim().is_empty())
+}
+
 /// Does this node have a block-level child? Inline-block does not count: it is
 /// inline-level and sits happily in a line.
 fn contains_block(style_node: &StyledNode) -> bool {
@@ -1880,6 +1952,11 @@ fn build_box<'a>(style_node: &'a StyledNode<'a>, force_block: bool) -> LayoutBox
     // Flex and grid items are always block-level, whatever their own display says.
     let blockifies = matches!(display, Display::Flex | Display::Grid);
     for child in &style_node.children {
+        // Whitespace between flex or grid items produces no box at all — the
+        // newlines in a page's source must not become items of their own.
+        if blockifies && is_whitespace_text(child) {
+            continue;
+        }
         match child.display() {
             Display::None => {} // skip
             Display::Block | Display::Flex | Display::Grid | Display::Table => {

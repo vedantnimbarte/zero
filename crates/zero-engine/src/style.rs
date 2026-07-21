@@ -417,7 +417,7 @@ fn resolve_vars(values: &mut PropertyMap, vars: &PropertyMap) {
 
 /// Properties that flow from parent to child when the child doesn't set them.
 /// Text nodes have no rules of their own, so this is how they get color/size.
-const INHERITED_PROPERTIES: [&str; 3] = ["color", "font-size", "text-align"];
+const INHERITED_PROPERTIES: [&str; 4] = ["color", "font-size", "text-align", "white-space"];
 
 pub fn style_tree<'a>(root: &'a Node, stylesheet: &'a Stylesheet) -> StyledNode<'a> {
     style_tree_with_hover(root, stylesheet, &HoverChain::new())
@@ -531,14 +531,25 @@ fn style_tree_inner<'a>(
 mod tests {
     use super::*;
 
-    /// Colour of the element found at `path` (child indices from the root).
+    /// The element children of a node, skipping the text nodes between them.
+    ///
+    /// Whitespace between tags is part of the tree — it has to be, for
+    /// white-space: pre — so tests address elements, not raw child positions.
+    fn elements<'a>(node: &'a StyledNode<'a>) -> Vec<&'a StyledNode<'a>> {
+        node.children
+            .iter()
+            .filter(|c| matches!(c.node.node_type, NodeType::Element(_)))
+            .collect()
+    }
+
+    /// Colour of the element found at `path` (element indices from the root).
     fn color_at(html: &str, css: &str, path: &[usize]) -> Option<Value> {
         let dom = crate::html::parse(html.to_string());
         let sheet = crate::css::parse(css.to_string());
         let styled = style_tree(&dom, &sheet);
         let mut node = &styled;
         for i in path {
-            node = &node.children[*i];
+            node = elements(node)[*i];
         }
         node.value("color")
     }
@@ -576,14 +587,15 @@ mod tests {
 
         // With no cursor, hover rules never apply.
         let cold = style_tree(&dom, &sheet);
-        assert_eq!(cold.children[0].value("color"), Some(black.clone()));
+        assert_eq!(elements(&cold)[0].value("color"), Some(black.clone()));
 
         // Hovering the span also hovers the link that contains it...
         let chain: HoverChain = [span, link].into_iter().collect();
         let hot = style_tree_with_hover(&dom, &sheet, &chain);
-        assert_eq!(hot.children[0].value("color"), Some(red));
+        let links = elements(&hot);
+        assert_eq!(links[0].value("color"), Some(red));
         // ...but not the link beside it.
-        assert_eq!(hot.children[1].value("color"), Some(black));
+        assert_eq!(links[1].value("color"), Some(black));
     }
 
     #[test]
@@ -593,7 +605,8 @@ mod tests {
         let dom = crate::html::parse(html.to_string());
         let sheet = crate::css::parse(css.to_string());
         let styled = style_tree(&dom, &sheet);
-        let color = |i: usize| styled.children[i].value("color");
+        let fields = elements(&styled);
+        let color = |i: usize| fields[i].value("color");
         let rgb = |r, g, b| {
             Some(Value::ColorValue(crate::css::Color { r, g, b, a: 255 }))
         };
@@ -603,12 +616,12 @@ mod tests {
         assert_eq!(color(2), rgb(0, 0, 255)); // suffix match on href
         // `~=` matches one word of a space-separated list.
         assert_eq!(
-            styled.children[2].value("background-color"),
+            fields[2].value("background-color"),
             Some(Value::ColorValue(crate::css::Color { r: 17, g: 17, b: 17, a: 255 }))
         );
         // Presence alone, and a prefix that does not match.
-        assert_eq!(styled.children[0].value("padding"), Some(Value::Length(4.0, Unit::Px)));
-        assert_eq!(styled.children[1].value("padding"), None);
+        assert_eq!(fields[0].value("padding"), Some(Value::Length(4.0, Unit::Px)));
+        assert_eq!(fields[1].value("padding"), None);
     }
 
     #[test]
@@ -620,16 +633,17 @@ mod tests {
         let sheet = crate::css::parse(".over { background-color: #000000; }".to_string());
         let styled = style_tree(&dom, &sheet);
 
-        assert_eq!(styled.children[0].value("background-color"), Some(orange.clone()));
+        let cells = elements(&styled);
+        assert_eq!(cells[0].value("background-color"), Some(orange.clone()));
         assert_eq!(
-            styled.children[0].value("width"),
+            cells[0].value("width"),
             Some(Value::Length(85.0, Unit::Percent))
         );
         // Attributes may omit the `#`, which CSS never allows.
-        assert_eq!(styled.children[1].value("background-color"), Some(orange));
+        assert_eq!(cells[1].value("background-color"), Some(orange));
         // A stylesheet beats a presentation hint.
         assert_eq!(
-            styled.children[2].value("background-color"),
+            cells[2].value("background-color"),
             Some(Value::ColorValue(crate::css::Color { r: 0, g: 0, b: 0, a: 255 }))
         );
     }
@@ -641,17 +655,18 @@ mod tests {
         let dom = crate::html::parse(html.to_string());
         let sheet = crate::css::parse(css.to_string());
         let styled = style_tree(&dom, &sheet);
-        let body = &styled.children[0];
+        let body = elements(&styled)[0];
 
         let red = Value::ColorValue(crate::css::Color { r: 255, g: 0, b: 0, a: 255 });
         let green = Value::ColorValue(crate::css::Color { r: 0, g: 255, b: 0, a: 255 });
         // Defined on :root, used several levels down.
-        assert_eq!(body.children[0].value("color"), Some(red));
-        assert_eq!(body.children[0].value("padding"), Some(Value::Length(12.0, Unit::Px)));
+        let cards = elements(body);
+        assert_eq!(cards[0].value("color"), Some(red));
+        assert_eq!(cards[0].value("padding"), Some(Value::Length(12.0, Unit::Px)));
         // A missing variable falls back to the value after the comma.
-        assert_eq!(body.children[1].value("color"), Some(green));
+        assert_eq!(cards[1].value("color"), Some(green));
         // With no fallback the declaration is dropped, not left as raw text.
-        assert_eq!(body.children[2].value("color"), None);
+        assert_eq!(cards[2].value("color"), None);
     }
 
     #[test]
@@ -677,7 +692,7 @@ mod tests {
         // Both match; `main p` is more specific than `p`, whatever the order.
         let html = "<body><main><p>text</p></main></body>";
         let css = "main p { color: #ff0000; } p { color: #0000ff; }";
-        assert_eq!(color_at(html, css, &[0, 0, 0]), Some(RED));
+        assert_eq!(color_at(html, css, &[0, 0]), Some(RED)); // body > main > p
     }
 
     #[test]

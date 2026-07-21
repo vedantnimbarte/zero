@@ -540,6 +540,7 @@ const USER_AGENT_CSS: &str = "
     label, tbody, thead, tfoot, center, dl, dt, dd, caption, details, summary,
     legend, menu, dir { display: block; }
     table { display: table; }
+    pre { white-space: pre; }
     td, th { display: block; padding: 6px; }
     input, textarea, select { background: #ffffff; color: #111111; padding: 7px;
         border-radius: 4px; width: 260px; }
