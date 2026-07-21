@@ -243,6 +243,74 @@ fn parse_attr_length(value: &str) -> Option<Value> {
     }
 }
 
+/// Custom properties (`--brand`) inherit like text colour does, so a value
+/// defined on `:root` reaches every element that mentions it.
+fn is_custom_property(name: &str) -> bool {
+    name.starts_with("--")
+}
+
+/// Replace every `var(--name)` in `text` with the variable's value, or the
+/// fallback after the comma when it has none.
+///
+/// ponytail: no cycle detection and one level of substitution, so a variable
+/// defined in terms of another resolves only if the sheet already did the work.
+fn substitute_vars(text: &str, vars: &PropertyMap) -> Option<String> {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("var(") {
+        out.push_str(&rest[..start]);
+        let body_start = start + "var(".len();
+        let end = rest[body_start..].find(')')? + body_start;
+        let (name, fallback) = match rest[body_start..end].split_once(',') {
+            Some((name, fallback)) => (name.trim(), Some(fallback.trim())),
+            None => (rest[body_start..end].trim(), None),
+        };
+        let value = match vars.get(name) {
+            Some(Value::Raw(raw)) => Some(raw.clone()),
+            Some(other) => Some(format!("{other:?}")), // never happens: customs stay raw
+            None => fallback.map(str::to_string),
+        };
+        // An unresolvable var makes the whole declaration invalid, per CSS.
+        out.push_str(&value?);
+        rest = &rest[end + 1..];
+    }
+    out.push_str(rest);
+    Some(out)
+}
+
+/// Turn values that mention variables into real values, now that inheritance
+/// has brought every visible custom property into `values`.
+fn resolve_vars(values: &mut PropertyMap) {
+    let vars: PropertyMap = values
+        .iter()
+        .filter(|(name, _)| is_custom_property(name))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    if vars.is_empty() {
+        return;
+    }
+    let pending: Vec<(String, String)> = values
+        .iter()
+        .filter_map(|(name, value)| match value {
+            Value::Raw(text) if !is_custom_property(name) && text.contains("var(") => {
+                Some((name.clone(), text.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    for (name, text) in pending {
+        match substitute_vars(&text, &vars).and_then(|text| crate::css::parse_value(&text)) {
+            Some(value) => {
+                values.insert(name, value);
+            }
+            // Leave nothing behind rather than a value we could not read.
+            None => {
+                values.remove(&name);
+            }
+        }
+    }
+}
+
 /// Properties that flow from parent to child when the child doesn't set them.
 /// Text nodes have no rules of their own, so this is how they get color/size.
 const INHERITED_PROPERTIES: [&str; 3] = ["color", "font-size", "text-align"];
@@ -268,6 +336,12 @@ fn style_tree_inner<'a>(
             }
         }
     }
+    // Every custom property in scope inherits, then values that mention one can
+    // finally be read.
+    for (name, value) in inherited.iter().filter(|(name, _)| is_custom_property(name)) {
+        specified.entry(name.clone()).or_insert_with(|| value.clone());
+    }
+    resolve_vars(&mut specified);
 
     // Collapse font-size to absolute px now: `em` is relative to the *parent's*
     // font size, which is only knowable here during the top-down walk.
@@ -341,6 +415,26 @@ mod tests {
             styled.children[2].value("background-color"),
             Some(Value::ColorValue(crate::css::Color { r: 0, g: 0, b: 0, a: 255 }))
         );
+    }
+
+    #[test]
+    fn custom_properties_inherit_and_resolve() {
+        let css = ":root { --brand: #ff0000; --pad: 12px; }                    .card { color: var(--brand); padding: var(--pad); }                    .fallback { color: var(--missing, #00ff00); }                    .broken { color: var(--nothing); }";
+        let html = "<html><body><div class=\"card\">a</div>                    <div class=\"fallback\">b</div><div class=\"broken\">c</div></body></html>";
+        let dom = crate::html::parse(html.to_string());
+        let sheet = crate::css::parse(css.to_string());
+        let styled = style_tree(&dom, &sheet);
+        let body = &styled.children[0];
+
+        let red = Value::ColorValue(crate::css::Color { r: 255, g: 0, b: 0, a: 255 });
+        let green = Value::ColorValue(crate::css::Color { r: 0, g: 255, b: 0, a: 255 });
+        // Defined on :root, used several levels down.
+        assert_eq!(body.children[0].value("color"), Some(red));
+        assert_eq!(body.children[0].value("padding"), Some(Value::Length(12.0, Unit::Px)));
+        // A missing variable falls back to the value after the comma.
+        assert_eq!(body.children[1].value("color"), Some(green));
+        // With no fallback the declaration is dropped, not left as raw text.
+        assert_eq!(body.children[2].value("color"), None);
     }
 
     #[test]

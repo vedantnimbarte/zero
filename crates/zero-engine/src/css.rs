@@ -608,6 +608,12 @@ impl Parser {
                 '*' => {
                     self.consume_char();
                 }
+                // The one pseudo-class worth supporting: sheets define their
+                // custom properties on :root, and dropping it loses all of them.
+                ':' if self.starts_with(":root") => {
+                    self.pos += ":root".len();
+                    selector.tag_name = Some("html".to_string());
+                }
                 c if is_ident(c) => {
                     selector.tag_name = Some(self.parse_identifier().to_ascii_lowercase());
                 }
@@ -641,7 +647,13 @@ impl Parser {
             }
             if !name.is_empty() {
                 let raw = raw.trim();
-                let value = if RAW_VALUE_PROPERTIES.contains(&name.as_str()) {
+                // A custom property is whatever text it was given, and a value
+                // that mentions one cannot be understood until styling resolves
+                // it against the element's inherited variables.
+                let value = if name.starts_with("--")
+                    || raw.contains("var(")
+                    || RAW_VALUE_PROPERTIES.contains(&name.as_str())
+                {
                     Some(Value::Raw(raw.to_string()))
                 } else {
                     classify_value(raw)
