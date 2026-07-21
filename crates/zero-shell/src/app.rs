@@ -39,6 +39,8 @@ const TOOLBAR_CSS: &str = "body{background:#1f2127;color:#f2f3f5;font-size:15px;
           border-radius:6px;} \
      .off{display:inline-block;background:#24262d;color:#5f636d;width:30px;padding:7px;\
           border-radius:6px;} \
+     .on{display:inline-block;background:#f5a524;color:#241a00;width:30px;padding:7px;\
+         border-radius:6px;} \
      .addr{display:inline-block;background:#141519;color:#f2f3f5;padding:7px;\
            border-radius:6px;}";
 
@@ -354,6 +356,9 @@ impl App {
                 "t" => self.new_tab(),
                 "w" => self.close_tab(),
                 "i" => self.toggle_assistant(),
+                "d" => self.toggle_bookmark(),
+                "h" => self.go_to("zero://history".into()),
+                "b" => self.go_to("zero://bookmarks".into()),
                 _ => {}
             },
             Key::Named(NamedKey::Tab) if ctrl => self.next_tab(),
@@ -591,11 +596,15 @@ impl App {
         // Disabled buttons get a dim class, so the chrome reflects real state.
         let back = if tab.history_index > 0 { "btn" } else { "off" };
         let fwd = if tab.history_index + 1 < tab.history.len() { "btn" } else { "off" };
+        // A lit star means this page is already bookmarked.
+        let star = if storage::is_bookmarked(&tab.address) { "on" } else { "btn" };
         format!(
             "<html><body><div id=\"bar\">\
              <span id=\"back\" class=\"{back}\">&lt;</span>\
              <span id=\"fwd\" class=\"{fwd}\">&gt;</span>\
              <span id=\"reload\" class=\"btn\">R</span>\
+             <span id=\"star\" class=\"{star}\">*</span>\
+             <span id=\"marks\" class=\"btn\">B</span>\
              <span id=\"addr\" class=\"addr\">{lock}{}|{shield}</span>\
              </div></body></html>",
             escape(&tab.address)
@@ -603,6 +612,19 @@ impl App {
     }
 
     /// Act on a toolbar button, if the cursor is over one.
+    /// Save the current page, or unsave it if it is already bookmarked.
+    fn toggle_bookmark(&mut self) {
+        let url = self.tab().address.clone();
+        if url.is_empty() || crate::internal::is_internal(&url) {
+            return; // nothing worth saving
+        }
+        if !storage::remove_bookmark(&url) {
+            let title = tab_title(&url);
+            storage::add_bookmark(&url, &title);
+        }
+        self.request_redraw(); // the star changed
+    }
+
     fn handle_toolbar_click(&mut self, x: f32, y: f32) -> bool {
         let local_x = x - SIDEBAR_W as f32;
         let hit = self
@@ -624,6 +646,8 @@ impl App {
                 let target = self.tab().address.clone();
                 self.load(target);
             }
+            Some("star") => self.toggle_bookmark(),
+            Some("marks") => self.go_to("zero://bookmarks".into()),
             _ => return false,
         }
         true
