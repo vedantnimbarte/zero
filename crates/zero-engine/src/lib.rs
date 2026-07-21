@@ -110,6 +110,62 @@ impl Document {
         self.interp.set_dom(build_dom_view(&self.root));
     }
 
+    /// The document's readable text, with script/style/head content excluded.
+    ///
+    /// This is the sanitized view an assistant or reader mode should consume —
+    /// never raw markup, and never the contents of `<script>`.
+    pub fn page_text(&self) -> String {
+        fn walk(node: &Node, out: &mut String) {
+            match node.node_type {
+                NodeType::Text(ref t) => {
+                    let t = t.trim();
+                    if !t.is_empty() {
+                        out.push_str(t);
+                        out.push(' ');
+                    }
+                }
+                NodeType::Element(ref e) => {
+                    // `nav` is navigation chrome, not readable content.
+                    if matches!(
+                        e.tag_name.as_str(),
+                        "script" | "style" | "head" | "noscript" | "nav"
+                    ) {
+                        return;
+                    }
+                    for child in &node.children {
+                        walk(child, out);
+                    }
+                }
+            }
+        }
+        let mut text = String::new();
+        walk(&self.root, &mut text);
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// Headings in document order, as (level, text) — a structural outline.
+    pub fn headings(&self) -> Vec<(u8, String)> {
+        fn walk(node: &Node, out: &mut Vec<(u8, String)>) {
+            if let NodeType::Element(ref e) = node.node_type {
+                if let Some(level) = e.tag_name.strip_prefix('h').and_then(|d| d.parse::<u8>().ok())
+                {
+                    if (1..=6).contains(&level) {
+                        let text = text_content(node).split_whitespace().collect::<Vec<_>>().join(" ");
+                        if !text.is_empty() {
+                            out.push((level, text));
+                        }
+                    }
+                }
+            }
+            for child in &node.children {
+                walk(child, out);
+            }
+        }
+        let mut out = Vec::new();
+        walk(&self.root, &mut out);
+        out
+    }
+
     /// Text content of an element, by node id. Mainly useful for tests/inspection.
     pub fn text_of(&self, node_id: usize) -> String {
         fn find(node: &Node, node_id: usize) -> Option<&Node> {
