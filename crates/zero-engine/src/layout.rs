@@ -33,6 +33,8 @@ pub struct TextFragment {
 #[derive(Clone)]
 pub struct ElementRect {
     pub node_id: usize,
+    /// The element's `id` attribute, so an embedder can identify chrome controls.
+    pub id: String,
     pub x: f32,
     pub y: f32,
     pub width: f32,
@@ -1406,6 +1408,7 @@ pub fn collect_element_rects(bx: &LayoutBox, out: &mut Vec<ElementRect>) {
             let b = bx.dimensions.border_box();
             out.push(ElementRect {
                 node_id: e.node_id,
+                id: e.id().cloned().unwrap_or_default(),
                 x: b.x,
                 y: b.y,
                 width: b.width,
