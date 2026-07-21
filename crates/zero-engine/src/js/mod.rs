@@ -116,6 +116,7 @@ mod tests {
         let dom = DomView {
             elements: vec![ElementInfo {
                 path: vec![0],
+                node_id: 1,
                 id: "out".into(),
                 tag: "div".into(),
                 text: "before".into(),
@@ -130,6 +131,24 @@ mod tests {
         assert!(out.errors.is_empty(), "{:?}", out.errors);
         assert_eq!(out.console, vec!["before"]); // read the snapshot
         assert!(matches!(out.mutations[..], [Mutation::SetText(0, ref s)] if s == "after"));
+    }
+
+    #[test]
+    fn click_handlers_fire_and_keep_closure_state() {
+        // A counter closure registered as a handler must survive between clicks.
+        let mut doc = crate::Document::load(
+            "<html><body><div id='b'>0</div><script>
+                 var n = 0;
+                 var b = document.getElementById('b');
+                 b.onclick = function() { n = n + 1; b.textContent = 'clicks: ' + n; };
+             </script></body></html>",
+            "",
+        );
+        // The <div> is the second element (html, body, div, script) -> node_id 3.
+        assert!(doc.click(3), "handler should have fired");
+        assert!(doc.click(3));
+        assert!(!doc.click(999), "unknown element has no handler");
+        assert!(doc.text_of(3).contains("clicks: 2"), "got {:?}", doc.text_of(3));
     }
 
     #[test]

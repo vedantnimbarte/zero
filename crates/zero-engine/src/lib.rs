@@ -28,7 +28,7 @@ pub mod style;
 pub mod text;
 
 pub use css::Color;
-pub use layout::LinkArea;
+pub use layout::{ElementRect, LinkArea};
 pub use paint::Canvas;
 pub use resource::{DecodedImage, ResourceLoader};
 
@@ -43,6 +43,100 @@ pub struct Page {
     pub links: Vec<LinkArea>,
     /// console.log output and script errors, for the embedder to surface.
     pub console: Vec<String>,
+    /// Painted element boxes, so the embedder can hit-test clicks for scripts.
+    pub element_rects: Vec<ElementRect>,
+}
+
+/// A loaded document with a **persistent** JavaScript runtime.
+///
+/// Event handlers are closures that must outlive the initial script run, so the
+/// interpreter lives as long as the page rather than being torn down per render.
+pub struct Document {
+    root: Node,
+    css: String,
+    interp: js::interp::Interp,
+    next_node_id: usize,
+    pub console: Vec<String>,
+}
+
+impl Document {
+    /// Parse `html`, then run its `<script>` content once.
+    pub fn load(html_source: &str, css_source: &str) -> Document {
+        let mut doc = Document {
+            root: html::parse(html_source.to_string()),
+            css: css_source.to_string(),
+            interp: js::interp::Interp::new(),
+            next_node_id: 1, // 0 means "unassigned"
+            console: Vec::new(),
+        };
+        doc.assign_node_ids();
+        doc.interp.set_dom(build_dom_view(&doc.root));
+
+        let mut source = String::new();
+        collect_script_text(&doc.root, &mut source);
+        if !source.trim().is_empty() {
+            match js::lexer::tokenize(&source).and_then(js::parser::parse) {
+                Ok(program) => doc.interp.run(&program),
+                Err(e) => doc.interp.out.errors.push(format!("SyntaxError: {e}")),
+            }
+        }
+        doc.absorb_script_output();
+        doc
+    }
+
+    /// Fire an element's click handler, applying whatever it changed.
+    /// Returns true if a handler ran (so the embedder knows to repaint).
+    pub fn click(&mut self, node_id: usize) -> bool {
+        if !self.interp.dispatch_click(node_id) {
+            return false;
+        }
+        self.absorb_script_output();
+        true
+    }
+
+    /// Apply pending DOM writes/document.write output and refresh the script's view.
+    fn absorb_script_output(&mut self) {
+        let out = std::mem::take(&mut self.interp.out);
+        self.console.extend(out.console);
+        self.console.extend(out.errors.iter().map(|e| format!("[error] {e}")));
+
+        apply_mutations(&mut self.root, &out.mutations);
+        if !out.writes.trim().is_empty() {
+            let written = html::parse(format!("<div>{}</div>", out.writes));
+            append_to_body(&mut self.root, written);
+        }
+        // New nodes need identities; existing ones keep theirs so handlers stay valid.
+        self.assign_node_ids();
+        self.interp.set_dom(build_dom_view(&self.root));
+    }
+
+    /// Text content of an element, by node id. Mainly useful for tests/inspection.
+    pub fn text_of(&self, node_id: usize) -> String {
+        fn find(node: &Node, node_id: usize) -> Option<&Node> {
+            if let NodeType::Element(ref e) = node.node_type {
+                if e.node_id == node_id {
+                    return Some(node);
+                }
+            }
+            node.children.iter().find_map(|c| find(c, node_id))
+        }
+        find(&self.root, node_id).map(text_content).unwrap_or_default()
+    }
+
+    fn assign_node_ids(&mut self) {
+        fn walk(node: &mut Node, next: &mut usize) {
+            if let NodeType::Element(ref mut e) = node.node_type {
+                if e.node_id == 0 {
+                    e.node_id = *next;
+                    *next += 1;
+                }
+            }
+            for child in &mut node.children {
+                walk(child, next);
+            }
+        }
+        walk(&mut self.root, &mut self.next_node_id);
+    }
 }
 
 /// Minimal user-agent stylesheet: gives real documents sane default display
@@ -114,36 +208,35 @@ impl Engine {
         height: f32,
         loader: &dyn ResourceLoader,
     ) -> Page {
-        let mut root = html::parse(html_source.to_string());
+        let mut doc = Document::load(html_source, css_source);
+        self.render_document(&mut doc, width, height, loader)
+    }
 
-        // Run <script> content, then splice any document.write() output into the
-        // document so it participates in styling and layout.
-        let mut console = Vec::new();
-        let mut script_source = String::new();
-        collect_script_text(&root, &mut script_source);
-        if !script_source.trim().is_empty() {
-            let out = js::run_with_dom(&script_source, build_dom_view(&root));
-            console.extend(out.console);
-            console.extend(out.errors.iter().map(|e| format!("[error] {e}")));
-            apply_mutations(&mut root, &out.mutations);
-            if !out.writes.trim().is_empty() {
-                let written = html::parse(format!("<div>{}</div>", out.writes));
-                append_to_body(&mut root, written);
-            }
-        }
+    /// Render a [`Document`], which keeps its JavaScript runtime alive between frames.
+    pub fn render_document(
+        &self,
+        doc: &mut Document,
+        width: f32,
+        height: f32,
+        loader: &dyn ResourceLoader,
+    ) -> Page {
+        let root = &doc.root;
+        let console = std::mem::take(&mut doc.console);
+        let css_source = doc.css.clone();
+        let css_source = css_source.as_str();
 
         // Cascade order (later wins on ties): UA stylesheet < page <style> < caller CSS.
         let mut stylesheet = css::parse(USER_AGENT_CSS.to_string());
         let mut page_css = String::new();
-        collect_style_text(&root, &mut page_css);
+        collect_style_text(root, &mut page_css);
         stylesheet.rules.extend(css::parse(page_css).rules);
         stylesheet.rules.extend(css::parse(css_source.to_string()).rules);
 
-        let style_root = style::style_tree(&root, &stylesheet);
+        let style_root = style::style_tree(root, &stylesheet);
 
         // Fetch + decode every <img> up front so layout knows their sizes.
         let mut images = ImageMap::new();
-        collect_and_load_images(&root, loader, &mut images);
+        collect_and_load_images(root, loader, &mut images);
 
         let mut viewport: layout::Dimensions = Default::default();
         viewport.content.width = width;
@@ -171,7 +264,9 @@ impl Engine {
 
         let mut links = Vec::new();
         layout::collect_links(&layout_root, &mut links);
-        Page { canvas, links, console }
+        let mut element_rects = Vec::new();
+        layout::collect_element_rects(&layout_root, &mut element_rects);
+        Page { canvas, links, console, element_rects }
     }
 }
 
@@ -199,6 +294,7 @@ fn build_dom_view(root: &Node) -> js::DomView {
         if let NodeType::Element(ref e) = node.node_type {
             out.push(js::ElementInfo {
                 path: path.clone(),
+                node_id: e.node_id,
                 id: e.id().cloned().unwrap_or_default(),
                 tag: e.tag_name.clone(),
                 text: text_content(node),
