@@ -45,6 +45,9 @@ pub enum Value {
     /// A unitless number, e.g. `flex-grow: 2` or `opacity: 0.5`.
     Number(f32),
     ColorValue(Color),
+    /// A multi-value declaration kept verbatim (e.g. a grid track list), for
+    /// properties whose grammar the generic classifier can't express.
+    Raw(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -132,6 +135,9 @@ pub fn parse(source: String) -> Stylesheet {
 fn is_ident(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '-' || c == '_'
 }
+
+/// Properties whose values are lists we parse later, not single tokens.
+const RAW_VALUE_PROPERTIES: &[&str] = &["grid-template-columns", "grid-template-rows"];
 
 /// Interpret a raw value string, returning `None` for anything unsupported.
 fn classify_value(s: &str) -> Option<Value> {
@@ -282,7 +288,13 @@ impl Parser {
                 self.consume_char();
             }
             if !name.is_empty() {
-                if let Some(value) = classify_value(raw.trim()) {
+                let raw = raw.trim();
+                let value = if RAW_VALUE_PROPERTIES.contains(&name.as_str()) {
+                    Some(Value::Raw(raw.to_string()))
+                } else {
+                    classify_value(raw)
+                };
+                if let Some(value) = value {
                     declarations.push(Declaration { name, value });
                 }
             }
