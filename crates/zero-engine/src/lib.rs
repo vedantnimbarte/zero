@@ -602,6 +602,8 @@ impl Engine {
             .rules
             .extend(css::parse(css_source.to_string()).rules);
 
+        // Media blocks are parsed but only apply at this viewport width.
+        stylesheet.rules.retain(|rule| css::media_matches(rule.media.as_deref(), width));
         let style_root = style::style_tree(root, &stylesheet);
 
         // Fetch + decode every <img> up front so layout knows their sizes.

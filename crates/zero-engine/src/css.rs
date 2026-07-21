@@ -18,6 +18,9 @@ pub struct Stylesheet {
 pub struct Rule {
     pub selectors: Vec<Selector>,
     pub declarations: Vec<Declaration>,
+    /// The `@media` condition this rule came from, if any. Evaluated against the
+    /// viewport at render time — see [`media_matches`].
+    pub media: Option<String>,
 }
 
 #[derive(Debug)]
@@ -246,6 +249,55 @@ fn parse_hex_color(hex: &str) -> Option<Value> {
     Some(Value::ColorValue(color))
 }
 
+/// Whether a rule applies at this viewport width. `None` (no media block)
+/// always applies.
+///
+/// Understands media types and width features, which is what responsive layout
+/// actually turns on. A feature we don't understand makes the block *not*
+/// match, so an unsupported condition leaves the page at its base styling
+/// rather than applying rules meant for some other context.
+pub fn media_matches(condition: Option<&str>, viewport_width: f32) -> bool {
+    let Some(condition) = condition else { return true };
+    // Commas are "or": any branch matching is enough.
+    condition.split(',').any(|branch| {
+        let branch = branch.trim().to_lowercase();
+        !branch.is_empty() && branch.split(" and ").all(|term| term_matches(term.trim(), viewport_width))
+    })
+}
+
+fn term_matches(term: &str, viewport_width: f32) -> bool {
+    match term {
+        "screen" | "all" => return true,
+        "print" | "speech" | "only print" => return false,
+        _ => {}
+    }
+    if let Some(rest) = term.strip_prefix("only ") {
+        return term_matches(rest.trim(), viewport_width);
+    }
+    let Some(inner) = term.strip_prefix('(').and_then(|t| t.strip_suffix(')')) else {
+        return false; // an unknown bare term
+    };
+    let Some((feature, value)) = inner.split_once(':') else {
+        return false; // a bare feature test like `(hover)`
+    };
+    let Some(px) = parse_px(value.trim()) else { return false };
+    match feature.trim() {
+        "min-width" => viewport_width >= px,
+        "max-width" => viewport_width <= px,
+        _ => false,
+    }
+}
+
+/// Media queries are stated in px, em or rem; anything else we cannot judge.
+fn parse_px(value: &str) -> Option<f32> {
+    for (suffix, scale) in [("px", 1.0), ("rem", 16.0), ("em", 16.0)] {
+        if let Some(number) = value.strip_suffix(suffix) {
+            return number.trim().parse::<f32>().ok().map(|n| n * scale);
+        }
+    }
+    value.parse().ok()
+}
+
 struct Parser {
     pos: usize,
     input: String,
@@ -259,7 +311,9 @@ impl Parser {
             if self.eof() {
                 break;
             }
-            if self.starts_with("@") {
+            if self.starts_with("@media") {
+                rules.extend(self.parse_media_block());
+            } else if self.starts_with("@") {
                 self.skip_at_rule();
             } else if self.starts_with("}") {
                 self.consume_char(); // stray brace
@@ -279,6 +333,7 @@ impl Parser {
             Some(Rule {
                 selectors,
                 declarations,
+                media: None,
             })
         }
     }
@@ -389,6 +444,41 @@ impl Parser {
             return;
         }
         self.skip_balanced_braces();
+    }
+
+    /// Parse `@media <condition> { ... }`, tagging the rules inside with the
+    /// condition rather than dropping them: real sites keep most of their CSS
+    /// in media blocks, so skipping them loses nearly all styling.
+    fn parse_media_block(&mut self) -> Vec<Rule> {
+        self.pos += "@media".len();
+        let start = self.pos;
+        self.consume_while(|c| c != '{' && c != ';');
+        let condition = self.input[start..self.pos].trim().to_string();
+        if !self.starts_with("{") {
+            if self.starts_with(";") {
+                self.consume_char();
+            }
+            return Vec::new();
+        }
+        self.consume_char(); // the opening brace
+        let mut rules = Vec::new();
+        loop {
+            self.consume_whitespace();
+            if self.eof() || self.starts_with("}") {
+                if !self.eof() {
+                    self.consume_char();
+                }
+                break;
+            }
+            // ponytail: a nested at-rule inside @media is skipped, not merged.
+            if self.starts_with("@") {
+                self.skip_at_rule();
+            } else if let Some(mut rule) = self.parse_rule() {
+                rule.media = Some(condition.clone());
+                rules.push(rule);
+            }
+        }
+        rules
     }
 
     fn skip_at_rule(&mut self) {
@@ -510,6 +600,44 @@ mod tests {
     }
 
     #[test]
+    fn media_blocks_apply_at_matching_widths() {
+        let sheet = parse(
+            "body { color: #000000; }              @media screen and (min-width: 700px) { .wide { color: #ff0000; } }              @media print { .paper { color: #00ff00; } }"
+                .to_string(),
+        );
+        assert_eq!(sheet.rules.len(), 3, "media rules are kept, not dropped");
+
+        let applies = |width: f32| -> Vec<Option<String>> {
+            sheet
+                .rules
+                .iter()
+                .filter(|r| media_matches(r.media.as_deref(), width))
+                .map(|r| r.media.clone())
+                .collect()
+        };
+        // Wide: the base rule and the min-width block, never the print one.
+        assert_eq!(applies(800.0).len(), 2);
+        // Narrow: only the base rule.
+        assert_eq!(applies(500.0), vec![None]);
+    }
+
+    #[test]
+    fn media_conditions_are_evaluated() {
+        assert!(media_matches(None, 400.0)); // no block: always on
+        assert!(media_matches(Some("screen"), 400.0));
+        assert!(!media_matches(Some("print"), 400.0));
+        assert!(media_matches(Some("(max-width: 600px)"), 400.0));
+        assert!(!media_matches(Some("(max-width: 600px)"), 900.0));
+        // `and` requires both; a comma is `or`.
+        assert!(!media_matches(Some("screen and (min-width: 900px)"), 400.0));
+        assert!(media_matches(Some("print, screen"), 400.0));
+        // em/rem conditions resolve against the initial font size.
+        assert!(media_matches(Some("(min-width: 20em)"), 400.0));
+        // A feature we cannot judge must not switch styles on.
+        assert!(!media_matches(Some("(prefers-color-scheme: dark)"), 400.0));
+    }
+
+    #[test]
     fn skips_unsupported_without_panic() {
         // Complex selector, at-rule, rgb(), % — all dropped; the plain rule survives.
         let s = parse(
@@ -519,8 +647,10 @@ mod tests {
              .ok { color: #123456; width: 50%; padding: 8px; }"
                 .to_string(),
         );
-        assert_eq!(s.rules.len(), 1); // only `.ok`
-                                      // color + width(%) + padding all understood now.
-        assert_eq!(s.rules[0].declarations.len(), 3);
+        // `.ok`, plus the rule inside the media block — the complex selectors go.
+        assert_eq!(s.rules.len(), 2);
+        let ok = s.rules.iter().find(|r| r.media.is_none()).expect("the plain rule");
+        // color + width(%) + padding all understood now.
+        assert_eq!(ok.declarations.len(), 3);
     }
 }
