@@ -332,6 +332,53 @@ mod tests {
     }
 
     #[test]
+    fn local_storage_reads_writes_and_survives_a_reload() {
+        use std::cell::RefCell;
+        use std::collections::HashMap as Map;
+        use std::rc::Rc;
+
+        /// Stand-in for the embedder's on-disk store.
+        #[derive(Default)]
+        struct MemStore(RefCell<Map<String, String>>);
+        impl crate::KeyValueStore for MemStore {
+            fn get(&self, key: &str) -> Option<String> {
+                self.0.borrow().get(key).cloned()
+            }
+            fn set(&self, key: &str, value: &str) {
+                self.0.borrow_mut().insert(key.into(), value.into());
+            }
+            fn remove(&self, key: &str) {
+                self.0.borrow_mut().remove(key);
+            }
+            fn clear(&self) {
+                self.0.borrow_mut().clear();
+            }
+        }
+
+        let store = Rc::new(MemStore::default());
+        let page = "<html><body><script>\
+            console.log(localStorage.getItem('visits'));\
+            localStorage.setItem('visits', '1');\
+            localStorage.setItem('junk', 'x');\
+            localStorage.removeItem('junk');\
+            console.log(localStorage.getItem('junk'));\
+            </script></body></html>";
+
+        let doc = crate::Document::load_hosted(page, "", None, Some(store.clone()));
+        // First visit: nothing stored yet, and a removed key reads back as null.
+        assert_eq!(doc.console, vec!["null", "null"]);
+
+        // Same store, fresh document: the value written last time is still there.
+        let doc = crate::Document::load_hosted(page, "", None, Some(store.clone()));
+        assert_eq!(doc.console[0], "1");
+
+        // A different site gets a different store, so it sees nothing.
+        let other = Rc::new(MemStore::default());
+        let doc = crate::Document::load_hosted(page, "", None, Some(other));
+        assert_eq!(doc.console[0], "null");
+    }
+
+    #[test]
     fn script_can_set_a_field_value() {
         let mut doc = crate::Document::load(
             "<html><body><input id='q' value='old'>\
