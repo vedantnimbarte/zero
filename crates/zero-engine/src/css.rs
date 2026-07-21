@@ -693,7 +693,7 @@ impl Parser {
             self.consume_char();
             return Some(AttrTest { name, op: AttrOp::Exists, value: String::new() });
         }
-        let op = match self.next_char_or(' ') {
+        let op = match self.next_char_or('\0') {
             '=' => AttrOp::Equals,
             '~' => AttrOp::Includes,
             '^' => AttrOp::Prefix,
@@ -703,14 +703,14 @@ impl Parser {
         };
         self.consume_char();
         if op != AttrOp::Equals {
-            if self.next_char_or(' ') != '=' {
+            if self.next_char_or('\0') != '=' {
                 return None;
             }
             self.consume_char();
         }
         self.consume_whitespace();
         // The value may be quoted, and either quote is allowed.
-        let value = match self.next_char_or(' ') {
+        let value = match self.next_char_or('\0') {
             quote @ ('"' | '\'') => {
                 self.consume_char();
                 let value = self.consume_while(|c| c != quote);
