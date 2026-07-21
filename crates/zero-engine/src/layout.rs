@@ -130,6 +130,40 @@ impl<'a> LayoutBox<'a> {
         }
     }
 
+    /// True when this box is taken out of normal flow (`absolute` or `fixed`).
+    fn is_out_of_flow(&self) -> bool {
+        match self.box_type {
+            BoxType::AnonymousBlock => false,
+            _ => matches!(
+                self.get_style_node().value("position"),
+                Some(Value::Keyword(ref k)) if k == "absolute" || k == "fixed"
+            ),
+        }
+    }
+
+    /// Where an out-of-flow box's margin box should start, from `top`/`left`/
+    /// `right`/`bottom`. Requires the box to have been measured already, because
+    /// `right`/`bottom` depend on its own size.
+    fn positioned_origin(&self, containing_block: Dimensions) -> (f32, f32) {
+        let style = self.get_style_node();
+        let cb = containing_block.content;
+        let ctx_x = style.length_context(cb.width);
+        let ctx_y = style.length_context(cb.height);
+        let outer = self.dimensions.margin_box();
+
+        let x = match (style.value("left"), style.value("right")) {
+            (Some(left), _) => cb.x + left.resolve(ctx_x),
+            (None, Some(right)) => cb.x + cb.width - right.resolve(ctx_x) - outer.width,
+            _ => outer.x,
+        };
+        let y = match (style.value("top"), style.value("bottom")) {
+            (Some(top), _) => cb.y + top.resolve(ctx_y),
+            (None, Some(bottom)) => cb.y + cb.height - bottom.resolve(ctx_y) - outer.height,
+            _ => outer.y,
+        };
+        (x, y)
+    }
+
     fn layout(&mut self, containing_block: Dimensions, fonts: Option<&FontSet>, images: &ImageMap) {
         match self.box_type {
             BoxType::BlockNode(_) => self.layout_block(containing_block, fonts, images),
@@ -154,6 +188,28 @@ impl<'a> LayoutBox<'a> {
         if let Some((w, h)) = self.resolved_image_size(images) {
             self.dimensions.content.width = w;
             self.dimensions.content.height = h;
+        }
+        // Positioned children resolve against this box's *final* size, so they run
+        // last — `bottom`/`right` are meaningless until the height/width are known.
+        self.layout_positioned_children(fonts, images);
+    }
+
+    fn layout_positioned_children(&mut self, fonts: Option<&FontSet>, images: &ImageMap) {
+        let container = self.dimensions;
+        for child in &mut self.children {
+            if !child.is_out_of_flow() {
+                continue;
+            }
+            // Pass 1 measures the box so `right`/`bottom` can be resolved.
+            child.layout(container, fonts, images);
+            let (x, y) = child.positioned_origin(container);
+            // Pass 2 lays the whole subtree out at its final origin, so descendants
+            // and text land in the right place instead of being moved afterwards.
+            let mut slot = container;
+            slot.content.x = x;
+            slot.content.y = y;
+            slot.content.height = 0.0;
+            child.layout(slot, fonts, images);
         }
     }
 
@@ -261,6 +317,9 @@ impl<'a> LayoutBox<'a> {
     }
 
     fn calculate_block_width(&mut self, containing_block: Dimensions) {
+        // An out-of-flow box is placed explicitly, so it must not absorb the
+        // container's leftover space into its margins the way in-flow blocks do.
+        let out_of_flow = self.is_out_of_flow();
         let style = self.get_style_node();
         let auto = Value::Keyword("auto".to_string());
         let zero = Value::Length(0.0, Unit::Px);
@@ -295,9 +354,11 @@ impl<'a> LayoutBox<'a> {
 
         let underflow = containing_block.content.width - total;
         match (width == auto, margin_left == auto, margin_right == auto) {
-            // Over-constrained: adjust the right margin.
+            // Over-constrained: adjust the right margin (in-flow boxes only).
             (false, false, false) => {
-                margin_right = Value::Length(margin_right.resolve(ctx) + underflow, Unit::Px);
+                if !out_of_flow {
+                    margin_right = Value::Length(margin_right.resolve(ctx) + underflow, Unit::Px);
+                }
             }
             (false, false, true) => margin_right = Value::Length(underflow, Unit::Px),
             (false, true, false) => margin_left = Value::Length(underflow, Unit::Px),
@@ -369,6 +430,9 @@ impl<'a> LayoutBox<'a> {
         let count = self.children.len();
         let d = &mut self.dimensions;
         for (i, child) in self.children.iter_mut().enumerate() {
+            if child.is_out_of_flow() {
+                continue; // positioned later, once the container's size is final
+            }
             child.layout(*d, fonts, images);
             // Grow this box to contain each child's margin box.
             d.content.height += child.dimensions.margin_box().height;
@@ -437,6 +501,9 @@ impl<'a> LayoutBox<'a> {
         let mut cursor_x = container.x;
         let mut tallest = 0.0_f32;
         for (i, child) in self.children.iter_mut().enumerate() {
+            if child.is_out_of_flow() {
+                continue; // positioned later, once the container's size is final
+            }
             let mut width = items[i].base;
             if leftover > 0.0 && total_grow > 0.0 {
                 width += leftover * items[i].grow / total_grow;
@@ -736,6 +803,33 @@ mod tests {
         assert_eq!(xs, vec![0.0, 300.0, 500.0]);
         let ys: Vec<f32> = laid.children.iter().map(|c| c.dimensions.content.y).collect();
         assert_eq!(ys, vec![0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn absolute_child_positions_from_right_and_bottom() {
+        let node = dom::elem("div".into(), HashMap::new(), vec![]);
+        let mut child_values = HashMap::new();
+        child_values.insert("display".to_string(), Value::Keyword("block".into()));
+        child_values.insert("position".to_string(), Value::Keyword("absolute".into()));
+        child_values.insert("width".to_string(), Value::Length(100.0, Unit::Px));
+        child_values.insert("height".to_string(), Value::Length(40.0, Unit::Px));
+        child_values.insert("right".to_string(), Value::Length(20.0, Unit::Px));
+        child_values.insert("bottom".to_string(), Value::Length(10.0, Unit::Px));
+        let child = StyledNode { node: &node, specified_values: child_values, children: vec![] };
+
+        let mut root_values = HashMap::new();
+        root_values.insert("display".to_string(), Value::Keyword("block".into()));
+        root_values.insert("height".to_string(), Value::Length(200.0, Unit::Px));
+        let root =
+            StyledNode { node: &node, specified_values: root_values, children: vec![child] };
+
+        let mut viewport: Dimensions = Default::default();
+        viewport.content.width = 900.0;
+        let laid = layout_tree(&root, viewport, None, &ImageMap::new());
+
+        let placed = laid.children[0].dimensions.margin_box();
+        assert_eq!(placed.x, 900.0 - 20.0 - 100.0); // right edge is 20 from the container's
+        assert_eq!(placed.y, 200.0 - 10.0 - 40.0); // bottom edge is 10 from the container's
     }
 
     #[test]
