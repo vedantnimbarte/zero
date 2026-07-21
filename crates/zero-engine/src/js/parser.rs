@@ -1,8 +1,8 @@
 //! JavaScript parser: tokens -> AST, via recursive descent with precedence climbing.
 //!
-//! ponytail: supports declarations, assignment, calls, member access, if/while/for,
-//! and functions. No objects/array literals, classes, `new`, closures-by-capture,
-//! try/catch, or destructuring yet.
+//! ponytail: supports declarations, assignment, calls, member/index access, object
+//! and array literals, if/while/for, and function declarations/expressions. No
+//! arrow functions, classes, `new`, try/catch, or destructuring yet.
 
 use super::lexer::{Kw, Tok};
 
@@ -19,6 +19,11 @@ pub enum Expr {
     Assign { target: Box<Expr>, value: Box<Expr> },
     Call { callee: Box<Expr>, args: Vec<Expr> },
     Member { object: Box<Expr>, property: String },
+    Index { object: Box<Expr>, index: Box<Expr> },
+    ObjectLit(Vec<(String, Expr)>),
+    ArrayLit(Vec<Expr>),
+    /// A function expression, which captures the scope it was created in.
+    Func { params: Vec<String>, body: Vec<Stmt> },
 }
 
 #[derive(Debug, Clone)]
@@ -278,6 +283,10 @@ impl Parser {
             if self.eat_op(".") {
                 let property = self.expect_ident()?;
                 expr = Expr::Member { object: Box::new(expr), property };
+            } else if self.eat_op("[") {
+                let index = self.parse_expr()?;
+                self.expect_op("]")?;
+                expr = Expr::Index { object: Box::new(expr), index: Box::new(index) };
             } else if self.eat_op("(") {
                 let mut args = Vec::new();
                 while !self.eat_op(")") {
@@ -317,6 +326,38 @@ impl Parser {
                 self.expect_op(")")?;
                 Ok(e)
             }
+            Tok::Op(op) if op == "[" => {
+                let mut items = Vec::new();
+                while !self.eat_op("]") {
+                    items.push(self.parse_expr()?);
+                    self.eat_op(",");
+                }
+                Ok(Expr::ArrayLit(items))
+            }
+            // In expression position `{` is an object literal; statements handle blocks.
+            Tok::Op(op) if op == "{" => {
+                let mut props = Vec::new();
+                while !self.eat_op("}") {
+                    let key = match self.next() {
+                        Tok::Ident(k) => k,
+                        Tok::Str(k) => k,
+                        Tok::Num(n) => n.to_string(),
+                        other => return Err(format!("bad object key {other:?}")),
+                    };
+                    self.expect_op(":")?;
+                    props.push((key, self.parse_expr()?));
+                    self.eat_op(",");
+                }
+                Ok(Expr::ObjectLit(props))
+            }
+            Tok::Kw(Kw::Function) => {
+                if matches!(self.peek(), Tok::Ident(_)) {
+                    self.pos += 1; // optional name on a function expression
+                }
+                let params = self.parse_params()?;
+                let body = self.parse_block_body()?;
+                Ok(Expr::Func { params, body })
+            }
             other => Err(format!("unexpected token {other:?}")),
         }
     }
@@ -338,6 +379,15 @@ mod tests {
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_literals_and_indexing() {
+        let ast = parse(tokenize("var a = [1, 2]; var o = {x: 1}; a[0]; o.x;").unwrap()).unwrap();
+        assert!(matches!(ast[0], Stmt::VarDecl { init: Some(Expr::ArrayLit(_)), .. }));
+        assert!(matches!(ast[1], Stmt::VarDecl { init: Some(Expr::ObjectLit(_)), .. }));
+        assert!(matches!(ast[2], Stmt::ExprStmt(Expr::Index { .. })));
+        assert!(matches!(ast[3], Stmt::ExprStmt(Expr::Member { .. })));
     }
 
     #[test]
