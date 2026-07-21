@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html><head><style>
+body { background: #0e0f12; color: #f2f3f5; padding: 26px; font-size: 15px; }
+h1 { color: #e5484d; font-size: 26px; }
+h2 { color: #9a9da6; font-size: 13px; }
+table { border-spacing: 2px; }
+th { background: #23262e; color: #f2f3f5; padding: 10px; }
+td { background: #17181c; padding: 10px; }
+.num { background: #1d2a22; color: #7ee2b0; padding: 10px; }
+</style></head><body>
+<h1>Tables</h1>
+<h2>Columns align across rows; rows take their tallest cell</h2>
+<table>
+  <thead>
+    <tr><th>Browser</th><th>Engine</th><th>Language</th><th>Share</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Chrome</td><td>Blink</td><td>C++</td><td class="num">63%</td></tr>
+    <tr><td>Safari</td><td>WebKit</td><td>C++</td><td class="num">17%</td></tr>
+    <tr><td>Firefox</td><td>Gecko</td><td>C++ and Rust</td><td class="num">4%</td></tr>
+    <tr><td>Zero</td><td>Zero engine, written from scratch for this project</td><td>Rust</td><td class="num">0%</td></tr>
+  </tbody>
+</table>
+</body></html>
