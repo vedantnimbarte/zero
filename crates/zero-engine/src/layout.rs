@@ -1677,9 +1677,28 @@ fn build_layout_tree<'a>(style_node: &'a StyledNode<'a>) -> LayoutBox<'a> {
     build_box(style_node, false)
 }
 
+/// Does this node have a block-level child? Inline-block does not count: it is
+/// inline-level and sits happily in a line.
+fn contains_block(style_node: &StyledNode) -> bool {
+    style_node.children.iter().any(|child| {
+        matches!(
+            child.display(),
+            Display::Block | Display::Flex | Display::Grid | Display::Table
+        )
+    })
+}
+
 /// `force_block` blockifies a node because its parent is a flex container —
 /// flex items are always block-level, whatever their own `display` says.
 fn build_box<'a>(style_node: &'a StyledNode<'a>, force_block: bool) -> LayoutBox<'a> {
+    // An inline element holding block-level children cannot lay out as a line of
+    // text — doing so flattens whole tables into a run of words. CSS splits the
+    // inline around its block children; treating the parent as a block keeps the
+    // children's structure, which is the part that matters.
+    //
+    // ponytail: no anonymous block splitting, so text before and after a block
+    // child becomes its own block line instead of continuing the same line.
+    let force_block = force_block || contains_block(style_node);
     let display = style_node.display();
     let mut root = LayoutBox::new(match display {
         Display::Block | Display::Flex | Display::Grid | Display::Table => {
