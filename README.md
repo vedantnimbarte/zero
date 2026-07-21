@@ -64,7 +64,7 @@ correctly, including their own stylesheets, tables and forms.
   named colours, `rgb()`/`hsl()`, alpha
 - **Layout**: block, inline, inline-block, flex (wrap/grow/justify/align), grid
   (`repeat()`, `fr`, `minmax()`, spans, named areas), tables (colspan/rowspan),
-  out-of-flow positioning, intrinsic sizing, `text-align`
+  out-of-flow positioning, intrinsic sizing, `text-align`, `white-space: pre`
 - **Text**: shaping via HarfBuzz with a font fallback chain — Latin, Indic
   (Devanagari, Tamil, Telugu, Bengali and more) and CJK
 - **JavaScript**: own lexer, parser and interpreter — closures, classes with
