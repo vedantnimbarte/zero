@@ -708,9 +708,60 @@ fn collect_linked_css(node: &Node, loader: &dyn ResourceLoader, out: &mut String
     for bytes in loader.load_all(&hrefs).into_iter().flatten() {
         if let Ok(text) = String::from_utf8(bytes) {
             out.push('\n');
-            out.push_str(&text);
+            expand_imports(&text, loader, out, 0);
         }
     }
+}
+
+/// Append a sheet, with anything it `@import`s placed ahead of it.
+///
+/// An `@import` sits at the top of a sheet and its rules cascade *before* the
+/// importing sheet's own, so order matters here.
+///
+/// ponytail: relative URLs resolve against the page, not the importing sheet,
+/// because the engine never learns a sheet's own URL. Absolute and root-relative
+/// imports (the common case) are right; a relative one simply fails to load.
+fn expand_imports(text: &str, loader: &dyn ResourceLoader, out: &mut String, depth: usize) {
+    const MAX_DEPTH: usize = 4; // a sheet importing itself must not spin forever
+    let urls = import_urls(text);
+    if depth < MAX_DEPTH && !urls.is_empty() {
+        for bytes in loader.load_all(&urls).into_iter().flatten() {
+            if let Ok(imported) = String::from_utf8(bytes) {
+                expand_imports(&imported, loader, out, depth + 1);
+                out.push('\n');
+            }
+        }
+    }
+    out.push_str(text);
+}
+
+/// URLs from `@import "a.css";` and `@import url(a.css) screen;`.
+fn import_urls(text: &str) -> Vec<String> {
+    let mut urls = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("@import") {
+        rest = &rest[start + "@import".len()..];
+        // The statement ends at the first `;`, and media conditions may follow.
+        let Some(end) = rest.find(';') else { break };
+        let (statement, tail) = rest.split_at(end);
+        rest = tail;
+        let statement = statement.trim();
+        // `url(...)` is optional around the URL, and media conditions may follow
+        // it — so a quoted URL ends at its closing quote, not at the statement.
+        let inner = match statement.strip_prefix("url(") {
+            Some(after) => after.split(')').next().unwrap_or("").trim(),
+            None => statement,
+        };
+        let url = match inner.chars().next() {
+            Some(quote @ ('"' | '\'')) => inner[1..].split(quote).next().unwrap_or(""),
+            _ => inner.split_whitespace().next().unwrap_or(""),
+        }
+        .trim();
+        if !url.is_empty() && !url.starts_with("data:") {
+            urls.push(url.to_string());
+        }
+    }
+    urls
 }
 
 fn collect_stylesheet_hrefs(node: &Node, out: &mut Vec<String>) {
@@ -1023,6 +1074,41 @@ mod tests {
 
         let field = first_input(&doc);
         assert_eq!(doc.submit(field).unwrap().query, "q=x&region=in");
+    }
+
+    #[test]
+    fn import_statements_are_found_in_every_spelling() {
+        let urls = super::import_urls(
+            "@import \"base.css\";
+             @import url(theme.css);
+             @import url('print.css') print;
+             @import   \"/abs/spaced.css\"  screen and (min-width: 40em);
+             .rule { color: red }",
+        );
+        assert_eq!(urls, ["base.css", "theme.css", "print.css", "/abs/spaced.css"]);
+        // Nothing to import, and a data: sheet is not worth a fetch.
+        assert!(super::import_urls("body { color: red }").is_empty());
+        assert!(super::import_urls("@import url(data:text/css,body{});").is_empty());
+    }
+
+    /// Imported rules must cascade before the importing sheet's own.
+    #[test]
+    fn imports_are_placed_ahead_of_the_sheet_that_asked_for_them() {
+        struct Sheets;
+        impl super::ResourceLoader for Sheets {
+            fn load(&self, url: &str) -> Option<Vec<u8>> {
+                match url {
+                    "base.css" => Some(b"p { color: #ff0000 }".to_vec()),
+                    _ => None,
+                }
+            }
+        }
+        let mut out = String::new();
+        super::expand_imports("@import \"base.css\";
+p { color: #0000ff }", &Sheets, &mut out, 0);
+        let base = out.find("#ff0000").expect("imported rule");
+        let own = out.find("#0000ff").expect("the sheet's own rule");
+        assert!(base < own, "the import must come first: {out:?}");
     }
 
     #[test]

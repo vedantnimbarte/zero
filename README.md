@@ -56,7 +56,7 @@ The engine renders real sites — Hacker News and DuckDuckGo results render clos
 correctly, including their own stylesheets, tables and forms.
 
 - **HTML**: tolerant parser, character references, raw-text and void elements
-- **CSS**: external `<link>` sheets, `@media` (type + width), descendant/child
+- **CSS**: external `<link>` sheets and `@import`, `@media` (type + width), descendant/child
   selectors, custom properties (`var()`, defined on `:root`), the cascade with
   specificity, HTML presentation attributes (`bgcolor`, `width`, `align`),
   named colours, `rgb()`/`hsl()`, alpha
@@ -74,7 +74,7 @@ correctly, including their own stylesheets, tables and forms.
   Windows; macOS and Linux backends are still to come)
 
 **Known limits.** Pseudo-classes other than `:root` (so `:hover`), attribute
-selectors and `@import` are skipped — a rule using one is dropped rather than
+selectors are skipped — a rule using one is dropped rather than
 misapplied. Wikipedia's skin renders its columns correctly at
 wide window sizes but still overlaps its floating tools rail. Layout and paint are
 single-threaded, and a page is painted in full rather than by viewport.
