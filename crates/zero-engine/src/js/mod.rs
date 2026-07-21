@@ -61,6 +61,51 @@ mod tests {
     }
 
     #[test]
+    fn closures_capture_their_defining_scope() {
+        let out = run(
+            "function counter() {
+                 var n = 0;
+                 return function() { n = n + 1; return n; };
+             }
+             var next = counter();
+             next(); next();
+             console.log(next());
+             var other = counter();
+             console.log(other());",
+        );
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        // Each counter keeps its own captured `n`.
+        assert_eq!(out.console, vec!["3", "1"]);
+    }
+
+    #[test]
+    fn objects_and_arrays() {
+        let out = run(
+            "var user = { name: 'Zero', tags: ['fast', 'private'] };
+             user.tags.push('indian');
+             user.year = 2026;
+             var nums = [1, 2, 3];
+             nums[1] = 20;
+             console.log(user.name + ' ' + user.year);
+             console.log(user.tags.join('/'));
+             console.log(nums[1] + nums.length);",
+        );
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(out.console, vec!["Zero 2026", "fast/private/indian", "23"]);
+    }
+
+    #[test]
+    fn functions_are_values() {
+        let out = run(
+            "function apply(f, v) { return f(v); }
+             var double = function(x) { return x * 2; };
+             console.log(apply(double, 21));",
+        );
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(out.console, vec!["42"]);
+    }
+
+    #[test]
     fn document_write_is_captured() {
         let out = run("document.write('<p>hi</p>');");
         assert_eq!(out.writes, "<p>hi</p>");

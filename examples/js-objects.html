@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <style>
+        body { background: #0e0f12; color: #f2f3f5; padding: 32px; font-size: 17px; }
+        h1 { color: #e5484d; font-size: 30px; }
+        .row { background: #17181c; width: 620px; padding: 14px; }
+        .out { background: #30a46c; color: #0e0f12; width: 620px; padding: 14px; }
+    </style>
+</head>
+<body>
+    <h1>Closures, objects, arrays</h1>
+    <div id="app" class="row">replaced below</div>
+    <script>
+        var browser = {
+            name: "Zero",
+            engine: "from scratch",
+            pillars: ["privacy", "performance", "AI", "India-first"]
+        };
+
+        function makeCounter() {
+            var n = 0;
+            return function () { n = n + 1; return n; };
+        }
+        var tick = makeCounter();
+        tick(); tick(); tick();
+
+        function map(list, f) {
+            var out = [];
+            for (var i = 0; i < list.length; i++) { out.push(f(list[i])); }
+            return out;
+        }
+        var shouted = map(browser.pillars, function (p) { return p.toUpperCase(); });
+
+        document.getElementById('app').textContent =
+            browser.name + " (" + browser.engine + ") - closure counter = " + tick();
+        document.write('<div class="out">' + shouted.join(" | ") + '</div>');
+        document.write('<div class="row">pillars: ' + browser.pillars.length + '</div>');
+    </script>
+</body>
+</html>
