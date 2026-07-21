@@ -10,7 +10,6 @@
 //! widened to a registry suffix like `co.uk`.
 
 use std::collections::HashMap;
-use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -90,10 +89,6 @@ impl CookieJar {
         } else {
             Some(pairs.join("; "))
         }
-    }
-
-    pub fn len(&self) -> usize {
-        self.partitions.values().map(Vec::len).sum()
     }
 
     /// Persist non-session cookies as tab-separated lines.

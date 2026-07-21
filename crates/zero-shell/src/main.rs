@@ -30,6 +30,11 @@ use std::fs;
 use zero_engine::Engine;
 
 fn main() {
+    // Say so when profile data is not encrypted, rather than leaving the user to
+    // assume it is — see crypto's note on which platforms have a backend.
+    if !crypto::is_available() {
+        eprintln!("note: no data-protection backend on this platform; profile data is stored in the clear");
+    }
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(|a| a == "--history").unwrap_or(false) {
         for visit in storage::load_history() {
