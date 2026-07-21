@@ -1,7 +1,17 @@
-//! The windowed browser app: window, input, navigation, and compositing.
+//! The windowed browser app: window, input, tabs, navigation, and compositing.
 //!
-//! The toolbar is itself rendered *by the engine* (as a tiny HTML doc) and
-//! composited above the page, so the shell needs no text-drawing code of its own.
+//! The chrome (vertical tab sidebar + toolbar) is itself rendered *by the engine*
+//! as tiny HTML documents and composited around the page, so the shell needs no
+//! text-drawing or widget code of its own.
+//!
+//! Window regions:
+//! ```text
+//!   +----------+---------------------------+
+//!   | sidebar  |         toolbar           |
+//!   | (tabs)   +---------------------------+
+//!   |          |          page             |
+//!   +----------+---------------------------+
+//! ```
 
 use crate::net::{load_target, normalize_target, resolve_url, ShellLoader};
 use std::num::NonZeroU32;
@@ -14,28 +24,90 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 use zero_engine::Engine;
 
+const SIDEBAR_W: u32 = 220;
+const SIDEBAR_HEAD_H: u32 = 44; // header row height, so tab hit-testing is exact
+const TAB_ROW_H: u32 = 40; // padding(10*2) + height(20)
 const TOOLBAR_H: u32 = 48;
+
 const TOOLBAR_CSS: &str =
     "body{background:#1f2127;color:#f2f3f5;font-size:16px;} #bar{padding:14px;height:20px;}";
+
+const NEW_TAB_HTML: &str = "<html><head><style>\
+    body{background:#0e0f12;color:#f2f3f5;padding:48px;font-size:18px;}\
+    h1{color:#e5484d;font-size:40px;}\
+    </style></head><body><h1>Zero</h1>\
+    <p>Type a URL above and press Enter.</p></body></html>";
+
+fn escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+/// A short label for a tab: the host for URLs, the file name for paths.
+fn tab_title(address: &str) -> String {
+    if address.is_empty() {
+        return "New Tab".to_string();
+    }
+    let title = match address.split("://").nth(1) {
+        Some(rest) => rest.split('/').next().unwrap_or(rest).to_string(),
+        None => std::path::Path::new(address)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| address.to_string()),
+    };
+    if title.chars().count() > 22 {
+        title.chars().take(21).collect::<String>() + "..."
+    } else {
+        title
+    }
+}
+
+/// Everything that belongs to one tab, including its own history and render cache.
+struct Tab {
+    address: String,
+    page_html: String,
+    page_css: String,
+    history: Vec<String>,
+    history_index: usize,
+    scroll_y: f32,
+    secure: bool,
+    blocked_count: usize,
+    page_canvas: Option<zero_engine::Canvas>,
+    links: Vec<zero_engine::LinkArea>,
+    cache_w: u32,
+    cache_h: u32,
+}
+
+impl Tab {
+    fn new(address: String, html: String, css: String) -> Tab {
+        Tab {
+            history: vec![address.clone()],
+            address,
+            page_html: html,
+            page_css: css,
+            history_index: 0,
+            scroll_y: 0.0,
+            secure: true,
+            blocked_count: 0,
+            page_canvas: None,
+            links: Vec::new(),
+            cache_w: 0,
+            cache_h: 0,
+        }
+    }
+
+    fn blank() -> Tab {
+        Tab::new(String::new(), NEW_TAB_HTML.to_string(), String::new())
+    }
+}
 
 pub fn run_window(engine: Engine, html: String, css: String, address: String) {
     let event_loop = EventLoop::new().expect("failed to create event loop");
     let mut app = App {
         engine,
-        page_html: html,
-        page_css: css,
-        address: address.clone(),
-        scroll_y: 0.0,
-        history: vec![address],
-        history_index: 0,
+        tabs: vec![Tab::new(address, html, css)],
+        active: 0,
         modifiers: ModifiersState::default(),
-        page_canvas: None,
-        links: Vec::new(),
         cursor: (0.0, 0.0),
-        blocked_count: 0,
-        secure: true,
-        cache_w: 0,
-        cache_h: 0,
         window: None,
         surface: None,
     };
@@ -44,21 +116,10 @@ pub fn run_window(engine: Engine, html: String, css: String, address: String) {
 
 struct App {
     engine: Engine,
-    page_html: String,
-    page_css: String,
-    address: String,
-    scroll_y: f32,
-    history: Vec<String>,
-    history_index: usize,
+    tabs: Vec<Tab>,
+    active: usize,
     modifiers: ModifiersState,
-    // Cached full-height page render; re-rendered only on navigate/resize, not per scroll frame.
-    page_canvas: Option<zero_engine::Canvas>,
-    links: Vec<zero_engine::LinkArea>,
     cursor: (f32, f32),
-    blocked_count: usize,
-    secure: bool,
-    cache_w: u32,
-    cache_h: u32,
     window: Option<Rc<Window>>,
     surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
 }
@@ -67,7 +128,7 @@ impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let attrs = Window::default_attributes()
             .with_title("Zero Browser")
-            .with_inner_size(LogicalSize::new(800.0, 600.0));
+            .with_inner_size(LogicalSize::new(1100.0, 720.0));
         let window = Rc::new(event_loop.create_window(attrs).expect("failed to create window"));
         let context = softbuffer::Context::new(window.clone()).expect("softbuffer context");
         let surface =
@@ -91,7 +152,8 @@ impl ApplicationHandler for App {
                     MouseScrollDelta::LineDelta(_, y) => y * 48.0,
                     MouseScrollDelta::PixelDelta(pos) => pos.y as f32,
                 };
-                self.scroll_y = (self.scroll_y - dy).max(0.0); // clamped to content in redraw
+                let tab = self.tab_mut();
+                tab.scroll_y = (tab.scroll_y - dy).max(0.0); // clamped to content in redraw
                 self.request_redraw();
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -113,117 +175,206 @@ impl ApplicationHandler for App {
 }
 
 impl App {
+    fn tab(&self) -> &Tab {
+        &self.tabs[self.active]
+    }
+
+    fn tab_mut(&mut self) -> &mut Tab {
+        &mut self.tabs[self.active]
+    }
+
     fn request_redraw(&self) {
         if let Some(window) = &self.window {
             window.request_redraw();
         }
     }
 
+    // --- tab management ---
+
+    fn new_tab(&mut self) {
+        self.tabs.push(Tab::blank());
+        self.active = self.tabs.len() - 1;
+    }
+
+    fn close_tab(&mut self) {
+        self.tabs.remove(self.active);
+        if self.tabs.is_empty() {
+            self.tabs.push(Tab::blank()); // always keep one tab open
+        }
+        self.active = self.active.min(self.tabs.len() - 1);
+    }
+
+    fn next_tab(&mut self) {
+        self.active = (self.active + 1) % self.tabs.len();
+    }
+
+    // --- input ---
+
     fn handle_key(&mut self, event: KeyEvent) {
+        let ctrl = self.modifiers.control_key();
         match event.logical_key {
+            Key::Character(ref c) if ctrl => match c.as_str() {
+                "t" => self.new_tab(),
+                "w" => self.close_tab(),
+                _ => {}
+            },
+            Key::Named(NamedKey::Tab) if ctrl => self.next_tab(),
             Key::Named(NamedKey::ArrowLeft) if self.modifiers.alt_key() => self.back(),
             Key::Named(NamedKey::ArrowRight) if self.modifiers.alt_key() => self.forward(),
             Key::Named(NamedKey::Enter) => self.navigate(),
             Key::Named(NamedKey::Backspace) => {
-                self.address.pop();
+                self.tab_mut().address.pop();
             }
-            Key::Named(NamedKey::ArrowDown) => self.scroll_y += 48.0,
-            Key::Named(NamedKey::ArrowUp) => self.scroll_y = (self.scroll_y - 48.0).max(0.0),
-            Key::Named(NamedKey::PageDown) => self.scroll_y += 400.0,
-            Key::Named(NamedKey::PageUp) => self.scroll_y = (self.scroll_y - 400.0).max(0.0),
-            Key::Named(NamedKey::Home) => self.scroll_y = 0.0,
+            Key::Named(NamedKey::ArrowDown) => self.tab_mut().scroll_y += 48.0,
+            Key::Named(NamedKey::ArrowUp) => {
+                let t = self.tab_mut();
+                t.scroll_y = (t.scroll_y - 48.0).max(0.0);
+            }
+            Key::Named(NamedKey::PageDown) => self.tab_mut().scroll_y += 400.0,
+            Key::Named(NamedKey::PageUp) => {
+                let t = self.tab_mut();
+                t.scroll_y = (t.scroll_y - 400.0).max(0.0);
+            }
+            Key::Named(NamedKey::Home) => self.tab_mut().scroll_y = 0.0,
             _ => {
                 if let Some(text) = &event.text {
-                    for c in text.chars() {
-                        if !c.is_control() {
-                            self.address.push(c);
-                        }
-                    }
+                    let chars: Vec<char> = text.chars().filter(|c| !c.is_control()).collect();
+                    self.tab_mut().address.extend(chars);
                 }
             }
         }
     }
 
-    /// Hit-test the last click against the page's link rects and navigate if one matches.
+    /// Route a click: sidebar switches tabs, page follows links, toolbar is inert.
     fn handle_click(&mut self) {
         let (cx, cy) = self.cursor;
-        let tb = TOOLBAR_H as f32;
-        if cy < tb {
-            return; // clicks in the toolbar don't navigate
+
+        if cx < SIDEBAR_W as f32 {
+            if cy >= SIDEBAR_HEAD_H as f32 {
+                let row = ((cy - SIDEBAR_HEAD_H as f32) / TAB_ROW_H as f32) as usize;
+                if row < self.tabs.len() {
+                    self.active = row;
+                }
+            }
+            return;
         }
-        // Window coords -> page coords (undo toolbar offset, add scroll).
-        let (px, py) = (cx, cy - tb + self.scroll_y);
+        if cy < TOOLBAR_H as f32 {
+            return; // toolbar clicks don't navigate
+        }
+
+        // Window coords -> page coords (undo chrome offsets, add scroll).
+        let px = cx - SIDEBAR_W as f32;
+        let py = cy - TOOLBAR_H as f32 + self.tab().scroll_y;
         let href = self
+            .tab()
             .links
             .iter()
             .find(|l| px >= l.x && px <= l.x + l.width && py >= l.y && py <= l.y + l.height)
             .map(|l| l.href.clone());
         if let Some(href) = href {
-            let target = resolve_url(&self.address, &href);
+            let target = resolve_url(&self.tab().address, &href);
             self.go_to(target);
             self.request_redraw();
         }
     }
 
-    /// Navigate to a target typed in the address bar (pushes onto history).
+    // --- navigation (per tab) ---
+
     fn navigate(&mut self) {
-        let target = normalize_target(&self.address);
+        let target = normalize_target(&self.tab().address);
         self.go_to(target);
     }
 
-    /// Navigate to a new target and record it in history (dropping any forward entries).
     fn go_to(&mut self, target: String) {
-        self.history.truncate(self.history_index + 1);
-        if self.history.last() != Some(&target) {
-            self.history.push(target.clone());
-            self.history_index = self.history.len() - 1;
+        {
+            let tab = self.tab_mut();
+            tab.history.truncate(tab.history_index + 1);
+            if tab.history.last() != Some(&target) {
+                tab.history.push(target.clone());
+                tab.history_index = tab.history.len() - 1;
+            }
         }
         self.load(target);
     }
 
     fn back(&mut self) {
-        if self.history_index > 0 {
-            self.history_index -= 1;
-            self.load(self.history[self.history_index].clone());
-        }
+        let target = {
+            let tab = self.tab_mut();
+            if tab.history_index == 0 {
+                return;
+            }
+            tab.history_index -= 1;
+            tab.history[tab.history_index].clone()
+        };
+        self.load(target);
     }
 
     fn forward(&mut self) {
-        if self.history_index + 1 < self.history.len() {
-            self.history_index += 1;
-            self.load(self.history[self.history_index].clone());
-        }
+        let target = {
+            let tab = self.tab_mut();
+            if tab.history_index + 1 >= tab.history.len() {
+                return;
+            }
+            tab.history_index += 1;
+            tab.history[tab.history_index].clone()
+        };
+        self.load(target);
     }
 
-    /// Load a target into the page without touching history.
+    /// Load a target into the active tab without touching history.
     fn load(&mut self, target: String) {
         let fetched = load_target(&target);
+        let tab = self.tab_mut();
         // An HTTPS upgrade can change the URL, so adopt whatever actually loaded.
-        self.address = fetched.url.clone();
-        self.page_html = fetched.body;
-        self.secure = fetched.secure;
-        self.page_css = String::new(); // rely on the page's own <style>
-        self.scroll_y = 0.0;
-        self.page_canvas = None; // force re-render of the new page
+        tab.address = fetched.url;
+        tab.page_html = fetched.body;
+        tab.secure = fetched.secure;
+        tab.page_css = String::new(); // rely on the page's own <style>
+        tab.scroll_y = 0.0;
+        tab.page_canvas = None; // force re-render of the new page
+        let title = tab.address.clone();
         if let Some(window) = &self.window {
-            window.set_title(&format!("Zero Browser — {}", self.address));
+            window.set_title(&format!("Zero Browser — {title}"));
         }
     }
 
-    /// A blinking-free cursor: just show the caret at the end of the address.
+    // --- chrome, rendered by the engine ---
+
     fn toolbar_html(&self) -> String {
-        let safe = self
-            .address
-            .replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;");
-        let lock = if self.secure { "" } else { "Not secure  .  " };
-        let shield = if self.blocked_count > 0 {
-            format!("     .     {} trackers blocked", self.blocked_count)
+        let tab = self.tab();
+        let lock = if tab.secure { "" } else { "Not secure  .  " };
+        let shield = if tab.blocked_count > 0 {
+            format!("     .     {} trackers blocked", tab.blocked_count)
         } else {
             String::new()
         };
-        format!("<html><body><div id=\"bar\">{lock}{safe}|{shield}</div></body></html>")
+        format!(
+            "<html><body><div id=\"bar\">{lock}{}|{shield}</div></body></html>",
+            escape(&tab.address)
+        )
+    }
+
+    fn sidebar_html(&self) -> String {
+        let rows: String = self
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let class = if i == self.active { "tab active" } else { "tab" };
+                format!("<div class=\"{class}\">{}</div>", escape(&tab_title(&t.address)))
+            })
+            .collect();
+        format!("<html><body><div id=\"head\">ZERO</div>{rows}</body></html>")
+    }
+
+    /// Height is injected so the sidebar background fills the window.
+    fn sidebar_css(height: u32) -> String {
+        format!(
+            "body{{background:#141519;color:#c9ccd3;font-size:14px;height:{height}px;}} \
+             #head{{color:#6b7280;padding:12px;height:20px;}} \
+             .tab{{padding:10px;height:20px;}} \
+             .active{{background:#26282f;color:#ffffff;}}"
+        )
     }
 
     fn redraw(&mut self) {
@@ -234,37 +385,46 @@ impl App {
             }
             None => return,
         };
+        let sw = SIDEBAR_W.min(w);
+        let content_w = w.saturating_sub(sw).max(1);
         let tb = TOOLBAR_H.min(h);
         let page_vh = h.saturating_sub(tb).max(1);
 
-        // Re-render the page only when the page or the layout size changed; scrolling
-        // just re-blits the cached (full-height) canvas.
-        if self.page_canvas.is_none() || self.cache_w != w || self.cache_h != page_vh {
-            let loader = ShellLoader::new(self.address.clone());
-            let page = self.engine.render_page(
-                &self.page_html,
-                &self.page_css,
-                w as f32,
-                page_vh as f32,
-                &loader,
-            );
-            self.blocked_count = loader.blocked.get();
-            self.page_canvas = Some(page.canvas);
-            self.links = page.links;
-            self.cache_w = w;
-            self.cache_h = page_vh;
+        // Re-render the active tab only when its page or layout size changed;
+        // scrolling and tab switching just re-blit cached canvases.
+        {
+            let engine = &self.engine;
+            let tab = &mut self.tabs[self.active];
+            if tab.page_canvas.is_none() || tab.cache_w != content_w || tab.cache_h != page_vh {
+                let loader = ShellLoader::new(tab.address.clone());
+                let page = engine.render_page(
+                    &tab.page_html,
+                    &tab.page_css,
+                    content_w as f32,
+                    page_vh as f32,
+                    &loader,
+                );
+                tab.blocked_count = loader.blocked.get();
+                tab.page_canvas = Some(page.canvas);
+                tab.links = page.links;
+                tab.cache_w = content_w;
+                tab.cache_h = page_vh;
+            }
+            // Clamp scroll to available overflow.
+            let page_height = tab.page_canvas.as_ref().unwrap().height;
+            let max_scroll = page_height.saturating_sub(page_vh as usize) as f32;
+            tab.scroll_y = tab.scroll_y.clamp(0.0, max_scroll);
         }
-        // Clamp scroll to available overflow (read height into a local first).
-        let page_height = self.page_canvas.as_ref().unwrap().height;
-        let max_scroll = page_height.saturating_sub(page_vh as usize) as f32;
-        self.scroll_y = self.scroll_y.clamp(0.0, max_scroll);
-        let scroll = self.scroll_y as usize;
+        let scroll = self.tab().scroll_y as usize;
 
-        // Toolbar is cheap; render it fresh each frame (reflects typing).
-        let toolbar = self.engine.render(&self.toolbar_html(), TOOLBAR_CSS, w as f32, tb as f32);
+        // Chrome is cheap; render fresh each frame so typing/tab changes show.
+        let sidebar =
+            self.engine.render(&self.sidebar_html(), &Self::sidebar_css(h), sw as f32, h as f32);
+        let toolbar =
+            self.engine.render(&self.toolbar_html(), TOOLBAR_CSS, content_w as f32, tb as f32);
 
-        // Disjoint field borrows: page_canvas (shared) + surface (mut).
-        let page = self.page_canvas.as_ref().unwrap();
+        // Disjoint field borrows: tabs (shared) + surface (mut).
+        let page = self.tabs[self.active].page_canvas.as_ref().unwrap();
         let surface = match self.surface.as_mut() {
             Some(s) => s,
             None => return,
@@ -273,17 +433,18 @@ impl App {
             .resize(NonZeroU32::new(w).unwrap(), NonZeroU32::new(h).unwrap())
             .expect("surface resize");
         let mut buffer = surface.buffer_mut().expect("surface buffer");
-        let w = w as usize;
-        let tb = tb as usize;
+
+        let (w, sw, tb) = (w as usize, sw as usize, tb as usize);
         for y in 0..h as usize {
-            let src = if y < tb {
-                &toolbar.pixels[y * toolbar.width..]
-            } else {
-                let py = (y - tb) + scroll;
-                &page.pixels[py * page.width..]
-            };
             for x in 0..w {
-                let px = src[x];
+                let px = if x < sw {
+                    sidebar.pixels[y * sidebar.width + x]
+                } else if y < tb {
+                    toolbar.pixels[y * toolbar.width + (x - sw)]
+                } else {
+                    let py = (y - tb) + scroll;
+                    page.pixels[py * page.width + (x - sw)]
+                };
                 buffer[y * w + x] = (px.r as u32) << 16 | (px.g as u32) << 8 | px.b as u32;
             }
         }
