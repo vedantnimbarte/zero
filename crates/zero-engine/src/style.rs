@@ -22,6 +22,7 @@ pub enum Display {
     Block,
     Flex,
     Grid,
+    Table,
     None,
 }
 
@@ -68,6 +69,7 @@ impl<'a> StyledNode<'a> {
                 // inline-flex is treated as a block-level flex container for now.
                 "flex" | "inline-flex" => Display::Flex,
                 "grid" | "inline-grid" => Display::Grid,
+                "table" | "inline-table" => Display::Table,
                 "none" => Display::None,
                 _ => Display::Inline,
             },
