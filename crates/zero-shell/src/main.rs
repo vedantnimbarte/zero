@@ -31,34 +31,33 @@ const TOOLBAR_CSS: &str =
     "body{background:#1f2127;color:#f2f3f5;font-size:16px;} #bar{padding:14px;height:20px;}";
 
 /// Font *sourcing* is a platform/shell concern — the engine only wants bytes.
-fn load_system_font() -> Option<Vec<u8>> {
-    // Prefer fonts with broad script coverage (Latin + Indic) so Devanagari/Tamil
-    // render. ponytail: single font, no per-script fallback yet.
+/// Returns every candidate that exists, in priority order, forming a fallback chain:
+/// a good Latin font first, then broad-coverage Indic fonts.
+fn load_system_fonts() -> Vec<Vec<u8>> {
     const CANDIDATES: &[&str] = &[
-        "C:/Windows/Fonts/Nirmala.ttf", // Latin + Devanagari/Tamil/Telugu/...
+        // Windows
         "C:/Windows/Fonts/segoeui.ttf",
+        "C:/Windows/Fonts/Nirmala.ttf", // Devanagari/Tamil/Telugu/Bengali/...
         "C:/Windows/Fonts/arial.ttf",
-        "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf",
-        "/System/Library/Fonts/Supplemental/Kohinoor.ttc",
+        // macOS
         "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "/System/Library/Fonts/Supplemental/Devanagari Sangam MN.ttc",
         "/Library/Fonts/Arial.ttf",
+        // Linux
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf",
         "/usr/share/fonts/TTF/DejaVuSans.ttf",
     ];
-    CANDIDATES.iter().find_map(|p| fs::read(p).ok())
+    CANDIDATES.iter().filter_map(|p| fs::read(p).ok()).collect()
 }
 
 fn build_engine() -> Engine {
-    match load_system_font() {
-        Some(bytes) => Engine::new(&bytes).unwrap_or_else(|e| {
-            eprintln!("font load failed ({e}); rendering shapes only");
-            Engine::shapes_only()
-        }),
-        None => {
-            eprintln!("no system font found; rendering shapes only");
-            Engine::shapes_only()
-        }
+    let fonts = load_system_fonts();
+    if fonts.is_empty() {
+        eprintln!("no system font found; rendering shapes only");
+        return Engine::shapes_only();
     }
+    Engine::with_fonts(fonts)
 }
 
 fn is_url(s: &str) -> bool {
