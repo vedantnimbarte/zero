@@ -39,6 +39,19 @@ pub struct ElementRect {
     pub height: f32,
 }
 
+/// The painted box of an inline element (`<span>`, `<a>`, `<code>`) on one line.
+/// An inline element that wraps produces one fragment per line it covers.
+#[derive(Clone)]
+pub struct InlineBox {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub background: Option<Color>,
+    pub border_color: Option<Color>,
+    pub radius: f32,
+}
+
 /// A clickable region for an `<a href>`, in absolute page coordinates.
 #[derive(Clone)]
 pub struct LinkArea {
@@ -104,6 +117,8 @@ pub struct LayoutBox<'a> {
     pub text_fragments: Vec<TextFragment>,
     /// Clickable link regions produced by inline layout.
     pub link_areas: Vec<LinkArea>,
+    /// Backgrounds/borders for inline elements, painted beneath their text.
+    pub inline_boxes: Vec<InlineBox>,
 }
 
 pub enum BoxType<'a> {
@@ -120,6 +135,7 @@ impl<'a> LayoutBox<'a> {
             children: Vec::new(),
             text_fragments: Vec::new(),
             link_areas: Vec::new(),
+            inline_boxes: Vec::new(),
         }
     }
 
@@ -379,14 +395,44 @@ impl<'a> LayoutBox<'a> {
         let mut fragments: Vec<TextFragment> = Vec::new();
         let mut link_areas: Vec<LinkArea> = Vec::new();
 
-        // Flatten the inline subtree (text, plus <a href>/<span>/... wrappers) into pieces,
-        // carrying the nearest ancestor link's href with each piece.
-        let mut pieces: Vec<TextPiece> = Vec::new();
+        // Flatten the inline subtree into a stream of text runs and element
+        // boundaries, carrying the nearest ancestor link's href with each run.
+        let mut pieces: Vec<InlinePiece> = Vec::new();
         for child in &self.children {
             collect_inline_text(child, default_size, None, &mut pieces);
         }
 
+        let mut inline_boxes: Vec<InlineBox> = Vec::new();
+        let mut open: Vec<OpenInline> = Vec::new();
+        // Width of the space appended after the last word, so an element's box can
+        // stop at its text rather than bleeding into the following gap.
+        let mut trailing_space = 0.0_f32;
+
         for piece in &pieces {
+            let piece = match piece {
+                InlinePiece::Enter(style) => {
+                    // Padding before the element's first word reserves real space.
+                    cursor_x += style.pad_left;
+                    open.push(OpenInline {
+                        style: style.clone(),
+                        start_x: cursor_x - style.pad_left,
+                        line_y: cursor_y,
+                        height: line_height,
+                    });
+                    continue;
+                }
+                InlinePiece::Exit => {
+                    if let Some(mut boxed) = open.pop() {
+                        boxed.height = boxed.height.max(line_height);
+                        let text_end = cursor_x - trailing_space;
+                        inline_boxes.push(boxed.close(text_end + boxed.style.pad_right));
+                        cursor_x += boxed.style.pad_right;
+                    }
+                    continue;
+                }
+                InlinePiece::Text(piece) => piece,
+            };
+
             let word_height = piece.size * 1.25;
             let (_, space_w) = shape_run(&fonts.entries[0], " ", piece.size);
 
@@ -397,11 +443,23 @@ impl<'a> LayoutBox<'a> {
                 let (glyphs, word_w) = shape_run(&fonts.entries[font_index], word, piece.size);
                 // Wrap if this word overflows and we're not at line start.
                 if cursor_x > start_x && cursor_x + word_w > start_x + max_width {
+                    // Close each open element on the line it is leaving, then
+                    // reopen it on the next one, so a wrapped span paints twice.
+                    for boxed in open.iter_mut() {
+                        boxed.height = boxed.height.max(line_height);
+                        inline_boxes.push(boxed.close(cursor_x - trailing_space));
+                        boxed.start_x = start_x;
+                        boxed.line_y = cursor_y + line_height;
+                        boxed.height = 0.0;
+                    }
                     cursor_y += line_height;
                     cursor_x = start_x;
                     line_height = 0.0;
                 }
                 line_height = line_height.max(word_height);
+                for boxed in open.iter_mut() {
+                    boxed.height = boxed.height.max(word_height);
+                }
                 fragments.push(TextFragment {
                     glyphs,
                     x: cursor_x,
@@ -420,8 +478,15 @@ impl<'a> LayoutBox<'a> {
                     });
                 }
                 cursor_x += word_w + space_w;
+                trailing_space = space_w;
             }
         }
+        // Anything still open ran to the end of the content.
+        while let Some(mut boxed) = open.pop() {
+            boxed.height = boxed.height.max(line_height);
+            inline_boxes.push(boxed.close(cursor_x - trailing_space));
+        }
+        self.inline_boxes = inline_boxes;
 
         self.dimensions.content.height =
             if fragments.is_empty() { 0.0 } else { (cursor_y - top) + line_height };
@@ -733,18 +798,70 @@ struct TextPiece {
     href: Option<String>,
 }
 
-/// Walk an inline box subtree, collecting each text node with its (inherited)
-/// font size, color, and nearest ancestor `<a href>`. This is what makes
-/// `<a>`/`<span>` text render and become clickable.
-fn collect_inline_text(bx: &LayoutBox, default_size: f32, href: Option<&str>, out: &mut Vec<TextPiece>) {
-    // If this inline box is an <a href>, it becomes the link context for its subtree.
+/// Style an inline element paints with, captured when layout enters it.
+#[derive(Clone)]
+struct InlineStyle {
+    background: Option<Color>,
+    border_color: Option<Color>,
+    radius: f32,
+    pad_left: f32,
+    pad_right: f32,
+    pad_top: f32,
+    pad_bottom: f32,
+}
+
+/// The inline stream: text runs plus the element boundaries around them.
+enum InlinePiece {
+    Text(TextPiece),
+    Enter(InlineStyle),
+    Exit,
+}
+
+/// A decorated inline element currently open on the line being built.
+struct OpenInline {
+    style: InlineStyle,
+    start_x: f32,
+    line_y: f32,
+    height: f32,
+}
+
+impl OpenInline {
+    fn close(&self, end_x: f32) -> InlineBox {
+        InlineBox {
+            x: self.start_x,
+            y: self.line_y - self.style.pad_top,
+            width: (end_x - self.start_x).max(0.0),
+            height: self.height + self.style.pad_top + self.style.pad_bottom,
+            background: self.style.background,
+            border_color: self.style.border_color,
+            radius: self.style.radius,
+        }
+    }
+}
+
+/// Walk an inline box subtree, emitting text runs plus the boundaries of any
+/// inline element that paints something (background, border, or padding).
+///
+/// Boundaries are what let a wrapped `<span>` produce one painted box per line.
+fn collect_inline_text(
+    bx: &LayoutBox,
+    default_size: f32,
+    href: Option<&str>,
+    out: &mut Vec<InlinePiece>,
+) {
     let mut current_href = href.map(str::to_string);
+    let mut decorated = false;
+
     if let BoxType::InlineNode(styled) = bx.box_type {
         if let NodeType::Element(ref e) = styled.node.node_type {
             if e.tag_name == "a" {
                 if let Some(h) = e.attributes.get("href") {
                     current_href = Some(h.clone());
                 }
+            }
+            if let Some(style) = inline_style_of(styled) {
+                out.push(InlinePiece::Enter(style));
+                decorated = true;
             }
         }
         if let NodeType::Text(ref t) = styled.node.node_type {
@@ -753,12 +870,54 @@ fn collect_inline_text(bx: &LayoutBox, default_size: f32, href: Option<&str>, ou
                 Some(Value::ColorValue(c)) => c,
                 _ => Color { r: 0, g: 0, b: 0, a: 255 },
             };
-            out.push(TextPiece { text: t.clone(), size, color, href: current_href.clone() });
+            out.push(InlinePiece::Text(TextPiece {
+                text: t.clone(),
+                size,
+                color,
+                href: current_href.clone(),
+            }));
         }
     }
     for child in &bx.children {
         collect_inline_text(child, default_size, current_href.as_deref(), out);
     }
+    if decorated {
+        out.push(InlinePiece::Exit);
+    }
+}
+
+/// The paintable style of an inline element, or `None` if it draws nothing.
+fn inline_style_of(styled: &StyledNode) -> Option<InlineStyle> {
+    let ctx = styled.length_context(0.0);
+    let zero = Value::Length(0.0, Unit::Px);
+    let pad = |side: &str| styled.lookup(side, "padding", &zero).resolve(ctx);
+    let color_of = |name: &str| match styled.value(name) {
+        Some(Value::ColorValue(c)) => Some(c),
+        _ => None,
+    };
+    let background = color_of("background").or_else(|| color_of("background-color"));
+    let border_color = color_of("border-color");
+    let (pad_left, pad_right) = (pad("padding-left"), pad("padding-right"));
+    let (pad_top, pad_bottom) = (pad("padding-top"), pad("padding-bottom"));
+
+    if background.is_none()
+        && border_color.is_none()
+        && pad_left == 0.0
+        && pad_right == 0.0
+        && pad_top == 0.0
+        && pad_bottom == 0.0
+    {
+        return None;
+    }
+    Some(InlineStyle {
+        background,
+        border_color,
+        radius: styled.px("border-radius", 0.0).unwrap_or(0.0),
+        pad_left,
+        pad_right,
+        pad_top,
+        pad_bottom,
+    })
 }
 
 /// Horizontal margin + border + padding for an element, in px.
@@ -1013,7 +1172,7 @@ fn measure_text(text: &str, size: f32, fonts: Option<&FontSet>) -> f32 {
     shape_run(&fonts.entries[fonts.pick(&trimmed)], &trimmed, size).1
 }
 
-/// Gather the painted box of every element, so the embedder can hit-test clicks.
+/// Gather the painted box of every element, so the embedder can hit-test clicks./// Gather the painted box of every element, so the embedder can hit-test clicks.
 pub fn collect_element_rects(bx: &LayoutBox, out: &mut Vec<ElementRect>) {
     if let BoxType::BlockNode(styled) | BoxType::InlineNode(styled) = bx.box_type {
         if let NodeType::Element(ref e) = styled.node.node_type {
