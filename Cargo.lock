@@ -2509,6 +2509,7 @@ dependencies = [
  "image",
  "softbuffer",
  "ureq",
+ "windows-sys 0.59.0",
  "winit",
  "zero-engine",
 ]
