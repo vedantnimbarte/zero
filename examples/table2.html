@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html><head><style>
+body { background: #0e0f12; color: #f2f3f5; padding: 24px; font-size: 15px; }
+h1 { color: #e5484d; font-size: 26px; }
+h2 { color: #9a9da6; font-size: 13px; }
+table { border-spacing: 3px; }
+th { background: #2b2e37; padding: 10px; }
+td { background: #17181c; padding: 10px; }
+.span { background: #e5484d; color: #fff; padding: 10px; }
+.tall { background: #30a46c; color: #06251a; padding: 10px; }
+</style></head><body>
+<h1>colspan and rowspan</h1>
+<h2>A header spanning three columns, and a cell spanning two rows</h2>
+<table>
+  <tr><th colspan="3" class="span">Quarterly results (colspan 3)</th></tr>
+  <tr><th>Region</th><th>Q1</th><th>Q2</th></tr>
+  <tr><td rowspan="2" class="tall">India (rowspan 2)</td><td>120</td><td>150</td></tr>
+  <tr><td>90</td><td>110</td></tr>
+  <tr><td>Europe</td><td>75</td><td>80</td></tr>
+  <tr><td colspan="2" class="span">Total (colspan 2)</td><td>340</td></tr>
+</table>
+</body></html>
