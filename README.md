@@ -46,6 +46,7 @@ cargo run -- --history                     # dump stored history
 
 **Keys:** `Ctrl+T` new tab · `Ctrl+W` close · `Ctrl+Tab` next · `Ctrl+L` clear address ·
 `Ctrl+F` find · `Ctrl+D` bookmark · `Ctrl+H` history · `Ctrl+B` bookmarks ·
+`Ctrl+U` view source ·
 `Ctrl+I` AI panel · `Alt+←/→` back and forward.
 
 **Built-in pages:** `zero://newtab`, `zero://history`, `zero://bookmarks`.
