@@ -183,7 +183,7 @@ impl<'a> LayoutBox<'a> {
     fn layout(&mut self, containing_block: Dimensions, fonts: Option<&FontSet>, images: &ImageMap) {
         match self.box_type {
             BoxType::BlockNode(_) => self.layout_block(containing_block, fonts, images),
-            BoxType::AnonymousBlock => self.layout_inline(containing_block, fonts),
+            BoxType::AnonymousBlock => self.layout_inline(containing_block, fonts, images),
             // A bare inline node is laid out by its anonymous-block parent, not here.
             BoxType::InlineNode(_) => {}
         }
@@ -496,7 +496,12 @@ impl<'a> LayoutBox<'a> {
 
     /// Lay out inline children (text) as wrapped lines, producing text fragments
     /// and this box's height. ponytail: word-level wrapping, no per-glyph breaking.
-    fn layout_inline(&mut self, containing_block: Dimensions, fonts: Option<&FontSet>) {
+    fn layout_inline(
+        &mut self,
+        containing_block: Dimensions,
+        fonts: Option<&FontSet>,
+        images: &ImageMap,
+    ) {
         let start_x = containing_block.content.x;
         let max_width = containing_block.content.width;
         let top = containing_block.content.height + containing_block.content.y;
@@ -523,19 +528,35 @@ impl<'a> LayoutBox<'a> {
         // Flatten the inline subtree into a stream of text runs and element
         // boundaries, carrying the nearest ancestor link's href with each run.
         let mut pieces: Vec<InlinePiece> = Vec::new();
-        for child in &self.children {
-            collect_inline_text(child, default_size, None, &mut pieces);
+        for (index, child) in self.children.iter().enumerate() {
+            // Inside an inline container, a block-level box can only be an
+            // inline-block, so it joins the line as one indivisible item.
+            if matches!(child.box_type, BoxType::BlockNode(_)) {
+                pieces.push(InlinePiece::Atomic(index));
+            } else {
+                collect_inline_text(child, default_size, None, &mut pieces);
+            }
         }
 
         let mut inline_boxes: Vec<InlineBox> = Vec::new();
         let mut open: Vec<OpenInline> = Vec::new();
-        // Width of the space appended after the last word, so an element's box can
-        // stop at its text rather than bleeding into the following gap.
-        let mut trailing_space = 0.0_f32;
+        // Spaces are inserted *before* the next item rather than after the previous
+        // one, so an element's painted box stops at its text and adjacent
+        // inline-blocks still get separated.
+        let mut pending_space = false;
+        let (_, default_space) = shape_run(&fonts.entries[0], " ", default_size);
+        // An inline-block occupies a line even when it contributes no text of its
+        // own, so height can't be inferred from text fragments alone.
+        let mut placed_any = false;
 
         for piece in &pieces {
             let piece = match piece {
                 InlinePiece::Enter(style) => {
+                    // Any pending word gap belongs *outside* the element's box.
+                    if pending_space && cursor_x > start_x {
+                        cursor_x += default_space;
+                        pending_space = false;
+                    }
                     // Padding before the element's first word reserves real space.
                     cursor_x += style.pad_left;
                     open.push(OpenInline {
@@ -549,10 +570,54 @@ impl<'a> LayoutBox<'a> {
                 InlinePiece::Exit => {
                     if let Some(mut boxed) = open.pop() {
                         boxed.height = boxed.height.max(line_height);
-                        let text_end = cursor_x - trailing_space;
-                        inline_boxes.push(boxed.close(text_end + boxed.style.pad_right));
+                        inline_boxes.push(boxed.close(cursor_x + boxed.style.pad_right));
                         cursor_x += boxed.style.pad_right;
                     }
+                    continue;
+                }
+                InlinePiece::Atomic(index) => {
+                    let index = *index;
+                    // Shrink-to-fit: an explicit width wins, else the content width,
+                    // never wider than the line.
+                    let outer = {
+                        let style = self.children[index].get_style_node();
+                        let ctx = style.length_context(max_width);
+                        match style.value("width") {
+                            Some(v @ Value::Length(..)) => {
+                                v.resolve(ctx) + horizontal_edges(style, ctx)
+                            }
+                            // `fonts` is already unwrapped in this scope.
+                            _ => max_content_width(style, Some(fonts), images).min(max_width),
+                        }
+                    };
+                    let mut lead =
+                        if pending_space && cursor_x > start_x { default_space } else { 0.0 };
+                    if cursor_x > start_x && cursor_x + lead + outer > start_x + max_width {
+                        lead = 0.0;
+                        for boxed in open.iter_mut() {
+                            boxed.height = boxed.height.max(line_height);
+                            inline_boxes.push(boxed.close(cursor_x));
+                            boxed.start_x = start_x;
+                            boxed.line_y = cursor_y + line_height;
+                            boxed.height = 0.0;
+                        }
+                        cursor_y += line_height;
+                        cursor_x = start_x;
+                        line_height = 0.0;
+                    }
+                    cursor_x += lead;
+                    let mut slot: Dimensions = Default::default();
+                    slot.content =
+                        Rect { x: cursor_x, y: cursor_y, width: outer, height: 0.0 };
+                    self.children[index].layout(slot, Some(fonts), images);
+                    let placed = self.children[index].dimensions.margin_box();
+                    line_height = line_height.max(placed.height);
+                    for boxed in open.iter_mut() {
+                        boxed.height = boxed.height.max(placed.height);
+                    }
+                    cursor_x += placed.width;
+                    pending_space = true;
+                    placed_any = true;
                     continue;
                 }
                 InlinePiece::Text(piece) => piece,
@@ -566,13 +631,15 @@ impl<'a> LayoutBox<'a> {
                 // Indic reordering/conjuncts happen.
                 let font_index = fonts.pick(word);
                 let (glyphs, word_w) = shape_run(&fonts.entries[font_index], word, piece.size);
+                let mut lead = if pending_space && cursor_x > start_x { space_w } else { 0.0 };
                 // Wrap if this word overflows and we're not at line start.
-                if cursor_x > start_x && cursor_x + word_w > start_x + max_width {
+                if cursor_x > start_x && cursor_x + lead + word_w > start_x + max_width {
+                    lead = 0.0;
                     // Close each open element on the line it is leaving, then
                     // reopen it on the next one, so a wrapped span paints twice.
                     for boxed in open.iter_mut() {
                         boxed.height = boxed.height.max(line_height);
-                        inline_boxes.push(boxed.close(cursor_x - trailing_space));
+                        inline_boxes.push(boxed.close(cursor_x));
                         boxed.start_x = start_x;
                         boxed.line_y = cursor_y + line_height;
                         boxed.height = 0.0;
@@ -581,6 +648,7 @@ impl<'a> LayoutBox<'a> {
                     cursor_x = start_x;
                     line_height = 0.0;
                 }
+                cursor_x += lead;
                 line_height = line_height.max(word_height);
                 for boxed in open.iter_mut() {
                     boxed.height = boxed.height.max(word_height);
@@ -602,19 +670,20 @@ impl<'a> LayoutBox<'a> {
                         height: word_height,
                     });
                 }
-                cursor_x += word_w + space_w;
-                trailing_space = space_w;
+                cursor_x += word_w;
+                pending_space = true;
+                placed_any = true;
             }
         }
         // Anything still open ran to the end of the content.
         while let Some(mut boxed) = open.pop() {
             boxed.height = boxed.height.max(line_height);
-            inline_boxes.push(boxed.close(cursor_x - trailing_space));
+            inline_boxes.push(boxed.close(cursor_x));
         }
         self.inline_boxes = inline_boxes;
 
         self.dimensions.content.height =
-            if fragments.is_empty() { 0.0 } else { (cursor_y - top) + line_height };
+            if placed_any { (cursor_y - top) + line_height } else { 0.0 };
         self.text_fragments = fragments;
         self.link_areas = link_areas;
     }
@@ -935,11 +1004,14 @@ struct InlineStyle {
     pad_bottom: f32,
 }
 
-/// The inline stream: text runs plus the element boundaries around them.
+/// The inline stream: text runs, element boundaries, and atomic inline-blocks.
 enum InlinePiece {
     Text(TextPiece),
     Enter(InlineStyle),
     Exit,
+    /// An `inline-block` child, laid out as a block but placed on the line.
+    /// Holds its index among this box's children.
+    Atomic(usize),
 }
 
 /// A decorated inline element currently open on the line being built.
@@ -1269,7 +1341,7 @@ pub fn max_content_width(
                 if row_flex {
                     flex_total += w;
                     items += 1;
-                } else if child.display() == Display::Inline {
+                } else if matches!(child.display(), Display::Inline | Display::InlineBlock) {
                     inline_run += w;
                 } else {
                     widest = widest.max(w);
@@ -1366,6 +1438,8 @@ fn build_box<'a>(style_node: &'a StyledNode<'a>, force_block: bool) -> LayoutBox
         Display::Block | Display::Flex | Display::Grid | Display::Table => {
             BoxType::BlockNode(style_node)
         }
+        // An inline-block lays out as a block; its parent decides where it sits.
+        Display::InlineBlock => BoxType::BlockNode(style_node),
         Display::Inline if force_block => BoxType::BlockNode(style_node),
         Display::Inline => BoxType::InlineNode(style_node),
         Display::None => panic!("Root node has display: none."),
@@ -1381,6 +1455,11 @@ fn build_box<'a>(style_node: &'a StyledNode<'a>, force_block: bool) -> LayoutBox
             }
             Display::Inline if blockifies => root.children.push(build_box(child, true)),
             Display::Inline => root.get_inline_container().children.push(build_box(child, false)),
+            // Blockified by a flex/grid parent, otherwise it joins the line.
+            Display::InlineBlock if blockifies => root.children.push(build_box(child, true)),
+            Display::InlineBlock => {
+                root.get_inline_container().children.push(build_box(child, true))
+            }
         }
     }
     root
