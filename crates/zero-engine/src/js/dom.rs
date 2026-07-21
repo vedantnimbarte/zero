@@ -57,7 +57,10 @@ impl DomView {
                 let ancestors = self.ancestors_of(*i);
                 rule.selectors
                     .iter()
-                    .any(|selector| crate::style::matches(*element, &ancestors, selector))
+                    .any(|selector| {
+                        // A script's query has no cursor; `:hover` matches nothing.
+                        crate::style::matches(*element, &ancestors, selector, &Default::default())
+                    })
             })
             .map(|(i, _)| i)
             .collect()
@@ -87,6 +90,10 @@ impl DomView {
 }
 
 impl crate::style::Matchable for ElementInfo {
+    fn node_id(&self) -> usize {
+        self.node_id
+    }
+
     fn tag(&self) -> &str {
         &self.tag
     }

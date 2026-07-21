@@ -58,6 +58,7 @@ correctly, including their own stylesheets, tables and forms.
 - **HTML**: tolerant parser, character references, raw-text and void elements
 - **CSS**: external `<link>` sheets and `@import`, `@media` (type + width), descendant/child
   selectors, attribute selectors (`[type=text]`, `~=`, `^=`, `$=`, `*=`),
+  `:hover`,
   custom properties (`var()`, defined on `:root`), the cascade with specificity, HTML presentation attributes (`bgcolor`, `width`, `align`),
   named colours, `rgb()`/`hsl()`, alpha
 - **Layout**: block, inline, inline-block, flex (wrap/grow/justify/align), grid
@@ -73,7 +74,7 @@ correctly, including their own stylesheets, tables and forms.
   `localStorage` partitioned per site, profile data encrypted at rest (DPAPI on
   Windows; macOS and Linux backends are still to come)
 
-**Known limits.** Pseudo-classes other than `:root` (so `:hover`) are skipped —
+**Known limits.** Pseudo-classes other than `:root` and `:hover` are skipped —
 a rule using one is dropped rather than misapplied. Wikipedia's skin renders its columns correctly at
 wide window sizes but still overlaps its floating tools rail. Layout and paint are
 single-threaded, and a page is painted in full rather than by viewport.

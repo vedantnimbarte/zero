@@ -51,6 +51,9 @@ pub struct SimpleSelector {
     pub id: Option<String>,
     pub class: Vec<String>,
     pub attrs: Vec<AttrTest>,
+    /// `:hover` — matches only while the cursor is over this element or
+    /// something inside it.
+    pub hover: bool,
 }
 
 /// An `[attr]`, `[attr=value]`, `[attr~=value]` … condition.
@@ -96,6 +99,7 @@ impl SimpleSelector {
             && self.id.is_none()
             && self.class.is_empty()
             && self.attrs.is_empty()
+            && !self.hover
     }
 }
 
@@ -638,6 +642,7 @@ impl Parser {
             id: None,
             class: Vec::new(),
             attrs: Vec::new(),
+            hover: false,
         };
         loop {
             match self.next_char_or('\0') {
@@ -656,11 +661,15 @@ impl Parser {
                     Some(test) => selector.attrs.push(test),
                     None => break, // malformed: let the caller drop the rule
                 },
-                // The one pseudo-class worth supporting: sheets define their
-                // custom properties on :root, and dropping it loses all of them.
+                // Sheets define their custom properties on :root, and dropping
+                // the rule for the pseudo-class would lose all of them.
                 ':' if self.starts_with(":root") => {
                     self.pos += ":root".len();
                     selector.tag_name = Some("html".to_string());
+                }
+                ':' if self.starts_with(":hover") => {
+                    self.pos += ":hover".len();
+                    selector.hover = true;
                 }
                 c if is_ident(c) => {
                     selector.tag_name = Some(self.parse_identifier().to_ascii_lowercase());
@@ -984,10 +993,8 @@ mod tests {
              .ok { color: #123456; width: 50%; padding: 8px; }"
                 .to_string(),
         );
-        // Kept: the media rule, `div > p`, and `.ok`. Dropped: the `:hover` one,
-        // since applying a hover style unconditionally would be worse than
-        // ignoring the rule.
-        assert_eq!(s.rules.len(), 3);
+        // Kept: the media rule, `a:hover`, `div > p`, and `.ok`.
+        assert_eq!(s.rules.len(), 4);
         let ok = s
             .rules
             .iter()

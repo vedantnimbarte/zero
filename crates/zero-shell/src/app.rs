@@ -169,6 +169,8 @@ struct Tab {
     links: Vec<zero_engine::LinkArea>,
     /// Find-in-page match boxes from the last render, for jumping between them.
     matches: Vec<zero_engine::layout::Rect>,
+    /// Whether the last render's stylesheet reacted to the cursor at all.
+    uses_hover: bool,
     /// Shared with this tab's document so its subresource cache outlives a
     /// single render — the engine re-asks for images and stylesheets each time.
     loader: Rc<ShellLoader>,
@@ -198,6 +200,7 @@ impl Tab {
             page_canvas: None,
             links: Vec::new(),
             matches: Vec::new(),
+            uses_hover: false,
             cache_w: 0,
             cache_h: 0,
         }
@@ -357,6 +360,8 @@ impl ApplicationHandler for App {
                     let page_height = (h as f32 - page_top).max(1.0);
                     self.scroll_to_cursor(self.cursor.1, page_top, page_height);
                     self.request_redraw();
+                } else {
+                    self.update_hover();
                 }
             }
             WindowEvent::MouseInput { state: ElementState::Released, .. } => {
@@ -778,6 +783,39 @@ impl App {
         self.go_to(target);
     }
 
+    /// Tell the page which element the cursor is over, for `:hover`.
+    ///
+    /// Only pages whose stylesheet actually uses `:hover` are re-rendered:
+    /// otherwise every mouse movement would repaint for no visible change.
+    fn update_hover(&mut self) {
+        if !self.tab().uses_hover {
+            return;
+        }
+        let hit = self.page_node_at(self.cursor);
+        let tab = self.tab_mut();
+        if tab.doc.set_hover(hit) {
+            tab.page_canvas = None;
+            self.request_redraw();
+        }
+    }
+
+    /// The innermost element under a window position, if it is over the page.
+    fn page_node_at(&self, (cx, cy): (f32, f32)) -> Option<usize> {
+        let (w, _) = self.window_size();
+        let ai_width = if self.ai_open { AI_PANEL_W.min(w.saturating_sub(SIDEBAR_W)) } else { 0 };
+        if cx < SIDEBAR_W as f32 || cy < TOOLBAR_H as f32 || cx >= (w - ai_width) as f32 {
+            return None; // over the chrome, not the page
+        }
+        let px = cx - SIDEBAR_W as f32;
+        let py = cy - TOOLBAR_H as f32 + self.tab().scroll_y;
+        self.tab()
+            .element_rects
+            .iter()
+            .filter(|r| px >= r.x && px <= r.x + r.width && py >= r.y && py <= r.y + r.height)
+            .map(|r| r.node_id)
+            .next_back()
+    }
+
     // --- find in page ---
 
     fn open_find(&mut self) {
@@ -942,6 +980,7 @@ impl App {
                 tab.page_canvas = Some(page.canvas);
                 tab.links = page.links;
                 tab.matches = page.find_matches;
+                tab.uses_hover = page.uses_hover;
                 tab.element_rects = page.element_rects;
                 tab.cache_w = content_w;
                 tab.cache_h = page_vh;

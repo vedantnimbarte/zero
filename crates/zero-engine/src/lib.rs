@@ -48,6 +48,9 @@ pub struct Page {
     pub element_rects: Vec<ElementRect>,
     /// Boxes of the find-in-page matches, in document order.
     pub find_matches: Vec<layout::Rect>,
+    /// Whether any rule used `:hover`. Without this the embedder would repaint
+    /// on every mouse move for pages that do not react to the cursor at all.
+    pub uses_hover: bool,
 }
 
 /// A loaded document with a **persistent** JavaScript runtime.
@@ -70,6 +73,9 @@ pub struct Document {
     selections: HashMap<usize, (String, String)>,
     /// The find-in-page query, highlighted on the next render.
     find: Option<String>,
+    /// The element under the cursor, plus its ancestors — `:hover` applies to
+    /// the whole chain, not just the innermost element.
+    hovered: style::HoverChain,
     pub console: Vec<String>,
 }
 
@@ -120,6 +126,7 @@ impl Document {
             focus_baseline: String::new(),
             selections: HashMap::new(),
             find: None,
+            hovered: Default::default(),
             console: Vec::new(),
         };
         doc.assign_node_ids();
@@ -256,6 +263,19 @@ impl Document {
 
     pub fn is_focused(&self) -> bool {
         self.focused.is_some()
+    }
+
+    /// Put the cursor over an element, so `:hover` rules apply to it and to
+    /// everything it sits inside. Returns whether anything changed, so the
+    /// embedder only re-renders when it must.
+    pub fn set_hover(&mut self, node_id: Option<usize>) -> bool {
+        let chain = match node_id {
+            Some(id) => ancestor_chain(&self.root, id),
+            None => Default::default(),
+        };
+        let changed = chain != self.hovered;
+        self.hovered = chain;
+        changed
     }
 
     /// Highlight every occurrence of `query` on the next render; `None` clears it.
@@ -623,7 +643,13 @@ impl Engine {
 
         // Media blocks are parsed but only apply at this viewport width.
         stylesheet.rules.retain(|rule| css::media_matches(rule.media.as_deref(), width));
-        let style_root = style::style_tree(root, &stylesheet);
+        // Whether any rule cares about the cursor, so the embedder can skip
+        // re-rendering on mouse movement when nothing would change.
+        let uses_hover = stylesheet
+            .rules
+            .iter()
+            .any(|rule| rule.selectors.iter().any(|s| s.parts.iter().any(|p| p.simple.hover)));
+        let style_root = style::style_tree_with_hover(root, &stylesheet, &doc.hovered);
 
         // Fetch + decode every <img> up front so layout knows their sizes.
         let mut images = ImageMap::new();
@@ -684,6 +710,7 @@ impl Engine {
             console,
             element_rects,
             find_matches,
+            uses_hover,
         }
     }
 }
@@ -889,6 +916,32 @@ fn node_at<'a>(root: &'a mut Node, path: &[usize]) -> Option<&'a mut Node> {
 }
 
 /// Gather the text inside every `<script>` element into one JS source string.
+/// A node and every element it sits inside, by id.
+fn ancestor_chain(root: &Node, node_id: usize) -> style::HoverChain {
+    fn walk(node: &Node, node_id: usize, path: &mut Vec<usize>) -> bool {
+        if let NodeType::Element(ref e) = node.node_type {
+            path.push(e.node_id);
+            if e.node_id == node_id {
+                return true;
+            }
+        }
+        for child in &node.children {
+            if walk(child, node_id, path) {
+                return true;
+            }
+        }
+        if matches!(node.node_type, NodeType::Element(_)) {
+            path.pop();
+        }
+        false
+    }
+    let mut path = Vec::new();
+    match walk(root, node_id, &mut path) {
+        true => path.into_iter().collect(),
+        false => Default::default(),
+    }
+}
+
 /// Where a submitted form wants to go. The action is whatever the markup said,
 /// so the embedder still has to resolve it against the page URL.
 #[derive(Debug, PartialEq)]
@@ -1075,6 +1128,38 @@ mod tests {
 
         let field = first_input(&doc);
         assert_eq!(doc.submit(field).unwrap().query, "q=x&region=in");
+    }
+
+    /// Hover crosses parsing, styling and paint, so check the pixels.
+    #[test]
+    fn hovering_an_element_repaints_it() {
+        let engine = super::Engine::shapes_only();
+        let html = "<body><div id=\"box\">x</div></body>";
+        let css = "div { background: #0000ff; height: 50px; }                    div:hover { background: #ff0000; }";
+        let loader = super::NullLoader;
+
+        let mut doc = super::Document::load(html, css);
+        let page = engine.render_document(&mut doc, 100.0, 100.0, &loader);
+        assert!(page.uses_hover, "the sheet reacts to the cursor");
+        let blue = page.canvas.pixels[10 * 100 + 10];
+        assert_eq!((blue.r, blue.g, blue.b), (0, 0, 255));
+
+        let box_id = page
+            .element_rects
+            .iter()
+            .find(|r| r.id == "box")
+            .expect("the div was painted")
+            .node_id;
+        assert!(doc.set_hover(Some(box_id)), "hovering is a change");
+        let page = engine.render_document(&mut doc, 100.0, 100.0, &loader);
+        let red = page.canvas.pixels[10 * 100 + 10];
+        assert_eq!((red.r, red.g, red.b), (255, 0, 0));
+
+        // Moving off the element puts it back, and re-hovering the same node
+        // reports no change so the embedder can skip the repaint.
+        assert!(doc.set_hover(None));
+        assert!(doc.set_hover(Some(box_id)));
+        assert!(!doc.set_hover(Some(box_id)));
     }
 
     #[test]

@@ -88,6 +88,8 @@ impl<'a> StyledNode<'a> {
 /// matches against the snapshot scripts see; both use the same matcher through
 /// this, so the two can never disagree about what a selector means.
 pub trait Matchable {
+    /// Stable identity, so `:hover` can name an element.
+    fn node_id(&self) -> usize;
     fn tag(&self) -> &str;
     fn elem_id(&self) -> Option<&str>;
     fn has_class(&self, class: &str) -> bool;
@@ -95,6 +97,10 @@ pub trait Matchable {
 }
 
 impl Matchable for ElementData {
+    fn node_id(&self) -> usize {
+        self.node_id
+    }
+
     fn tag(&self) -> &str {
         &self.tag_name
     }
@@ -121,13 +127,30 @@ impl Matchable for ElementData {
 /// ponytail: a descendant combinator backtracks over every ancestor, so a
 /// pathological selector is quadratic in depth. Real sheets are two or three
 /// compounds deep; an ancestor bloom filter is the fix if it ever bites.
-pub fn matches<E: Matchable>(elem: &E, ancestors: &[&E], selector: &Selector) -> bool {
-    matches_chain(elem, ancestors, &selector.parts)
+pub fn matches<E: Matchable>(
+    elem: &E,
+    ancestors: &[&E],
+    selector: &Selector,
+    hovered: &HoverChain,
+) -> bool {
+    matches_chain(elem, ancestors, &selector.parts, hovered)
 }
 
-fn matches_chain<E: Matchable>(elem: &E, ancestors: &[&E], parts: &[SelectorPart]) -> bool {
+/// The element under the cursor and its ancestors: hovering a word inside a
+/// link hovers the link too, so `a:hover` has to match the whole chain.
+pub type HoverChain = std::collections::HashSet<usize>;
+
+fn matches_chain<E: Matchable>(
+    elem: &E,
+    ancestors: &[&E],
+    parts: &[SelectorPart],
+    hovered: &HoverChain,
+) -> bool {
     let Some((subject, rest)) = parts.split_last() else { return true };
     if !matches_simple_selector(elem, &subject.simple) {
+        return false;
+    }
+    if subject.simple.hover && !hovered.contains(&elem.node_id()) {
         return false;
     }
     if rest.is_empty() {
@@ -135,13 +158,13 @@ fn matches_chain<E: Matchable>(elem: &E, ancestors: &[&E], parts: &[SelectorPart
     }
     match subject.combinator {
         Combinator::Child => match ancestors.split_last() {
-            Some((parent, above)) => matches_chain(*parent, above, rest),
+            Some((parent, above)) => matches_chain(*parent, above, rest, hovered),
             None => false,
         },
         // Any ancestor may satisfy the rest of the chain; try the nearest first.
         Combinator::Descendant => (0..ancestors.len())
             .rev()
-            .any(|i| matches_chain(ancestors[i], &ancestors[..i], rest)),
+            .any(|i| matches_chain(ancestors[i], &ancestors[..i], rest, hovered)),
     }
 }
 
@@ -164,10 +187,11 @@ fn match_rule<'a>(
     elem: &ElementData,
     ancestors: &[&ElementData],
     rule: &'a Rule,
+    hovered: &HoverChain,
 ) -> Option<MatchedRule<'a>> {
     rule.selectors
         .iter()
-        .find(|selector| matches(elem, ancestors, selector))
+        .find(|selector| matches(elem, ancestors, selector, hovered))
         .map(|selector| (selector.specificity(), rule))
 }
 
@@ -175,11 +199,12 @@ fn matching_rules<'a>(
     elem: &ElementData,
     ancestors: &[&ElementData],
     stylesheet: &'a Stylesheet,
+    hovered: &HoverChain,
 ) -> Vec<MatchedRule<'a>> {
     stylesheet
         .rules
         .iter()
-        .filter_map(|rule| match_rule(elem, ancestors, rule))
+        .filter_map(|rule| match_rule(elem, ancestors, rule, hovered))
         .collect()
 }
 
@@ -187,9 +212,10 @@ fn specified_values(
     elem: &ElementData,
     ancestors: &[&ElementData],
     stylesheet: &Stylesheet,
+    hovered: &HoverChain,
 ) -> PropertyMap {
     let mut values = presentation_hints(elem);
-    let mut rules = matching_rules(elem, ancestors, stylesheet);
+    let mut rules = matching_rules(elem, ancestors, stylesheet, hovered);
     // Apply low specificity first so high specificity overrides it.
     rules.sort_by(|&(a, _), &(b, _)| a.cmp(&b));
     for (_, rule) in rules {
@@ -324,7 +350,16 @@ fn resolve_vars(values: &mut PropertyMap) {
 const INHERITED_PROPERTIES: [&str; 3] = ["color", "font-size", "text-align"];
 
 pub fn style_tree<'a>(root: &'a Node, stylesheet: &'a Stylesheet) -> StyledNode<'a> {
-    style_tree_inner(root, stylesheet, &HashMap::new(), &mut Vec::new())
+    style_tree_with_hover(root, stylesheet, &HoverChain::new())
+}
+
+/// Style a tree with a cursor somewhere in it, so `:hover` rules apply.
+pub fn style_tree_with_hover<'a>(
+    root: &'a Node,
+    stylesheet: &'a Stylesheet,
+    hovered: &HoverChain,
+) -> StyledNode<'a> {
+    style_tree_inner(root, stylesheet, &HashMap::new(), &mut Vec::new(), hovered)
 }
 
 fn style_tree_inner<'a>(
@@ -332,9 +367,10 @@ fn style_tree_inner<'a>(
     stylesheet: &'a Stylesheet,
     inherited: &PropertyMap,
     ancestors: &mut Vec<&'a ElementData>,
+    hovered: &HoverChain,
 ) -> StyledNode<'a> {
     let mut specified = match root.node_type {
-        NodeType::Element(ref elem) => specified_values(elem, ancestors, stylesheet),
+        NodeType::Element(ref elem) => specified_values(elem, ancestors, stylesheet, hovered),
         NodeType::Text(_) => HashMap::new(),
     };
     for prop in INHERITED_PROPERTIES {
@@ -372,7 +408,7 @@ fn style_tree_inner<'a>(
     let children: Vec<StyledNode> = root
         .children
         .iter()
-        .map(|child| style_tree_inner(child, stylesheet, &specified, ancestors))
+        .map(|child| style_tree_inner(child, stylesheet, &specified, ancestors, hovered))
         .collect();
     if matches!(root.node_type, NodeType::Element(_)) {
         ancestors.pop();
@@ -401,6 +437,47 @@ mod tests {
     }
 
     const RED: Value = Value::ColorValue(crate::css::Color { r: 255, g: 0, b: 0, a: 255 });
+
+    /// Elements come out of the parser unnumbered; the Document assigns ids
+    /// normally, so a bare tree has to be numbered before ids mean anything.
+    fn number_elements(node: &mut Node, next: &mut usize) {
+        if let NodeType::Element(ref mut e) = node.node_type {
+            *next += 1;
+            e.node_id = *next;
+        }
+        for child in &mut node.children {
+            number_elements(child, next);
+        }
+    }
+
+    #[test]
+    fn hover_applies_to_the_element_and_what_it_sits_inside() {
+        let html = "<body><a><span>inner</span></a><a>other</a></body>";
+        let css = "a { color: #000000; } a:hover { color: #ff0000; }";
+        let mut dom = crate::html::parse(html.to_string());
+        number_elements(&mut dom, &mut 0);
+        let sheet = crate::css::parse(css.to_string());
+        let black = Value::ColorValue(crate::css::Color { r: 0, g: 0, b: 0, a: 255 });
+        let red = Value::ColorValue(crate::css::Color { r: 255, g: 0, b: 0, a: 255 });
+
+        let id_of = |node: &Node| match &node.node_type {
+            NodeType::Element(e) => e.node_id,
+            NodeType::Text(_) => unreachable!("expected an element"),
+        };
+        let link = id_of(&dom.children[0]);
+        let span = id_of(&dom.children[0].children[0]);
+
+        // With no cursor, hover rules never apply.
+        let cold = style_tree(&dom, &sheet);
+        assert_eq!(cold.children[0].value("color"), Some(black.clone()));
+
+        // Hovering the span also hovers the link that contains it...
+        let chain: HoverChain = [span, link].into_iter().collect();
+        let hot = style_tree_with_hover(&dom, &sheet, &chain);
+        assert_eq!(hot.children[0].value("color"), Some(red));
+        // ...but not the link beside it.
+        assert_eq!(hot.children[1].value("color"), Some(black));
+    }
 
     #[test]
     fn attribute_selectors_match_on_value() {
