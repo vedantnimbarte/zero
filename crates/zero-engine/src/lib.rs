@@ -122,9 +122,10 @@ impl Engine {
         let mut script_source = String::new();
         collect_script_text(&root, &mut script_source);
         if !script_source.trim().is_empty() {
-            let out = js::run(&script_source);
+            let out = js::run_with_dom(&script_source, build_dom_view(&root));
             console.extend(out.console);
             console.extend(out.errors.iter().map(|e| format!("[error] {e}")));
+            apply_mutations(&mut root, &out.mutations);
             if !out.writes.trim().is_empty() {
                 let written = html::parse(format!("<div>{}</div>", out.writes));
                 append_to_body(&mut root, written);
@@ -190,6 +191,66 @@ fn collect_and_load_images(node: &Node, loader: &dyn ResourceLoader, out: &mut I
     for child in &node.children {
         collect_and_load_images(child, loader, out);
     }
+}
+
+/// Snapshot every element so scripts can address them by handle.
+fn build_dom_view(root: &Node) -> js::DomView {
+    fn walk(node: &Node, path: &mut Vec<usize>, out: &mut Vec<js::ElementInfo>) {
+        if let NodeType::Element(ref e) = node.node_type {
+            out.push(js::ElementInfo {
+                path: path.clone(),
+                id: e.id().cloned().unwrap_or_default(),
+                tag: e.tag_name.clone(),
+                text: text_content(node),
+            });
+        }
+        for (i, child) in node.children.iter().enumerate() {
+            path.push(i);
+            walk(child, path, out);
+            path.pop();
+        }
+    }
+    let mut elements = Vec::new();
+    walk(root, &mut Vec::new(), &mut elements);
+    js::DomView { elements }
+}
+
+fn text_content(node: &Node) -> String {
+    match node.node_type {
+        NodeType::Text(ref t) => t.clone(),
+        _ => node.children.iter().map(text_content).collect(),
+    }
+}
+
+/// Apply the DOM writes a script recorded, in order.
+fn apply_mutations(root: &mut Node, mutations: &[js::Mutation]) {
+    if mutations.is_empty() {
+        return;
+    }
+    let view = build_dom_view(root);
+    for mutation in mutations {
+        let (index, replacement) = match mutation {
+            js::Mutation::SetText(i, text) => (*i, vec![dom::text(text.clone())]),
+            js::Mutation::SetHtml(i, html) => {
+                (*i, html::parse(format!("<div>{html}</div>")).children)
+            }
+        };
+        let path = match view.elements.get(index) {
+            Some(e) => e.path.clone(),
+            None => continue,
+        };
+        if let Some(node) = node_at(root, &path) {
+            node.children = replacement;
+        }
+    }
+}
+
+fn node_at<'a>(root: &'a mut Node, path: &[usize]) -> Option<&'a mut Node> {
+    let mut current = root;
+    for &i in path {
+        current = current.children.get_mut(i)?;
+    }
+    Some(current)
 }
 
 /// Gather the text inside every `<script>` element into one JS source string.
