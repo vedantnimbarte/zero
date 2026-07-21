@@ -215,6 +215,7 @@ mod tests {
                 path: vec![0],
                 node_id: 1,
                 id: "out".into(),
+                class: String::new(),
                 tag: "div".into(),
                 text: "before".into(),
             }],
@@ -268,6 +269,66 @@ mod tests {
         doc.blur();
         assert!(doc.click(3));
         assert!(doc.text_of(4).contains("saw:abc"), "got {:?}", doc.text_of(4));
+    }
+
+    #[test]
+    fn typing_fires_input_and_blur_fires_change() {
+        let mut doc = crate::Document::load(
+            "<html><body><input id='q'><div id='live'>-</div><div id='done'>-</div>\
+             <script>\
+               var q = document.getElementById('q');\
+               q.oninput = function() {\
+                 document.getElementById('live').textContent = 'typing:' + q.value;\
+               };\
+               q.addEventListener('change', function() {\
+                 document.getElementById('done').textContent = 'final:' + q.value;\
+               });\
+             </script></body></html>",
+            "",
+        );
+        // html, body, input(3), live(4), done(5), script(6)
+        assert!(doc.focus(3));
+        doc.insert_text("hi");
+        // `input` fires on every keystroke.
+        assert!(doc.text_of(4).contains("typing:hi"), "got {:?}", doc.text_of(4));
+        // `change` waits for blur.
+        assert_eq!(doc.text_of(5), "-");
+        doc.blur();
+        assert!(doc.text_of(5).contains("final:hi"), "got {:?}", doc.text_of(5));
+    }
+
+    #[test]
+    fn class_name_can_be_read_and_restyled() {
+        let mut doc = crate::Document::load(
+            "<html><body><div id='box' class='idle'>x</div><div id='out'>-</div>\
+             <script>\
+               var box = document.getElementById('box');\
+               box.className = 'active';\
+               box.onclick = function() {\
+                 document.getElementById('out').textContent = 'now:' + box.className;\
+               };\
+             </script></body></html>",
+            "",
+        );
+        // The write reached the DOM, so a later event observes the new class.
+        assert!(doc.click(3));
+        assert!(doc.text_of(4).contains("now:active"), "got {:?}", doc.text_of(4));
+    }
+
+    #[test]
+    fn change_does_not_fire_when_nothing_was_edited() {
+        let mut doc = crate::Document::load(
+            "<html><body><input id='q' value='same'><div id='out'>untouched</div>\
+             <script>\
+               document.getElementById('q').onchange = function() {\
+                 document.getElementById('out').textContent = 'fired';\
+               };\
+             </script></body></html>",
+            "",
+        );
+        assert!(doc.focus(3));
+        doc.blur(); // focused and left without typing
+        assert_eq!(doc.text_of(4), "untouched");
     }
 
     #[test]
