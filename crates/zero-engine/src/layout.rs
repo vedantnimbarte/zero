@@ -9,7 +9,7 @@
 //! no bidi, justification, or mixed-baseline runs. Proper line-breaking is a later
 //! phase (docs/01-ARCHITECTURE.md §10).
 
-use crate::css::{Color, Unit, Value};
+use crate::css::{Color, LengthContext, Unit, Value};
 use crate::dom::NodeType;
 use crate::resource::ImageMap;
 use crate::style::{Display, StyledNode};
@@ -178,10 +178,10 @@ impl<'a> LayoutBox<'a> {
         self.calculate_block_width(containing_block);
         self.calculate_block_position(containing_block);
         // Then children are laid out to discover this box's height.
-        if self.get_style_node().display() == Display::Flex {
-            self.layout_flex_children(fonts, images);
-        } else {
-            self.layout_block_children(fonts, images);
+        match self.get_style_node().display() {
+            Display::Flex => self.layout_flex_children(fonts, images),
+            Display::Grid => self.layout_grid_children(fonts, images),
+            _ => self.layout_block_children(fonts, images),
         }
         self.calculate_block_height(containing_block);
         // A replaced element (<img>) overrides content size with its resolved dimensions.
@@ -238,6 +238,52 @@ impl<'a> LayoutBox<'a> {
             .or_else(|| img.map(|i| i.height as f32))
             .unwrap_or(w);
         Some((w, h))
+    }
+
+    /// Grid layout: place items into a fixed column track list, wrapping to new rows.
+    ///
+    /// ponytail: supports `grid-template-columns` with px/%/fr/`repeat()` plus `gap`.
+    /// No explicit placement, named lines, `grid-template-rows`, or alignment;
+    /// each row is sized to its tallest item.
+    fn layout_grid_children(&mut self, fonts: Option<&FontSet>, images: &ImageMap) {
+        let style = self.get_style_node();
+        let container = self.dimensions.content;
+        let ctx = style.length_context(container.width);
+        let gap = style.value("gap").map(|v| v.resolve(ctx)).unwrap_or(0.0);
+
+        let spec = match style.value("grid-template-columns") {
+            Some(Value::Raw(spec)) => spec,
+            _ => return self.layout_block_children_gapped(fonts, images, gap),
+        };
+        let columns = resolve_tracks(&spec, container.width, gap, ctx);
+        if columns.is_empty() {
+            return self.layout_block_children_gapped(fonts, images, gap);
+        }
+
+        let mut cursor_y = container.y;
+        let mut row_height = 0.0_f32;
+        let mut column = 0usize;
+        let mut stacked = 0.0_f32;
+
+        for child in &mut self.children {
+            if child.is_out_of_flow() {
+                continue;
+            }
+            if column == columns.len() {
+                // Row finished: drop below the tallest item in it.
+                cursor_y += row_height + gap;
+                stacked += row_height + gap;
+                row_height = 0.0;
+                column = 0;
+            }
+            let x = container.x + columns[..column].iter().sum::<f32>() + gap * column as f32;
+            let mut slot: Dimensions = Default::default();
+            slot.content = Rect { x, y: cursor_y, width: columns[column], height: 0.0 };
+            child.layout(slot, fonts, images);
+            row_height = row_height.max(child.dimensions.margin_box().height);
+            column += 1;
+        }
+        self.dimensions.content.height = stacked + row_height;
     }
 
     /// Lay out inline children (text) as wrapped lines, producing text fragments
@@ -600,6 +646,77 @@ fn collect_inline_text(bx: &LayoutBox, default_size: f32, href: Option<&str>, ou
     }
 }
 
+/// Expand a `grid-template-columns` track list into concrete pixel widths.
+///
+/// Handles `repeat(n, <tracks>)`, lengths, and `fr` units, which share whatever
+/// space the fixed tracks leave over.
+pub fn resolve_tracks(spec: &str, available: f32, gap: f32, ctx: LengthContext) -> Vec<f32> {
+    let mut tokens: Vec<String> = Vec::new();
+    let mut rest = spec.trim();
+    while !rest.is_empty() {
+        // Flatten `repeat(count, pattern)` into plain tokens.
+        if let Some(after) = rest.strip_prefix("repeat(") {
+            if let Some(close) = after.find(')') {
+                let (inside, tail) = after.split_at(close);
+                let mut parts = inside.splitn(2, ',');
+                let count = parts.next().unwrap_or("").trim().parse::<usize>().unwrap_or(0);
+                let pattern: Vec<&str> = parts.next().unwrap_or("").split_whitespace().collect();
+                for _ in 0..count.min(1000) {
+                    tokens.extend(pattern.iter().map(|p| p.to_string()));
+                }
+                rest = tail[1..].trim_start();
+                continue;
+            }
+        }
+        match rest.split_once(char::is_whitespace) {
+            Some((token, tail)) => {
+                tokens.push(token.to_string());
+                rest = tail.trim_start();
+            }
+            None => {
+                tokens.push(rest.to_string());
+                break;
+            }
+        }
+    }
+
+    // Fixed tracks take their size; `fr` tracks divide the remainder.
+    let fractions: Vec<Option<f32>> = tokens
+        .iter()
+        .map(|t| t.strip_suffix("fr").and_then(|n| n.trim().parse::<f32>().ok()))
+        .collect();
+    let fixed: Vec<f32> = tokens
+        .iter()
+        .zip(&fractions)
+        .map(|(t, fr)| if fr.is_some() { 0.0 } else { parse_track_length(t, ctx) })
+        .collect();
+
+    let total_gap = gap * tokens.len().saturating_sub(1) as f32;
+    let free = (available - fixed.iter().sum::<f32>() - total_gap).max(0.0);
+    let total_fr: f32 = fractions.iter().flatten().sum();
+
+    (0..tokens.len())
+        .map(|i| match fractions[i] {
+            Some(fr) if total_fr > 0.0 => free * fr / total_fr,
+            Some(_) => 0.0,
+            None => fixed[i],
+        })
+        .collect()
+}
+
+fn parse_track_length(token: &str, ctx: LengthContext) -> f32 {
+    for (suffix, unit) in
+        [("px", Unit::Px), ("rem", Unit::Rem), ("em", Unit::Em), ("%", Unit::Percent)]
+    {
+        if let Some(n) = token.strip_suffix(suffix) {
+            if let Ok(v) = n.trim().parse::<f32>() {
+                return Value::Length(v, unit).resolve(ctx);
+            }
+        }
+    }
+    0.0
+}
+
 /// The widest a subtree wants to be if nothing wraps it (CSS `max-content`).
 ///
 /// Needed for content-based sizing: a flex item with `width: auto` and no
@@ -717,18 +834,21 @@ fn build_layout_tree<'a>(style_node: &'a StyledNode<'a>) -> LayoutBox<'a> {
 fn build_box<'a>(style_node: &'a StyledNode<'a>, force_block: bool) -> LayoutBox<'a> {
     let display = style_node.display();
     let mut root = LayoutBox::new(match display {
-        Display::Block | Display::Flex => BoxType::BlockNode(style_node),
+        Display::Block | Display::Flex | Display::Grid => BoxType::BlockNode(style_node),
         Display::Inline if force_block => BoxType::BlockNode(style_node),
         Display::Inline => BoxType::InlineNode(style_node),
         Display::None => panic!("Root node has display: none."),
     });
 
-    let parent_is_flex = display == Display::Flex;
+    // Flex and grid items are always block-level, whatever their own display says.
+    let blockifies = matches!(display, Display::Flex | Display::Grid);
     for child in &style_node.children {
         match child.display() {
             Display::None => {} // skip
-            Display::Block | Display::Flex => root.children.push(build_box(child, false)),
-            Display::Inline if parent_is_flex => root.children.push(build_box(child, true)),
+            Display::Block | Display::Flex | Display::Grid => {
+                root.children.push(build_box(child, false))
+            }
+            Display::Inline if blockifies => root.children.push(build_box(child, true)),
             Display::Inline => root.get_inline_container().children.push(build_box(child, false)),
         }
     }
@@ -803,6 +923,15 @@ mod tests {
         assert_eq!(xs, vec![0.0, 300.0, 500.0]);
         let ys: Vec<f32> = laid.children.iter().map(|c| c.dimensions.content.y).collect();
         assert_eq!(ys, vec![0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn grid_tracks_expand_repeat_and_share_fr_space() {
+        let ctx = crate::css::LengthContext::default();
+        // 3 equal columns across 920 with 20px gaps -> (920 - 40) / 3.
+        assert_eq!(resolve_tracks("repeat(3, 1fr)", 920.0, 20.0, ctx), vec![293.33334; 3]);
+        // A fixed track keeps its size; fr splits what's left (600 - 200 - 10 = 390).
+        assert_eq!(resolve_tracks("200px 1fr 2fr", 600.0, 5.0, ctx), vec![200.0, 130.0, 260.0]);
     }
 
     #[test]
