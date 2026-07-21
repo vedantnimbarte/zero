@@ -14,6 +14,9 @@
 //!   zero [target] [css]              # window   (target = file or URL)
 //!   zero --png [target] [css] [out]  # headless PNG
 
+mod blocker;
+
+use std::cell::Cell;
 use std::fs;
 use std::io::Read;
 use std::num::NonZeroU32;
@@ -68,11 +71,24 @@ fn is_url(s: &str) -> bool {
 /// Networking + filesystem are shell concerns; the engine only decodes bytes.
 struct ShellLoader {
     base: String,
+    /// Shared with the app so the toolbar can report what was blocked.
+    blocked: Rc<Cell<usize>>,
+}
+
+impl ShellLoader {
+    fn new(base: String) -> ShellLoader {
+        ShellLoader { base, blocked: Rc::new(Cell::new(0)) }
+    }
 }
 
 impl zero_engine::ResourceLoader for ShellLoader {
     fn load(&self, url: &str) -> Option<Vec<u8>> {
         let resolved = resolve_url(&self.base, url);
+        // Drop tracker/ad requests before they are ever sent.
+        if blocker::is_blocked(&resolved) {
+            self.blocked.set(self.blocked.get() + 1);
+            return None;
+        }
         if resolved.starts_with("http://") || resolved.starts_with("https://") {
             let mut buf = Vec::new();
             ureq::get(&resolved).call().ok()?.into_reader().read_to_end(&mut buf).ok()?;
@@ -186,7 +202,7 @@ fn main() {
 }
 
 fn render_to_png(engine: &Engine, html: &str, css: &str, out_path: &str, base: &str) {
-    let loader = ShellLoader { base: base.to_string() };
+    let loader = ShellLoader::new(base.to_string());
     let canvas = engine.render_page(html, css, 800.0, 600.0, &loader).canvas;
     let buffer: Vec<u8> = canvas.pixels.iter().flat_map(|c| [c.r, c.g, c.b, c.a]).collect();
     let img = image::RgbaImage::from_raw(canvas.width as u32, canvas.height as u32, buffer)
@@ -209,6 +225,7 @@ fn run_window(engine: Engine, html: String, css: String, address: String) {
         page_canvas: None,
         links: Vec::new(),
         cursor: (0.0, 0.0),
+        blocked_count: 0,
         cache_w: 0,
         cache_h: 0,
         window: None,
@@ -230,6 +247,7 @@ struct App {
     page_canvas: Option<zero_engine::Canvas>,
     links: Vec<zero_engine::LinkArea>,
     cursor: (f32, f32),
+    blocked_count: usize,
     cache_w: u32,
     cache_h: u32,
     window: Option<Rc<Window>>,
@@ -387,7 +405,12 @@ impl App {
             .replace('&', "&amp;")
             .replace('<', "&lt;")
             .replace('>', "&gt;");
-        format!("<html><body><div id=\"bar\">{safe}|</div></body></html>")
+        let shield = if self.blocked_count > 0 {
+            format!("     .     {} trackers blocked", self.blocked_count)
+        } else {
+            String::new()
+        };
+        format!("<html><body><div id=\"bar\">{safe}|{shield}</div></body></html>")
     }
 
     fn redraw(&mut self) {
@@ -404,9 +427,10 @@ impl App {
         // Re-render the page only when the page or the layout size changed; scrolling
         // just re-blits the cached (full-height) canvas.
         if self.page_canvas.is_none() || self.cache_w != w || self.cache_h != page_vh {
-            let loader = ShellLoader { base: self.address.clone() };
+            let loader = ShellLoader::new(self.address.clone());
             let page =
                 self.engine.render_page(&self.page_html, &self.page_css, w as f32, page_vh as f32, &loader);
+            self.blocked_count = loader.blocked.get();
             self.page_canvas = Some(page.canvas);
             self.links = page.links;
             self.cache_w = w;
