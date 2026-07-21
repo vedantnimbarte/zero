@@ -11,6 +11,30 @@ use std::fs;
 use std::io::Read;
 use std::rc::Rc;
 
+/// How Zero identifies itself. Sites use this for rate limiting and for
+/// serving the right markup, and some (Wikimedia among them) reject requests
+/// that arrive with a library's default agent string.
+///
+/// It names Zero honestly rather than impersonating another browser.
+const USER_AGENT: &str = concat!(
+    "Mozilla/5.0 (compatible; ZeroBrowser/",
+    env!("CARGO_PKG_VERSION"),
+    "; +https://github.com/vedantnimbarte/zero)"
+);
+
+/// One agent for the process: it carries our identity and, more importantly,
+/// pools connections, so a page's subresources reuse an open TLS session
+/// instead of paying for a handshake each.
+fn agent() -> &'static ureq::Agent {
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    AGENT.get_or_init(|| {
+        ureq::AgentBuilder::new()
+            .user_agent(USER_AGENT)
+            .timeout_connect(std::time::Duration::from_secs(10))
+            .build()
+    })
+}
+
 pub fn is_url(s: &str) -> bool {
     s.starts_with("http://") || s.starts_with("https://")
 }
@@ -43,9 +67,19 @@ fn with_cookies(url: &str, request: ureq::Request) -> ureq::Request {
     }
 }
 
+/// The `Cookie` header a request should carry, read on the calling thread.
+fn cookie_header(url: &str) -> Option<String> {
+    JAR.with(|jar| jar.borrow().header_for(&partition(), url))
+}
+
 /// Record `Set-Cookie` headers from a response, then persist the jar.
 fn absorb_cookies(url: &str, response: &ureq::Response) {
-    let headers = response.all("set-cookie");
+    store_cookies(url, response.all("set-cookie").iter().map(|h| h.to_string()).collect());
+}
+
+/// The jar half of [`absorb_cookies`], usable with headers collected elsewhere
+/// — worker threads cannot touch the jar, since it is thread-local by design.
+fn store_cookies(url: &str, headers: Vec<String>) {
     if headers.is_empty() {
         return;
     }
@@ -53,7 +87,7 @@ fn absorb_cookies(url: &str, response: &ureq::Response) {
     JAR.with(|jar| {
         let mut jar = jar.borrow_mut();
         for header in headers {
-            jar.store(&site, url, header);
+            jar.store(&site, url, &header);
         }
         if let Some(dir) = crate::storage::profile_dir() {
             jar.save(&dir);
@@ -98,6 +132,145 @@ impl zero_engine::ResourceLoader for ShellLoader {
         self.cache.borrow_mut().insert(resolved, fetched.clone());
         fetched
     }
+
+    /// Fetch a page's subresources concurrently.
+    ///
+    /// Sequentially this dominates load time — a real article spends seconds
+    /// waiting on round trips it could have overlapped. Blocking, caching and
+    /// cookie work stay on this thread: the jar is thread-local on purpose, so
+    /// workers get a prepared header and hand back `Set-Cookie` to be stored here.
+    fn load_all(&self, urls: &[String]) -> Vec<Option<Vec<u8>>> {
+        let mut out: Vec<Option<Vec<u8>>> = vec![None; urls.len()];
+        let mut pending: Vec<(usize, String, Option<String>)> = Vec::new();
+        for (i, url) in urls.iter().enumerate() {
+            let resolved = resolve_url(&self.base, url);
+            if blocker::is_blocked(&resolved) {
+                self.blocked.set(self.blocked.get() + 1);
+                continue;
+            }
+            if let Some(hit) = self.cache.borrow().get(&resolved) {
+                out[i] = hit.clone();
+                continue;
+            }
+            let cookies = is_url(&resolved).then(|| cookie_header(&resolved)).flatten();
+            pending.push((i, resolved, cookies));
+        }
+
+        // Batches are built so no host appears more than PER_HOST times: hosts
+        // rate-limit per client, and a burst of parallel requests to one of them
+        // gets throttled (429) where the same requests spread out succeed.
+        let results: Vec<(usize, String, Option<(Vec<u8>, Vec<String>)>)> = batches(pending)
+            .into_iter()
+            .flat_map(|batch| {
+                std::thread::scope(|scope| {
+                    let handles: Vec<_> = batch
+                        .iter()
+                        .map(|(i, url, cookies)| {
+                            scope.spawn(move || (*i, url.clone(), fetch_detached(url, cookies)))
+                        })
+                        .collect();
+                    handles.into_iter().filter_map(|h| h.join().ok()).collect::<Vec<_>>()
+                })
+            })
+            .collect();
+
+        for (i, url, result) in results {
+            let bytes = match result {
+                Some((bytes, set_cookie)) => {
+                    store_cookies(&url, set_cookie);
+                    Some(bytes)
+                }
+                None => None,
+            };
+            self.cache.borrow_mut().insert(url, bytes.clone());
+            out[i] = bytes;
+        }
+        out
+    }
+}
+
+/// How many subresource fetches run at once, and how many of those may target
+/// the same host.
+const WORKERS: usize = 6;
+const PER_HOST: usize = 2;
+
+/// Split pending fetches into batches that respect both limits.
+///
+/// Requests are taken in order but a host that already has PER_HOST entries in
+/// the current batch is deferred to a later one, so a page of images from one
+/// CDN trickles rather than arriving as a burst.
+fn batches(
+    pending: Vec<(usize, String, Option<String>)>,
+) -> Vec<Vec<(usize, String, Option<String>)>> {
+    let mut out: Vec<Vec<(usize, String, Option<String>)>> = Vec::new();
+    for item in pending {
+        let host = host_of(&item.1);
+        let slot = out.iter().position(|batch| {
+            batch.len() < WORKERS
+                && batch.iter().filter(|(_, url, _)| host_of(url) == host).count() < PER_HOST
+        });
+        match slot {
+            Some(i) => out[i].push(item),
+            None => out.push(vec![item]),
+        }
+    }
+    out
+}
+
+fn host_of(url: &str) -> &str {
+    url.split("://").nth(1).unwrap_or(url).split('/').next().unwrap_or("")
+}
+
+/// A fetch with no access to shell state, so it can run on a worker thread.
+/// Returns the body and any `Set-Cookie` headers for the caller to store.
+fn fetch_detached(url: &str, cookies: &Option<String>) -> Option<(Vec<u8>, Vec<String>)> {
+    if !is_url(url) {
+        // Local files and unsupported schemes are cheap; no thread needed.
+        return std::fs::read(url).ok().map(|bytes| (bytes, Vec::new()));
+    }
+    // HTTPS-first, like every other request the shell makes.
+    let attempts = match url.strip_prefix("http://") {
+        Some(rest) => vec![format!("https://{rest}"), url.to_string()],
+        None => vec![url.to_string()],
+    };
+    for attempt in attempts {
+        let send = || {
+            let mut request = agent().get(&attempt);
+            if let Some(header) = cookies {
+                request = request.set("Cookie", header);
+            }
+            request.call()
+        };
+        let response = match send() {
+            Ok(response) => response,
+            // Fetching a page's images at once can trip a host's rate limit.
+            // Backing off once and retrying is what the status asks for, and it
+            // is the difference between a page with images and one without.
+            Err(ureq::Error::Status(429 | 503, response)) => {
+                std::thread::sleep(retry_after(&response));
+                match send() {
+                    Ok(response) => response,
+                    Err(_) => continue,
+                }
+            }
+            Err(_) => continue,
+        };
+        let set_cookie: Vec<String> =
+            response.all("set-cookie").iter().map(|h| h.to_string()).collect();
+        let mut buf = Vec::new();
+        if response.into_reader().read_to_end(&mut buf).is_ok() {
+            return Some((buf, set_cookie));
+        }
+    }
+    None
+}
+
+/// How long to wait before retrying, honouring `Retry-After` but never stalling
+/// a page load for long — an image is not worth a multi-second freeze, and a
+/// page with many of them would otherwise add up to a hang.
+fn retry_after(response: &ureq::Response) -> std::time::Duration {
+    let secs = response.header("retry-after").and_then(|v| v.trim().parse::<u64>().ok());
+    std::time::Duration::from_millis(secs.map_or(250, |s| (s * 1000).clamp(100, 500)))
 }
 
 impl ShellLoader {
@@ -126,7 +299,7 @@ impl ShellLoader {
 }
 
 fn fetch_bytes(url: &str) -> Option<impl Read> {
-    let response = with_cookies(url, ureq::get(url)).call().ok()?;
+    let response = with_cookies(url, agent().get(url)).call().ok()?;
     absorb_cookies(url, &response);
     Some(response.into_reader())
 }
@@ -194,7 +367,7 @@ pub struct Fetched {
 /// ponytail: blocking call on the UI thread — fine for now; move off-thread if it stalls.
 fn try_fetch(url: &str) -> Option<String> {
     eprintln!("fetching {url} ...");
-    let response = with_cookies(url, ureq::get(url)).call().ok()?;
+    let response = with_cookies(url, agent().get(url)).call().ok()?;
     absorb_cookies(url, &response);
     response.into_string().ok()
 }
@@ -243,6 +416,37 @@ fn error_page(title: &str, detail: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batches_spread_requests_across_hosts() {
+        let pending: Vec<(usize, String, Option<String>)> = [
+            "https://cdn.com/1.png",
+            "https://cdn.com/2.png",
+            "https://cdn.com/3.png",
+            "https://other.com/a.png",
+        ]
+        .iter()
+        .enumerate()
+        .map(|(i, u)| (i, u.to_string(), None))
+        .collect();
+
+        let batched = batches(pending);
+        // The third cdn.com request cannot share a batch with the first two.
+        assert_eq!(batched.len(), 2);
+        assert_eq!(batched[0].len(), 3); // 2x cdn.com + 1x other.com
+        assert_eq!(batched[1].len(), 1);
+        for batch in &batched {
+            assert!(batch.len() <= WORKERS);
+            let cdn = batch.iter().filter(|(_, u, _)| host_of(u) == "cdn.com").count();
+            assert!(cdn <= PER_HOST, "no host may exceed its share of a batch");
+        }
+    }
+
+    #[test]
+    fn host_of_ignores_scheme_and_path() {
+        assert_eq!(host_of("https://a.com/x/y.png"), "a.com");
+        assert_eq!(host_of("a.com/x"), "a.com");
+    }
 
     /// Deleting the file between loads proves the second never hit the disk —
     /// the same reason the network is not hit again on every keystroke.
