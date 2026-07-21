@@ -33,6 +33,7 @@ pub use paint::Canvas;
 pub use resource::{DecodedImage, ResourceLoader};
 
 use dom::{Node, NodeType};
+use std::collections::HashMap;
 use fontdue::Font;
 use resource::{ImageMap, NullLoader};
 use text::{FontEntry, FontSet};
@@ -56,6 +57,10 @@ pub struct Document {
     css: String,
     interp: js::interp::Interp,
     next_node_id: usize,
+    /// Current text of each form field, keyed by node id so it survives re-renders.
+    form_values: HashMap<usize, String>,
+    /// The focused text field, if any.
+    focused: Option<usize>,
     pub console: Vec<String>,
 }
 
@@ -85,11 +90,108 @@ impl Document {
             css: css_source.to_string(),
             interp: js::interp::Interp::new(),
             next_node_id: 1, // 0 means "unassigned"
+            form_values: HashMap::new(),
+            focused: None,
             console: Vec::new(),
         };
         doc.assign_node_ids();
+        doc.seed_form_values();
+        doc.sync_form_fields();
         doc.interp.set_dom(build_dom_view(&doc.root));
         doc
+    }
+
+    /// Text fields start from their `value` attribute.
+    fn seed_form_values(&mut self) {
+        fn walk(node: &Node, out: &mut HashMap<usize, String>) {
+            if let NodeType::Element(ref e) = node.node_type {
+                if is_text_field(&e.tag_name) {
+                    let initial = e.attributes.get("value").cloned().unwrap_or_default();
+                    out.entry(e.node_id).or_insert(initial);
+                }
+            }
+            for child in &node.children {
+                walk(child, out);
+            }
+        }
+        let mut values = std::mem::take(&mut self.form_values);
+        walk(&self.root, &mut values);
+        self.form_values = values;
+    }
+
+    /// Mirror each field's value into the DOM so normal text layout renders it,
+    /// with a caret on the focused one.
+    fn sync_form_fields(&mut self) {
+        let (values, focused) = (self.form_values.clone(), self.focused);
+        fn walk(node: &mut Node, values: &HashMap<usize, String>, focused: Option<usize>) {
+            let mut replacement = None;
+            if let NodeType::Element(ref e) = node.node_type {
+                if is_text_field(&e.tag_name) {
+                    let mut text = values.get(&e.node_id).cloned().unwrap_or_default();
+                    if focused == Some(e.node_id) {
+                        text.push('|'); // caret
+                    } else if text.is_empty() {
+                        text = e.attributes.get("placeholder").cloned().unwrap_or_default();
+                    }
+                    replacement = Some(text);
+                }
+            }
+            if let Some(text) = replacement {
+                // A space keeps the line box (and so the field height) non-zero.
+                node.children = vec![dom::text(if text.is_empty() { " ".into() } else { text })];
+                return;
+            }
+            for child in &mut node.children {
+                walk(child, values, focused);
+            }
+        }
+        walk(&mut self.root, &values, focused);
+    }
+
+    /// Focus a field. Returns false if the element isn't a text field.
+    pub fn focus(&mut self, node_id: usize) -> bool {
+        if !self.form_values.contains_key(&node_id) {
+            return false;
+        }
+        self.focused = Some(node_id);
+        self.refresh_fields();
+        true
+    }
+
+    pub fn blur(&mut self) {
+        if self.focused.take().is_some() {
+            self.refresh_fields();
+        }
+    }
+
+    pub fn is_focused(&self) -> bool {
+        self.focused.is_some()
+    }
+
+    /// Append typed text to the focused field.
+    pub fn insert_text(&mut self, text: &str) -> bool {
+        let Some(id) = self.focused else { return false };
+        self.form_values.entry(id).or_default().push_str(text);
+        self.refresh_fields();
+        true
+    }
+
+    pub fn backspace(&mut self) -> bool {
+        let Some(id) = self.focused else { return false };
+        self.form_values.entry(id).or_default().pop();
+        self.refresh_fields();
+        true
+    }
+
+    /// Re-render field text into the DOM and refresh what scripts can see.
+    fn refresh_fields(&mut self) {
+        self.sync_form_fields();
+        self.interp.set_dom(build_dom_view(&self.root));
+    }
+
+    /// The current text of a field, for the embedder or tests.
+    pub fn field_value(&self, node_id: usize) -> Option<&str> {
+        self.form_values.get(&node_id).map(String::as_str)
     }
 
     fn run_initial_scripts(&mut self) {
@@ -140,6 +242,13 @@ impl Document {
         }
         // New nodes need identities; existing ones keep theirs so handlers stay valid.
         self.assign_node_ids();
+        // Scripts may have set .value or added fields. These come from `out`,
+        // which already took everything off the interpreter.
+        for (id, text) in out.field_writes {
+            self.form_values.insert(id, text);
+        }
+        self.seed_form_values();
+        self.sync_form_fields();
         self.interp.set_dom(build_dom_view(&self.root));
     }
 
@@ -233,7 +342,12 @@ impl Document {
 const USER_AGENT_CSS: &str = "
     html, body, div, p, h1, h2, h3, h4, h5, h6, ul, ol, li, section, article,
     header, footer, nav, main, aside, figure, figcaption, blockquote, pre,
-    table, tr, form, fieldset, address, hr, img { display: block; }
+    table, tr, form, fieldset, address, hr, img, input, textarea, button, select,
+    label { display: block; }
+    input, textarea, select { background: #ffffff; color: #111111; padding: 7px;
+        border-radius: 4px; width: 260px; }
+    button { background: #e6e8ec; color: #111111; padding: 8px; border-radius: 4px;
+        width: 160px; }
     head, script, style, meta, link, title, noscript, base { display: none; }
 ";
 
@@ -357,6 +471,11 @@ impl Engine {
         layout::collect_element_rects(&layout_root, &mut element_rects);
         Page { canvas, links, console, element_rects }
     }
+}
+
+/// Elements whose text content is a user-editable value.
+pub fn is_text_field(tag: &str) -> bool {
+    matches!(tag, "input" | "textarea")
 }
 
 /// Find every `<img src>`, ask the loader for its bytes, and decode it.
