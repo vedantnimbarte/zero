@@ -146,6 +146,8 @@ pub struct Interp {
     env: EnvRef,
     depth: usize,
     dom: DomView,
+    /// Click handlers, keyed by stable element node_id so they survive re-renders.
+    handlers: HashMap<usize, Value>,
     pub out: Output,
 }
 
@@ -171,7 +173,7 @@ impl Interp {
                 ("getElementById", "document.getElementById"),
             ]),
         );
-        Interp { env, depth: 0, dom, out: Output::default() }
+        Interp { env, depth: 0, dom, handlers: HashMap::new(), out: Output::default() }
     }
 
     pub fn run(&mut self, program: &[Stmt]) {
@@ -192,6 +194,31 @@ impl Interp {
                 }
             }
         }
+    }
+
+    /// Refresh the snapshot after the document changed, so later events see new text.
+    pub fn set_dom(&mut self, dom: DomView) {
+        self.dom = dom;
+    }
+
+    pub fn has_handler(&self, node_id: usize) -> bool {
+        self.handlers.contains_key(&node_id)
+    }
+
+    /// Fire the click handler for an element. Returns false if it has none.
+    pub fn dispatch_click(&mut self, node_id: usize) -> bool {
+        let handler = match self.handlers.get(&node_id) {
+            Some(h) => h.clone(),
+            None => return false,
+        };
+        if let Err(e) = self.call(handler, Vec::new()) {
+            self.out.errors.push(e);
+        }
+        true
+    }
+
+    fn node_id_of(&self, index: usize) -> Option<usize> {
+        self.dom.elements.get(index).map(|e| e.node_id)
     }
 
     fn make_function(&self, params: Vec<String>, body: Vec<Stmt>) -> Value {
@@ -411,6 +438,11 @@ impl Interp {
                         map.borrow_mut().insert(property.clone(), v);
                     }
                     Value::Element(i) => match property.as_str() {
+                        "onclick" => {
+                            if let Some(id) = self.node_id_of(i) {
+                                self.handlers.insert(id, v);
+                            }
+                        }
                         "textContent" | "innerText" => {
                             self.out.mutations.push(Mutation::SetText(i, v.to_display()))
                         }
@@ -479,6 +511,16 @@ impl Interp {
                 let joined =
                     items.borrow().iter().map(Value::to_display).collect::<Vec<_>>().join(&sep);
                 Value::Str(joined)
+            }
+            (Value::Element(i), "addEventListener") => {
+                let is_click = args.first().map(Value::to_display).as_deref() == Some("click");
+                match (is_click, args.get(1), self.node_id_of(*i)) {
+                    (true, Some(f), Some(id)) => {
+                        self.handlers.insert(id, f.clone());
+                    }
+                    _ => {} // only click is supported for now
+                }
+                Value::Undefined
             }
             (Value::Str(s), "toUpperCase") => Value::Str(s.to_uppercase()),
             (Value::Str(s), "toLowerCase") => Value::Str(s.to_lowercase()),
