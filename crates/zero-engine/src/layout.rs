@@ -400,33 +400,54 @@ impl<'a> LayoutBox<'a> {
             return;
         }
 
-        // Explicit widths are honoured; everything else shares what's left.
-        let explicit: Vec<Option<f32>> = self
+        // Each item starts at its base size (explicit width, else content width),
+        // then leftover space is shared out in proportion to flex-grow.
+        struct Item {
+            base: f32,
+            grow: f32,
+        }
+        let items: Vec<Item> = self
             .children
             .iter()
             .map(|child| match child.box_type {
-                BoxType::AnonymousBlock => None,
-                _ => child.get_style_node().value("width").map(|v| v.to_px()).filter(|w| *w > 0.0),
+                BoxType::AnonymousBlock => Item { base: 0.0, grow: 1.0 },
+                _ => {
+                    let style = child.get_style_node();
+                    let ctx = style.length_context(container.width);
+                    let base = match style.value("width") {
+                        Some(v @ Value::Length(..)) => v.resolve(ctx),
+                        _ => max_content_width(style, fonts, images).min(container.width),
+                    };
+                    // `flex: 1` and `flex-grow: 1` both mean "take a share".
+                    let grow = style
+                        .value("flex-grow")
+                        .or_else(|| style.value("flex"))
+                        .and_then(|v| v.as_number())
+                        .unwrap_or(0.0);
+                    Item { base, grow }
+                }
             })
             .collect();
-        let fixed: f32 = explicit.iter().flatten().sum();
-        let flexible = explicit.iter().filter(|w| w.is_none()).count();
+
         let total_gap = gap * count.saturating_sub(1) as f32;
-        let leftover = (container.width - fixed - total_gap).max(0.0);
-        let share = if flexible > 0 { leftover / flexible as f32 } else { 0.0 };
+        let used: f32 = items.iter().map(|i| i.base).sum();
+        let leftover = container.width - used - total_gap;
+        let total_grow: f32 = items.iter().map(|i| i.grow).sum();
 
         let mut cursor_x = container.x;
         let mut tallest = 0.0_f32;
         for (i, child) in self.children.iter_mut().enumerate() {
+            let mut width = items[i].base;
+            if leftover > 0.0 && total_grow > 0.0 {
+                width += leftover * items[i].grow / total_grow;
+            } else if leftover < 0.0 && used > 0.0 {
+                width += leftover * (items[i].base / used); // shrink proportionally
+            }
             // Each item gets a containing block that is exactly its slot, so an
             // `auto` width fills the slot rather than the whole container.
             let mut slot: Dimensions = Default::default();
-            slot.content = Rect {
-                x: cursor_x,
-                y: container.y,
-                width: explicit[i].unwrap_or(share),
-                height: 0.0,
-            };
+            slot.content =
+                Rect { x: cursor_x, y: container.y, width: width.max(0.0), height: 0.0 };
             child.layout(slot, fonts, images);
             let item = child.dimensions.margin_box();
             cursor_x += item.width + gap;
@@ -512,6 +533,87 @@ fn collect_inline_text(bx: &LayoutBox, default_size: f32, href: Option<&str>, ou
     }
 }
 
+/// The widest a subtree wants to be if nothing wraps it (CSS `max-content`).
+///
+/// Needed for content-based sizing: a flex item with `width: auto` and no
+/// `flex-grow` should be as wide as its content, not as wide as its container.
+///
+/// ponytail: measures text without wrapping and ignores min-content (longest word).
+/// Good enough for shrink-to-fit; a full intrinsic pass would compute both.
+pub fn max_content_width(
+    style: &StyledNode,
+    fonts: Option<&FontSet>,
+    images: &ImageMap,
+) -> f32 {
+    if style.display() == Display::None {
+        return 0.0;
+    }
+    let ctx = style.length_context(0.0);
+    let edges = ["margin-left", "margin-right", "padding-left", "padding-right"]
+        .iter()
+        .map(|name| {
+            let short = if name.starts_with("margin") { "margin" } else { "padding" };
+            style.lookup(name, short, &Value::Length(0.0, Unit::Px)).resolve(ctx)
+        })
+        .sum::<f32>();
+
+    // An explicit, absolute width settles it.
+    if let Some(Value::Length(w, Unit::Px)) = style.value("width") {
+        return w + edges;
+    }
+
+    let content = match style.node.node_type {
+        NodeType::Text(ref t) => measure_text(t, style.font_size(), fonts),
+        NodeType::Element(ref e) if e.tag_name == "img" => e
+            .attributes
+            .get("src")
+            .and_then(|src| images.get(src))
+            .map(|img| img.width as f32)
+            .unwrap_or(0.0),
+        NodeType::Element(_) => {
+            let row_flex = style.display() == Display::Flex
+                && !matches!(style.value("flex-direction"), Some(Value::Keyword(ref k)) if k == "column");
+            let gap = style.value("gap").map(|v| v.resolve(ctx)).unwrap_or(0.0);
+
+            // Block children stack, so take the widest. Inline children share a
+            // line, so they add up. A flex row also adds up.
+            let mut widest: f32 = 0.0;
+            let mut inline_run = 0.0;
+            let mut flex_total = 0.0;
+            let mut items: usize = 0;
+            for child in &style.children {
+                let w = max_content_width(child, fonts, images);
+                if row_flex {
+                    flex_total += w;
+                    items += 1;
+                } else if child.display() == Display::Inline {
+                    inline_run += w;
+                } else {
+                    widest = widest.max(w);
+                }
+            }
+            if row_flex {
+                flex_total + gap * items.saturating_sub(1) as f32
+            } else {
+                widest.max(inline_run)
+            }
+        }
+    };
+    content + edges
+}
+
+fn measure_text(text: &str, size: f32, fonts: Option<&FontSet>) -> f32 {
+    let fonts = match fonts {
+        Some(f) => f,
+        None => return 0.0,
+    };
+    let trimmed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if trimmed.is_empty() {
+        return 0.0;
+    }
+    shape_run(&fonts.entries[fonts.pick(&trimmed)], &trimmed, size).1
+}
+
 /// Gather the painted box of every element, so the embedder can hit-test clicks.
 pub fn collect_element_rects(bx: &LayoutBox, out: &mut Vec<ElementRect>) {
     if let BoxType::BlockNode(styled) | BoxType::InlineNode(styled) = bx.box_type {
@@ -588,11 +690,12 @@ mod tests {
         assert_eq!(root.dimensions.content.width, 200.0);
     }
 
-    /// Build a styled node with the given `display`/`width`, plus children.
+    /// Build a styled node with the given `display`/`width`/`flex-grow`, plus children.
     fn styled<'a>(
         node: &'a dom::Node,
         display: &str,
         width: Option<f32>,
+        grow: Option<f32>,
         children: Vec<StyledNode<'a>>,
     ) -> StyledNode<'a> {
         let mut values = HashMap::new();
@@ -600,21 +703,25 @@ mod tests {
         if let Some(w) = width {
             values.insert("width".to_string(), Value::Length(w, Unit::Px));
         }
+        if let Some(g) = grow {
+            values.insert("flex-grow".to_string(), Value::Number(g));
+        }
         StyledNode { node, specified_values: values, children }
     }
 
     #[test]
-    fn flex_row_splits_leftover_space_between_auto_items() {
+    fn flex_grow_shares_leftover_space_proportionally() {
         let node = dom::elem("div".into(), HashMap::new(), vec![]);
-        // 900 wide: one fixed 300px item, two auto items share the rest.
+        // 900 wide: fixed 300px, then grow 1 and grow 2 split the remaining 600.
         let root = styled(
             &node,
             "flex",
             None,
+            None,
             vec![
-                styled(&node, "block", Some(300.0), vec![]),
-                styled(&node, "block", None, vec![]),
-                styled(&node, "block", None, vec![]),
+                styled(&node, "block", Some(300.0), None, vec![]),
+                styled(&node, "block", None, Some(1.0), vec![]),
+                styled(&node, "block", None, Some(2.0), vec![]),
             ],
         );
         let mut viewport: Dimensions = Default::default();
@@ -622,13 +729,33 @@ mod tests {
 
         let laid = layout_tree(&root, viewport, None, &ImageMap::new());
         let widths: Vec<f32> = laid.children.iter().map(|c| c.dimensions.content.width).collect();
-        assert_eq!(widths, vec![300.0, 300.0, 300.0]);
+        assert_eq!(widths, vec![300.0, 200.0, 400.0]);
 
         // Items sit side by side, not stacked.
         let xs: Vec<f32> = laid.children.iter().map(|c| c.dimensions.content.x).collect();
-        assert_eq!(xs, vec![0.0, 300.0, 600.0]);
+        assert_eq!(xs, vec![0.0, 300.0, 500.0]);
         let ys: Vec<f32> = laid.children.iter().map(|c| c.dimensions.content.y).collect();
         assert_eq!(ys, vec![0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn flex_items_without_grow_are_content_sized() {
+        let node = dom::elem("div".into(), HashMap::new(), vec![]);
+        // No flex-grow means shrink-to-fit, so an empty item takes no width and
+        // leftover space stays empty — which is what real CSS does.
+        let root = styled(
+            &node,
+            "flex",
+            None,
+            None,
+            vec![styled(&node, "block", Some(200.0), None, vec![]), styled(&node, "block", None, None, vec![])],
+        );
+        let mut viewport: Dimensions = Default::default();
+        viewport.content.width = 900.0;
+
+        let laid = layout_tree(&root, viewport, None, &ImageMap::new());
+        let widths: Vec<f32> = laid.children.iter().map(|c| c.dimensions.content.width).collect();
+        assert_eq!(widths, vec![200.0, 0.0]);
     }
 
     #[test]
