@@ -26,6 +26,9 @@ pub enum Expr {
     Func { params: Vec<String>, body: Vec<Stmt> },
     This,
     New { callee: Box<Expr>, args: Vec<Expr> },
+    /// `super` — resolves to the parent class's method table.
+    Super,
+    Ternary { cond: Box<Expr>, then: Box<Expr>, otherwise: Box<Expr> },
 }
 
 #[derive(Debug, Clone)]
@@ -40,8 +43,12 @@ pub enum Stmt {
     FuncDecl { name: String, params: Vec<String>, body: Vec<Stmt> },
     Throw(Expr),
     Try { body: Vec<Stmt>, param: Option<String>, catch: Vec<Stmt>, finally: Vec<Stmt> },
-    /// `class C { constructor(..){} method(..){} }`
-    ClassDecl { name: String, methods: Vec<(String, Vec<String>, Vec<Stmt>)> },
+    /// `class C extends P { constructor(..){} method(..){} }`
+    ClassDecl {
+        name: String,
+        parent: Option<String>,
+        methods: Vec<(String, Vec<String>, Vec<Stmt>)>,
+    },
 }
 
 /// Binding power for binary operators; higher binds tighter.
@@ -157,6 +164,7 @@ impl Parser {
         }
         if self.eat_kw(Kw::Class) {
             let name = self.expect_ident()?;
+            let parent = if self.eat_kw(Kw::Extends) { Some(self.expect_ident()?) } else { None };
             self.expect_op("{")?;
             let mut methods = Vec::new();
             while !self.eat_op("}") {
@@ -168,7 +176,7 @@ impl Parser {
                 let body = self.parse_block_body()?;
                 methods.push((method, params, body));
             }
-            return Ok(Stmt::ClassDecl { name, methods });
+            return Ok(Stmt::ClassDecl { name, parent, methods });
         }
         if self.eat_kw(Kw::Return) {
             let value = if matches!(self.peek(), Tok::Op(o) if o == ";") || *self.peek() == Tok::Eof
@@ -255,7 +263,7 @@ impl Parser {
     }
 
     fn parse_assign(&mut self) -> Result<Expr, String> {
-        let left = self.parse_binary(0)?;
+        let left = self.parse_ternary()?;
         // Compound assignment desugars to `x = x op v`.
         for (op, bin) in [("=", ""), ("+=", "+"), ("-=", "-"), ("*=", "*"), ("/=", "/")] {
             if matches!(self.peek(), Tok::Op(o) if o == op) {
@@ -274,6 +282,23 @@ impl Parser {
             }
         }
         Ok(left)
+    }
+
+    /// `cond ? a : b`, which binds tighter than assignment but looser than any
+    /// binary operator.
+    fn parse_ternary(&mut self) -> Result<Expr, String> {
+        let cond = self.parse_binary(0)?;
+        if !self.eat_op("?") {
+            return Ok(cond);
+        }
+        let then = self.parse_assign()?;
+        self.expect_op(":")?;
+        let otherwise = self.parse_assign()?;
+        Ok(Expr::Ternary {
+            cond: Box::new(cond),
+            then: Box::new(then),
+            otherwise: Box::new(otherwise),
+        })
     }
 
     fn parse_binary(&mut self, min_bp: u8) -> Result<Expr, String> {
@@ -362,6 +387,7 @@ impl Parser {
             Tok::Kw(Kw::Null) => Ok(Expr::Null),
             Tok::Kw(Kw::Undefined) => Ok(Expr::Undefined),
             Tok::Kw(Kw::This) => Ok(Expr::This),
+            Tok::Kw(Kw::Super) => Ok(Expr::Super),
             Tok::Kw(Kw::New) => {
                 let callee = self.parse_primary()?;
                 let mut args = Vec::new();
