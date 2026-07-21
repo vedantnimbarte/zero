@@ -27,13 +27,20 @@ pub struct ElementData {
 }
 
 pub fn text(data: String) -> Node {
-    Node { children: vec![], node_type: NodeType::Text(data) }
+    Node {
+        children: vec![],
+        node_type: NodeType::Text(data),
+    }
 }
 
 pub fn elem(name: String, attributes: AttrMap, children: Vec<Node>) -> Node {
     Node {
         children,
-        node_type: NodeType::Element(ElementData { tag_name: name, attributes, node_id: 0 }),
+        node_type: NodeType::Element(ElementData {
+            tag_name: name,
+            attributes,
+            node_id: 0,
+        }),
     }
 }
 

@@ -44,7 +44,9 @@ impl DomView {
     /// A combinator like `div p` is dropped by the parser and matches nothing.
     pub fn query(&self, selector: &str) -> Vec<usize> {
         let sheet = crate::css::parse(format!("{selector} {{}}"));
-        let Some(rule) = sheet.rules.first() else { return Vec::new() };
+        let Some(rule) = sheet.rules.first() else {
+            return Vec::new();
+        };
         self.elements
             .iter()
             .enumerate()

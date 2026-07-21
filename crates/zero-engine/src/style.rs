@@ -54,7 +54,8 @@ impl<'a> StyledNode<'a> {
 
     /// Resolve a property to px in this element's context.
     pub fn px(&self, name: &str, percent_base: f32) -> Option<f32> {
-        self.value(name).map(|v| v.resolve(self.length_context(percent_base)))
+        self.value(name)
+            .map(|v| v.resolve(self.length_context(percent_base)))
     }
 
     /// Return `name`, else `fallback_name` (for shorthand like `margin`), else `default`.
@@ -95,7 +96,11 @@ fn matches_simple_selector(elem: &ElementData, selector: &SimpleSelector) -> boo
         return false;
     }
     let elem_classes = elem.classes();
-    if selector.class.iter().any(|class| !elem_classes.contains(&class.as_str())) {
+    if selector
+        .class
+        .iter()
+        .any(|class| !elem_classes.contains(&class.as_str()))
+    {
         return false;
     }
     true
@@ -111,7 +116,11 @@ fn match_rule<'a>(elem: &ElementData, rule: &'a Rule) -> Option<MatchedRule<'a>>
 }
 
 fn matching_rules<'a>(elem: &ElementData, stylesheet: &'a Stylesheet) -> Vec<MatchedRule<'a>> {
-    stylesheet.rules.iter().filter_map(|rule| match_rule(elem, rule)).collect()
+    stylesheet
+        .rules
+        .iter()
+        .filter_map(|rule| match_rule(elem, rule))
+        .collect()
 }
 
 fn specified_values(elem: &ElementData, stylesheet: &Stylesheet) -> PropertyMap {
@@ -166,7 +175,14 @@ fn style_tree_inner<'a>(
         _ => parent_font,
     };
     specified.insert("font-size".to_string(), Value::Length(font_px, Unit::Px));
-    let children =
-        root.children.iter().map(|child| style_tree_inner(child, stylesheet, &specified)).collect();
-    StyledNode { node: root, specified_values: specified, children }
+    let children = root
+        .children
+        .iter()
+        .map(|child| style_tree_inner(child, stylesheet, &specified))
+        .collect();
+    StyledNode {
+        node: root,
+        specified_values: specified,
+        children,
+    }
 }

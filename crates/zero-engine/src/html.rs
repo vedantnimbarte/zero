@@ -19,7 +19,10 @@ const VOID_ELEMENTS: &[&str] = &[
 const RAW_TEXT_ELEMENTS: &[&str] = &["script", "style"];
 
 pub fn parse(source: String) -> dom::Node {
-    let mut parser = Parser { pos: 0, input: source };
+    let mut parser = Parser {
+        pos: 0,
+        input: source,
+    };
     let mut nodes = parser.parse_nodes();
     if nodes.len() == 1 {
         nodes.swap_remove(0)
@@ -54,7 +57,8 @@ impl Parser {
     fn starts_with_ci(&self, s: &str) -> bool {
         let bytes = self.input.as_bytes();
         let sb = s.as_bytes();
-        self.pos + sb.len() <= bytes.len() && bytes[self.pos..self.pos + sb.len()].eq_ignore_ascii_case(sb)
+        self.pos + sb.len() <= bytes.len()
+            && bytes[self.pos..self.pos + sb.len()].eq_ignore_ascii_case(sb)
     }
 
     fn eof(&self) -> bool {
@@ -132,7 +136,11 @@ impl Parser {
         }
         if RAW_TEXT_ELEMENTS.contains(&tag.as_str()) {
             let text = self.consume_raw_text(&tag);
-            let children = if text.trim().is_empty() { vec![] } else { vec![dom::text(text)] };
+            let children = if text.trim().is_empty() {
+                vec![]
+            } else {
+                vec![dom::text(text)]
+            };
             self.consume_close_tag();
             return dom::elem(tag, attrs, children);
         }

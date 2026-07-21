@@ -20,6 +20,11 @@ use crate::text::{shape_run, FontSet, PositionedGlyph};
 #[derive(Clone)]
 pub struct TextFragment {
     pub glyphs: Vec<PositionedGlyph>,
+    /// The source word, kept because shaping throws characters away and
+    /// find-in-page still has to match on them.
+    pub text: String,
+    /// Advance width of the run, so a highlight can be drawn behind it.
+    pub width: f32,
     pub x: f32,
     /// Top of the line box (baseline is derived at paint time from font ascent).
     pub y: f32,
@@ -191,7 +196,12 @@ impl<'a> LayoutBox<'a> {
         }
     }
 
-    fn layout_block(&mut self, containing_block: Dimensions, fonts: Option<&FontSet>, images: &ImageMap) {
+    fn layout_block(
+        &mut self,
+        containing_block: Dimensions,
+        fonts: Option<&FontSet>,
+        images: &ImageMap,
+    ) {
         // Width depends on the parent, so it's computed top-down first.
         self.calculate_block_width(containing_block);
         self.calculate_block_position(containing_block);
@@ -253,9 +263,15 @@ impl<'a> LayoutBox<'a> {
         let src = elem.attributes.get("src")?;
         let img = images.get(src);
         let css_px = |name: &str| styled.px(name, 0.0).filter(|v| *v > 0.0);
-        let attr_px = |name: &str| elem.attributes.get(name).and_then(|s| s.trim().parse::<f32>().ok());
+        let attr_px = |name: &str| {
+            elem.attributes
+                .get(name)
+                .and_then(|s| s.trim().parse::<f32>().ok())
+        };
 
-        let w = css_px("width").or_else(|| attr_px("width")).or_else(|| img.map(|i| i.width as f32))?;
+        let w = css_px("width")
+            .or_else(|| attr_px("width"))
+            .or_else(|| img.map(|i| i.width as f32))?;
         let h = css_px("height")
             .or_else(|| attr_px("height"))
             .or_else(|| img.map(|i| i.height as f32))
@@ -274,7 +290,10 @@ impl<'a> LayoutBox<'a> {
         let container = self.dimensions.content;
         let style = self.get_style_node();
         let ctx = style.length_context(container.width);
-        let spacing = style.value("border-spacing").map(|v| v.resolve(ctx)).unwrap_or(0.0);
+        let spacing = style
+            .value("border-spacing")
+            .map(|v| v.resolve(ctx))
+            .unwrap_or(0.0);
 
         // Rows may sit directly under the table or inside a section element.
         let mut rows: Vec<(usize, Option<usize>)> = Vec::new();
@@ -320,7 +339,13 @@ impl<'a> LayoutBox<'a> {
                 while carry.get(column).copied().unwrap_or(0) > 0 {
                     column += 1;
                 }
-                placed.push(Placed { row: r, cell: cell_index, column, colspan, rowspan });
+                placed.push(Placed {
+                    row: r,
+                    cell: cell_index,
+                    column,
+                    colspan,
+                    rowspan,
+                });
                 if rowspan > 1 {
                     while carry.len() < column + colspan {
                         carry.push(0);
@@ -376,7 +401,12 @@ impl<'a> LayoutBox<'a> {
             let row_path = rows[item.row];
             let cell = &mut row_at_mut(&mut self.children, row_path).children[item.cell];
             let mut slot: Dimensions = Default::default();
-            slot.content = Rect { x: container.x, y: container.y, width, height: 0.0 };
+            slot.content = Rect {
+                x: container.x,
+                y: container.y,
+                width,
+                height: 0.0,
+            };
             cell.layout(slot, fonts, images);
             if item.rowspan == 1 {
                 let height = cell.dimensions.margin_box().height;
@@ -418,7 +448,12 @@ impl<'a> LayoutBox<'a> {
             let top = row_tops[item.row];
             let cell = &mut row_at_mut(&mut self.children, row_path).children[item.cell];
             let mut slot: Dimensions = Default::default();
-            slot.content = Rect { x, y: top, width, height: 0.0 };
+            slot.content = Rect {
+                x,
+                y: top,
+                width,
+                height: 0.0,
+            };
             cell.layout(slot, fonts, images);
             // Stretch so a row's backgrounds share one baseline.
             let outer = cell.dimensions.margin_box().height;
@@ -439,20 +474,27 @@ impl<'a> LayoutBox<'a> {
 
         // Sections wrap their rows, so give them the union of what they contain.
         for child in self.children.iter_mut() {
-            if matches!(tag_name_of(child).as_deref(), Some("tbody" | "thead" | "tfoot")) {
+            if matches!(
+                tag_name_of(child).as_deref(),
+                Some("tbody" | "thead" | "tfoot")
+            ) {
                 let top = child.children.first().map(|r| r.dimensions.content.y);
                 let bottom = child
                     .children
                     .last()
                     .map(|r| r.dimensions.content.y + r.dimensions.content.height);
                 if let (Some(top), Some(bottom)) = (top, bottom) {
-                    child.dimensions.content =
-                        Rect { x: container.x, y: top, width: container.width, height: bottom - top };
+                    child.dimensions.content = Rect {
+                        x: container.x,
+                        y: top,
+                        width: container.width,
+                        height: bottom - top,
+                    };
                 }
             }
         }
-        self.dimensions.content.height = row_heights.iter().sum::<f32>()
-            + spacing * rows.len().saturating_sub(1) as f32;
+        self.dimensions.content.height =
+            row_heights.iter().sum::<f32>() + spacing * rows.len().saturating_sub(1) as f32;
     }
 
     /// Grid layout: place items into a track grid, honouring explicit placement.
@@ -507,7 +549,11 @@ impl<'a> LayoutBox<'a> {
                         occupied[row][c] = true;
                     }
                     placements.push((index, row, start, span));
-                    col = if explicit_col.is_some() { col } else { start + span };
+                    col = if explicit_col.is_some() {
+                        col
+                    } else {
+                        start + span
+                    };
                     if col >= columns.len() {
                         row += 1;
                         col = 0;
@@ -529,7 +575,12 @@ impl<'a> LayoutBox<'a> {
             let width = columns[c..c + span].iter().sum::<f32>() + gap * (span - 1) as f32;
             let x = container.x + columns[..c].iter().sum::<f32>() + gap * c as f32;
             let mut slot: Dimensions = Default::default();
-            slot.content = Rect { x, y: container.y, width, height: 0.0 };
+            slot.content = Rect {
+                x,
+                y: container.y,
+                width,
+                height: 0.0,
+            };
             self.children[index].layout(slot, fonts, images);
             let h = self.children[index].dimensions.margin_box().height;
             if r < row_heights.len() {
@@ -546,13 +597,16 @@ impl<'a> LayoutBox<'a> {
 
         // Re-run each item now that its row's y position is known.
         for &(index, r, c, span) in &placements {
-            let y = container.y
-                + row_heights[..r].iter().sum::<f32>()
-                + gap * r as f32;
+            let y = container.y + row_heights[..r].iter().sum::<f32>() + gap * r as f32;
             let width = columns[c..c + span].iter().sum::<f32>() + gap * (span - 1) as f32;
             let x = container.x + columns[..c].iter().sum::<f32>() + gap * c as f32;
             let mut slot: Dimensions = Default::default();
-            slot.content = Rect { x, y, width, height: 0.0 };
+            slot.content = Rect {
+                x,
+                y,
+                width,
+                height: 0.0,
+            };
             self.children[index].layout(slot, fonts, images);
             if let Some(explicit) = row_sizes.get(r) {
                 if *explicit > 0.0 {
@@ -664,8 +718,11 @@ impl<'a> LayoutBox<'a> {
                             _ => max_content_width(style, Some(fonts), images).min(max_width),
                         }
                     };
-                    let mut lead =
-                        if pending_space && cursor_x > start_x { default_space } else { 0.0 };
+                    let mut lead = if pending_space && cursor_x > start_x {
+                        default_space
+                    } else {
+                        0.0
+                    };
                     if cursor_x > start_x && cursor_x + lead + outer > start_x + max_width {
                         lead = 0.0;
                         for boxed in open.iter_mut() {
@@ -681,8 +738,12 @@ impl<'a> LayoutBox<'a> {
                     }
                     cursor_x += lead;
                     let mut slot: Dimensions = Default::default();
-                    slot.content =
-                        Rect { x: cursor_x, y: cursor_y, width: outer, height: 0.0 };
+                    slot.content = Rect {
+                        x: cursor_x,
+                        y: cursor_y,
+                        width: outer,
+                        height: 0.0,
+                    };
                     self.children[index].layout(slot, Some(fonts), images);
                     let placed = self.children[index].dimensions.margin_box();
                     line_height = line_height.max(placed.height);
@@ -705,7 +766,11 @@ impl<'a> LayoutBox<'a> {
                 // Indic reordering/conjuncts happen.
                 let font_index = fonts.pick(word);
                 let (glyphs, word_w) = shape_run(&fonts.entries[font_index], word, piece.size);
-                let mut lead = if pending_space && cursor_x > start_x { space_w } else { 0.0 };
+                let mut lead = if pending_space && cursor_x > start_x {
+                    space_w
+                } else {
+                    0.0
+                };
                 // Wrap if this word overflows and we're not at line start.
                 if cursor_x > start_x && cursor_x + lead + word_w > start_x + max_width {
                     lead = 0.0;
@@ -729,6 +794,8 @@ impl<'a> LayoutBox<'a> {
                 }
                 fragments.push(TextFragment {
                     glyphs,
+                    text: word.to_string(),
+                    width: word_w,
                     x: cursor_x,
                     y: cursor_y,
                     size: piece.size,
@@ -756,8 +823,11 @@ impl<'a> LayoutBox<'a> {
         }
         self.inline_boxes = inline_boxes;
 
-        self.dimensions.content.height =
-            if placed_any { (cursor_y - top) + line_height } else { 0.0 };
+        self.dimensions.content.height = if placed_any {
+            (cursor_y - top) + line_height
+        } else {
+            0.0
+        };
         self.text_fragments = fragments;
         self.link_areas = link_areas;
     }
@@ -781,8 +851,13 @@ impl<'a> LayoutBox<'a> {
         let padding_right = style.lookup("padding-right", "padding", &zero);
 
         let total: f32 = [
-            &margin_left, &margin_right, &border_left, &border_right, &padding_left,
-            &padding_right, &width,
+            &margin_left,
+            &margin_right,
+            &border_left,
+            &border_right,
+            &padding_left,
+            &padding_right,
+            &width,
         ]
         .iter()
         .map(|v| v.resolve(ctx))
@@ -849,10 +924,16 @@ impl<'a> LayoutBox<'a> {
         let d = &mut self.dimensions;
         d.margin.top = style.lookup("margin-top", "margin", &zero).resolve(ctx);
         d.margin.bottom = style.lookup("margin-bottom", "margin", &zero).resolve(ctx);
-        d.border.top = style.lookup("border-top-width", "border-width", &zero).resolve(ctx);
-        d.border.bottom = style.lookup("border-bottom-width", "border-width", &zero).resolve(ctx);
+        d.border.top = style
+            .lookup("border-top-width", "border-width", &zero)
+            .resolve(ctx);
+        d.border.bottom = style
+            .lookup("border-bottom-width", "border-width", &zero)
+            .resolve(ctx);
         d.padding.top = style.lookup("padding-top", "padding", &zero).resolve(ctx);
-        d.padding.bottom = style.lookup("padding-bottom", "padding", &zero).resolve(ctx);
+        d.padding.bottom = style
+            .lookup("padding-bottom", "padding", &zero)
+            .resolve(ctx);
 
         d.content.x = containing_block.content.x + d.margin.left + d.border.left + d.padding.left;
         // Stack below the content already placed in the containing block.
@@ -896,8 +977,13 @@ impl<'a> LayoutBox<'a> {
     /// `flex: 1` does, and covers most real column/nav layouts).
     fn layout_flex_children(&mut self, fonts: Option<&FontSet>, images: &ImageMap) {
         let style = self.get_style_node();
-        let is_column = matches!(style.value("flex-direction"), Some(Value::Keyword(ref k)) if k == "column");
-        let gap = style.value("gap").map(|v| v.to_px()).filter(|g| *g > 0.0).unwrap_or(0.0);
+        let is_column =
+            matches!(style.value("flex-direction"), Some(Value::Keyword(ref k)) if k == "column");
+        let gap = style
+            .value("gap")
+            .map(|v| v.to_px())
+            .filter(|g| *g > 0.0)
+            .unwrap_or(0.0);
 
         if is_column {
             // A column flex container stacks like a block, just with gaps.
@@ -919,14 +1005,19 @@ impl<'a> LayoutBox<'a> {
             .children
             .iter()
             .map(|child| match child.box_type {
-                BoxType::AnonymousBlock => Item { base: 0.0, grow: 1.0 },
+                BoxType::AnonymousBlock => Item {
+                    base: 0.0,
+                    grow: 1.0,
+                },
                 _ => {
                     let style = child.get_style_node();
                     let ctx = style.length_context(container.width);
                     // Base is the OUTER width, so gaps and free space line up with
                     // what layout actually produces (a border box, not content).
                     let base = match style.value("width") {
-                        Some(v @ Value::Length(..)) => v.resolve(ctx) + horizontal_edges(style, ctx),
+                        Some(v @ Value::Length(..)) => {
+                            v.resolve(ctx) + horizontal_edges(style, ctx)
+                        }
                         _ => max_content_width(style, fonts, images).min(container.width),
                     };
                     // `flex: 1` and `flex-grow: 1` both mean "take a share".
@@ -941,12 +1032,19 @@ impl<'a> LayoutBox<'a> {
             .collect();
 
         let wrap = matches!(style.value("flex-wrap"), Some(Value::Keyword(ref k)) if k.starts_with("wrap"));
-        let justify = style.value("justify-content").and_then(keyword_of).unwrap_or_default();
-        let align = style.value("align-items").and_then(keyword_of).unwrap_or_default();
+        let justify = style
+            .value("justify-content")
+            .and_then(keyword_of)
+            .unwrap_or_default();
+        let align = style
+            .value("align-items")
+            .and_then(keyword_of)
+            .unwrap_or_default();
 
         // Group items into lines. Without wrapping everything shares one line.
-        let flow: Vec<usize> =
-            (0..count).filter(|&i| !self.children[i].is_out_of_flow()).collect();
+        let flow: Vec<usize> = (0..count)
+            .filter(|&i| !self.children[i].is_out_of_flow())
+            .collect();
         let mut lines: Vec<Vec<usize>> = Vec::new();
         let mut current: Vec<usize> = Vec::new();
         let mut line_width = 0.0_f32;
@@ -994,8 +1092,12 @@ impl<'a> LayoutBox<'a> {
             let mut tallest = 0.0_f32;
             for (slot_index, &i) in line.iter().enumerate() {
                 let mut slot: Dimensions = Default::default();
-                slot.content =
-                    Rect { x: cursor_x, y: cursor_y, width: widths[slot_index], height: 0.0 };
+                slot.content = Rect {
+                    x: cursor_x,
+                    y: cursor_y,
+                    width: widths[slot_index],
+                    height: 0.0,
+                };
                 self.children[i].layout(slot, fonts, images);
                 let placed = self.children[i].dimensions.margin_box();
                 cursor_x += placed.width + gap + between;
@@ -1004,7 +1106,14 @@ impl<'a> LayoutBox<'a> {
 
             // Cross-axis alignment happens once the line's height is known.
             for &i in line.iter() {
-                align_cross_axis(&mut self.children[i], &align, cursor_y, tallest, fonts, images);
+                align_cross_axis(
+                    &mut self.children[i],
+                    &align,
+                    cursor_y,
+                    tallest,
+                    fonts,
+                    images,
+                );
             }
 
             cursor_y += tallest;
@@ -1136,10 +1245,19 @@ fn collect_inline_text(
             }
         }
         if let NodeType::Text(ref t) = styled.node.node_type {
-            let size = if styled.font_size() > 0.0 { styled.font_size() } else { default_size };
+            let size = if styled.font_size() > 0.0 {
+                styled.font_size()
+            } else {
+                default_size
+            };
             let color = match styled.value("color") {
                 Some(Value::ColorValue(c)) => c,
-                _ => Color { r: 0, g: 0, b: 0, a: 255 },
+                _ => Color {
+                    r: 0,
+                    g: 0,
+                    b: 0,
+                    a: 255,
+                },
             };
             out.push(InlinePiece::Text(TextPiece {
                 text: t.clone(),
@@ -1284,16 +1402,16 @@ fn parse_grid_span(style: &StyledNode, columns: usize) -> (Option<usize>, usize)
     let mut parts = spec.split('/').map(str::trim);
     let start = parts.next().and_then(|p| p.parse::<usize>().ok());
     let span = match parts.next() {
-        Some(end) if end.starts_with("span ") => {
-            end[5..].trim().parse::<usize>().unwrap_or(1)
-        }
+        Some(end) if end.starts_with("span ") => end[5..].trim().parse::<usize>().unwrap_or(1),
         Some(end) => match (start, end.parse::<usize>().ok()) {
             (Some(a), Some(b)) if b > a => b - a,
             _ => 1,
         },
         None => 1,
     };
-    let start = start.map(|line| line.saturating_sub(1)).filter(|s| *s < columns);
+    let start = start
+        .map(|line| line.saturating_sub(1))
+        .filter(|s| *s < columns);
     (start, span.max(1))
 }
 
@@ -1310,7 +1428,12 @@ pub fn resolve_tracks(spec: &str, available: f32, gap: f32, ctx: LengthContext) 
             if let Some(close) = after.find(')') {
                 let (inside, tail) = after.split_at(close);
                 let mut parts = inside.splitn(2, ',');
-                let count = parts.next().unwrap_or("").trim().parse::<usize>().unwrap_or(0);
+                let count = parts
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .parse::<usize>()
+                    .unwrap_or(0);
                 let pattern: Vec<&str> = parts.next().unwrap_or("").split_whitespace().collect();
                 for _ in 0..count.min(1000) {
                     tokens.extend(pattern.iter().map(|p| p.to_string()));
@@ -1334,12 +1457,21 @@ pub fn resolve_tracks(spec: &str, available: f32, gap: f32, ctx: LengthContext) 
     // Fixed tracks take their size; `fr` tracks divide the remainder.
     let fractions: Vec<Option<f32>> = tokens
         .iter()
-        .map(|t| t.strip_suffix("fr").and_then(|n| n.trim().parse::<f32>().ok()))
+        .map(|t| {
+            t.strip_suffix("fr")
+                .and_then(|n| n.trim().parse::<f32>().ok())
+        })
         .collect();
     let fixed: Vec<f32> = tokens
         .iter()
         .zip(&fractions)
-        .map(|(t, fr)| if fr.is_some() { 0.0 } else { parse_track_length(t, ctx) })
+        .map(|(t, fr)| {
+            if fr.is_some() {
+                0.0
+            } else {
+                parse_track_length(t, ctx)
+            }
+        })
         .collect();
 
     let total_gap = gap * tokens.len().saturating_sub(1) as f32;
@@ -1356,9 +1488,12 @@ pub fn resolve_tracks(spec: &str, available: f32, gap: f32, ctx: LengthContext) 
 }
 
 fn parse_track_length(token: &str, ctx: LengthContext) -> f32 {
-    for (suffix, unit) in
-        [("px", Unit::Px), ("rem", Unit::Rem), ("em", Unit::Em), ("%", Unit::Percent)]
-    {
+    for (suffix, unit) in [
+        ("px", Unit::Px),
+        ("rem", Unit::Rem),
+        ("em", Unit::Em),
+        ("%", Unit::Percent),
+    ] {
         if let Some(n) = token.strip_suffix(suffix) {
             if let Ok(v) = n.trim().parse::<f32>() {
                 return Value::Length(v, unit).resolve(ctx);
@@ -1375,11 +1510,7 @@ fn parse_track_length(token: &str, ctx: LengthContext) -> f32 {
 ///
 /// ponytail: measures text without wrapping and ignores min-content (longest word).
 /// Good enough for shrink-to-fit; a full intrinsic pass would compute both.
-pub fn max_content_width(
-    style: &StyledNode,
-    fonts: Option<&FontSet>,
-    images: &ImageMap,
-) -> f32 {
+pub fn max_content_width(style: &StyledNode, fonts: Option<&FontSet>, images: &ImageMap) -> f32 {
     if style.display() == Display::None {
         return 0.0;
     }
@@ -1477,7 +1608,10 @@ fn tag_name_of(bx: &LayoutBox) -> Option<String> {
 }
 
 /// A table row, addressed either directly or through a section element.
-fn row_at<'b, 'a>(children: &'b [LayoutBox<'a>], path: (usize, Option<usize>)) -> &'b LayoutBox<'a> {
+fn row_at<'b, 'a>(
+    children: &'b [LayoutBox<'a>],
+    path: (usize, Option<usize>),
+) -> &'b LayoutBox<'a> {
     match path.1 {
         None => &children[path.0],
         Some(j) => &children[path.0].children[j],
@@ -1550,12 +1684,16 @@ fn build_box<'a>(style_node: &'a StyledNode<'a>, force_block: bool) -> LayoutBox
                 root.children.push(build_box(child, false))
             }
             Display::Inline if blockifies => root.children.push(build_box(child, true)),
-            Display::Inline => root.get_inline_container().children.push(build_box(child, false)),
+            Display::Inline => root
+                .get_inline_container()
+                .children
+                .push(build_box(child, false)),
             // Blockified by a flex/grid parent, otherwise it joins the line.
             Display::InlineBlock if blockifies => root.children.push(build_box(child, true)),
-            Display::InlineBlock => {
-                root.get_inline_container().children.push(build_box(child, true))
-            }
+            Display::InlineBlock => root
+                .get_inline_container()
+                .children
+                .push(build_box(child, true)),
         }
     }
     root
@@ -1574,7 +1712,11 @@ mod tests {
         let mut values = HashMap::new();
         values.insert("display".to_string(), Value::Keyword("block".into()));
         values.insert("width".to_string(), Value::Length(200.0, Unit::Px));
-        let styled = StyledNode { node: &node, specified_values: values, children: vec![] };
+        let styled = StyledNode {
+            node: &node,
+            specified_values: values,
+            children: vec![],
+        };
 
         let mut viewport: Dimensions = Default::default();
         viewport.content.width = 800.0;
@@ -1599,7 +1741,11 @@ mod tests {
         if let Some(g) = grow {
             values.insert("flex-grow".to_string(), Value::Number(g));
         }
-        StyledNode { node, specified_values: values, children }
+        StyledNode {
+            node,
+            specified_values: values,
+            children,
+        }
     }
 
     #[test]
@@ -1621,13 +1767,25 @@ mod tests {
         viewport.content.width = 900.0;
 
         let laid = layout_tree(&root, viewport, None, &ImageMap::new());
-        let widths: Vec<f32> = laid.children.iter().map(|c| c.dimensions.content.width).collect();
+        let widths: Vec<f32> = laid
+            .children
+            .iter()
+            .map(|c| c.dimensions.content.width)
+            .collect();
         assert_eq!(widths, vec![300.0, 200.0, 400.0]);
 
         // Items sit side by side, not stacked.
-        let xs: Vec<f32> = laid.children.iter().map(|c| c.dimensions.content.x).collect();
+        let xs: Vec<f32> = laid
+            .children
+            .iter()
+            .map(|c| c.dimensions.content.x)
+            .collect();
         assert_eq!(xs, vec![0.0, 300.0, 500.0]);
-        let ys: Vec<f32> = laid.children.iter().map(|c| c.dimensions.content.y).collect();
+        let ys: Vec<f32> = laid
+            .children
+            .iter()
+            .map(|c| c.dimensions.content.y)
+            .collect();
         assert_eq!(ys, vec![0.0, 0.0, 0.0]);
     }
 
@@ -1635,9 +1793,15 @@ mod tests {
     fn grid_tracks_expand_repeat_and_share_fr_space() {
         let ctx = crate::css::LengthContext::default();
         // 3 equal columns across 920 with 20px gaps -> (920 - 40) / 3.
-        assert_eq!(resolve_tracks("repeat(3, 1fr)", 920.0, 20.0, ctx), vec![293.33334; 3]);
+        assert_eq!(
+            resolve_tracks("repeat(3, 1fr)", 920.0, 20.0, ctx),
+            vec![293.33334; 3]
+        );
         // A fixed track keeps its size; fr splits what's left (600 - 200 - 10 = 390).
-        assert_eq!(resolve_tracks("200px 1fr 2fr", 600.0, 5.0, ctx), vec![200.0, 130.0, 260.0]);
+        assert_eq!(
+            resolve_tracks("200px 1fr 2fr", 600.0, 5.0, ctx),
+            vec![200.0, 130.0, 260.0]
+        );
     }
 
     #[test]
@@ -1673,13 +1837,21 @@ mod tests {
             let mut v = HashMap::new();
             v.insert("display".to_string(), Value::Keyword("block".into()));
             v.insert("height".to_string(), Value::Length(20.0, Unit::Px));
-            StyledNode { node: n, specified_values: v, children: vec![] }
+            StyledNode {
+                node: n,
+                specified_values: v,
+                children: vec![],
+            }
         }
         let tr = dom::elem("tr".into(), HashMap::new(), vec![]);
         fn row<'a>(n: &'a dom::Node, cells: Vec<StyledNode<'a>>) -> StyledNode<'a> {
             let mut v = HashMap::new();
             v.insert("display".to_string(), Value::Keyword("block".into()));
-            StyledNode { node: n, specified_values: v, children: cells }
+            StyledNode {
+                node: n,
+                specified_values: v,
+                children: cells,
+            }
         }
         // Row 0: [rowspan=2][colspan=2]   Row 1: [a][b]  (col 0 covered by the rowspan)
         let mut table_values = HashMap::new();
@@ -1697,10 +1869,16 @@ mod tests {
         viewport.content.width = 300.0;
         let laid = layout_tree(&table, viewport, None, &ImageMap::new());
 
-        let row1: Vec<f32> =
-            laid.children[1].children.iter().map(|c| c.dimensions.content.x).collect();
+        let row1: Vec<f32> = laid.children[1]
+            .children
+            .iter()
+            .map(|c| c.dimensions.content.x)
+            .collect();
         // Column 0 is still owned by the rowspan, so row 1 starts at column 1.
-        assert!(row1[0] > 0.0, "second row must skip the spanned column, got {row1:?}");
+        assert!(
+            row1[0] > 0.0,
+            "second row must skip the spanned column, got {row1:?}"
+        );
         assert!(row1[1] > row1[0]);
     }
 
@@ -1714,7 +1892,11 @@ mod tests {
             if let Some(s) = span {
                 v.insert("grid-column".to_string(), Value::Raw(s.to_string()));
             }
-            StyledNode { node: &node, specified_values: v, children: vec![] }
+            StyledNode {
+                node: &node,
+                specified_values: v,
+                children: vec![],
+            }
         };
         let mut values = HashMap::new();
         values.insert("display".to_string(), Value::Keyword("grid".into()));
@@ -1726,15 +1908,32 @@ mod tests {
         let root = StyledNode {
             node: &node,
             specified_values: values,
-            children: vec![cell(Some("span 2")), cell(None), cell(None), cell(Some("span 3"))],
+            children: vec![
+                cell(Some("span 2")),
+                cell(None),
+                cell(None),
+                cell(Some("span 3")),
+            ],
         };
         let mut viewport: Dimensions = Default::default();
         viewport.content.width = 400.0; // 4 columns of 100
 
         let laid = layout_tree(&root, viewport, None, &ImageMap::new());
-        let xs: Vec<f32> = laid.children.iter().map(|c| c.dimensions.content.x).collect();
-        let ys: Vec<f32> = laid.children.iter().map(|c| c.dimensions.content.y).collect();
-        let ws: Vec<f32> = laid.children.iter().map(|c| c.dimensions.content.width).collect();
+        let xs: Vec<f32> = laid
+            .children
+            .iter()
+            .map(|c| c.dimensions.content.x)
+            .collect();
+        let ys: Vec<f32> = laid
+            .children
+            .iter()
+            .map(|c| c.dimensions.content.y)
+            .collect();
+        let ws: Vec<f32> = laid
+            .children
+            .iter()
+            .map(|c| c.dimensions.content.width)
+            .collect();
 
         assert_eq!(ws[0], 200.0, "span 2 covers two 100px tracks");
         assert_eq!(ws[3], 300.0, "span 3 covers three tracks");
@@ -1757,13 +1956,20 @@ mod tests {
         child_values.insert("height".to_string(), Value::Length(40.0, Unit::Px));
         child_values.insert("right".to_string(), Value::Length(20.0, Unit::Px));
         child_values.insert("bottom".to_string(), Value::Length(10.0, Unit::Px));
-        let child = StyledNode { node: &node, specified_values: child_values, children: vec![] };
+        let child = StyledNode {
+            node: &node,
+            specified_values: child_values,
+            children: vec![],
+        };
 
         let mut root_values = HashMap::new();
         root_values.insert("display".to_string(), Value::Keyword("block".into()));
         root_values.insert("height".to_string(), Value::Length(200.0, Unit::Px));
-        let root =
-            StyledNode { node: &node, specified_values: root_values, children: vec![child] };
+        let root = StyledNode {
+            node: &node,
+            specified_values: root_values,
+            children: vec![child],
+        };
 
         let mut viewport: Dimensions = Default::default();
         viewport.content.width = 900.0;
@@ -1795,7 +2001,11 @@ mod tests {
             v.insert("display".to_string(), Value::Keyword("block".into()));
             v.insert("width".to_string(), Value::Length(w, Unit::Px));
             v.insert("height".to_string(), Value::Length(50.0, Unit::Px));
-            StyledNode { node: &node, specified_values: v, children: vec![] }
+            StyledNode {
+                node: &node,
+                specified_values: v,
+                children: vec![],
+            }
         };
         let mut values = HashMap::new();
         values.insert("display".to_string(), Value::Keyword("flex".into()));
@@ -1809,11 +2019,19 @@ mod tests {
         viewport.content.width = 450.0; // fits two per line
 
         let laid = layout_tree(&root, viewport, None, &ImageMap::new());
-        let ys: Vec<f32> = laid.children.iter().map(|c| c.dimensions.content.y).collect();
+        let ys: Vec<f32> = laid
+            .children
+            .iter()
+            .map(|c| c.dimensions.content.y)
+            .collect();
         // First two share a line; the third wraps below them.
         assert_eq!(ys[0], ys[1]);
         assert!(ys[2] > ys[1], "third item should wrap, got {ys:?}");
-        let xs: Vec<f32> = laid.children.iter().map(|c| c.dimensions.content.x).collect();
+        let xs: Vec<f32> = laid
+            .children
+            .iter()
+            .map(|c| c.dimensions.content.x)
+            .collect();
         assert_eq!(xs[2], xs[0], "wrapped item restarts at the line start");
     }
 
@@ -1827,13 +2045,20 @@ mod tests {
             "flex",
             None,
             None,
-            vec![styled(&node, "block", Some(200.0), None, vec![]), styled(&node, "block", None, None, vec![])],
+            vec![
+                styled(&node, "block", Some(200.0), None, vec![]),
+                styled(&node, "block", None, None, vec![]),
+            ],
         );
         let mut viewport: Dimensions = Default::default();
         viewport.content.width = 900.0;
 
         let laid = layout_tree(&root, viewport, None, &ImageMap::new());
-        let widths: Vec<f32> = laid.children.iter().map(|c| c.dimensions.content.width).collect();
+        let widths: Vec<f32> = laid
+            .children
+            .iter()
+            .map(|c| c.dimensions.content.width)
+            .collect();
         assert_eq!(widths, vec![200.0, 0.0]);
     }
 
@@ -1842,7 +2067,11 @@ mod tests {
         let node = dom::elem("div".into(), HashMap::new(), vec![]);
         let mut values = HashMap::new();
         values.insert("display".to_string(), Value::Keyword("block".into()));
-        let styled = StyledNode { node: &node, specified_values: values, children: vec![] };
+        let styled = StyledNode {
+            node: &node,
+            specified_values: values,
+            children: vec![],
+        };
 
         let mut viewport: Dimensions = Default::default();
         viewport.content.width = 800.0;

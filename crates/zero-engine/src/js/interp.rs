@@ -8,8 +8,8 @@
 //! are plain maps and only a handful of built-in methods exist.
 
 use super::dom::{DomView, Mutation};
-use crate::resource::{KeyValueStore, ResourceLoader};
 use super::parser::{Expr, Stmt};
+use crate::resource::{KeyValueStore, ResourceLoader};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -30,11 +30,17 @@ pub struct Env {
 
 impl Env {
     fn root() -> EnvRef {
-        Rc::new(RefCell::new(Env { vars: HashMap::new(), parent: None }))
+        Rc::new(RefCell::new(Env {
+            vars: HashMap::new(),
+            parent: None,
+        }))
     }
 
     fn child(parent: &EnvRef) -> EnvRef {
-        Rc::new(RefCell::new(Env { vars: HashMap::new(), parent: Some(parent.clone()) }))
+        Rc::new(RefCell::new(Env {
+            vars: HashMap::new(),
+            parent: Some(parent.clone()),
+        }))
     }
 
     fn get(env: &EnvRef, name: &str) -> Option<Value> {
@@ -106,9 +112,12 @@ impl Value {
             Value::Null => "null".into(),
             Value::Undefined => "undefined".into(),
             Value::Func(_) | Value::Native(_) => "function".into(),
-            Value::Array(items) => {
-                items.borrow().iter().map(Value::to_display).collect::<Vec<_>>().join(",")
-            }
+            Value::Array(items) => items
+                .borrow()
+                .iter()
+                .map(Value::to_display)
+                .collect::<Vec<_>>()
+                .join(","),
             Value::Object(_) => "[object Object]".into(),
             Value::Element(_) => "[object HTMLElement]".into(),
         }
@@ -174,8 +183,10 @@ pub struct Interp {
 }
 
 fn namespace(entries: &[(&str, &'static str)]) -> Value {
-    let map: HashMap<String, Value> =
-        entries.iter().map(|(k, v)| (k.to_string(), Value::Native(v))).collect();
+    let map: HashMap<String, Value> = entries
+        .iter()
+        .map(|(k, v)| (k.to_string(), Value::Native(v)))
+        .collect();
     Value::Object(Rc::new(RefCell::new(map)))
 }
 
@@ -294,7 +305,12 @@ impl Interp {
     }
 
     fn make_function(&self, params: Vec<String>, body: Vec<Stmt>) -> Value {
-        Value::Func(Rc::new(FuncData { params, body, closure: self.env.clone(), this: None }))
+        Value::Func(Rc::new(FuncData {
+            params,
+            body,
+            closure: self.env.clone(),
+            this: None,
+        }))
     }
 
     /// Same function, but called with `receiver` as `this`.
@@ -353,7 +369,11 @@ impl Interp {
                 let body = body.clone();
                 self.in_child_scope(|me| me.exec_body(&body))
             }
-            Stmt::If { cond, then, otherwise } => {
+            Stmt::If {
+                cond,
+                then,
+                otherwise,
+            } => {
                 if self.eval(cond)?.truthy() {
                     self.exec(then)
                 } else if let Some(alt) = otherwise {
@@ -375,7 +395,12 @@ impl Interp {
                 }
                 Ok(Flow::Normal)
             }
-            Stmt::For { init, cond, step, body } => {
+            Stmt::For {
+                init,
+                cond,
+                step,
+                body,
+            } => {
                 let (init, cond, step, body) =
                     (init.clone(), cond.clone(), step.clone(), body.clone());
                 self.in_child_scope(move |me| {
@@ -422,7 +447,12 @@ impl Interp {
                 // Exceptions ride the error channel, tagged so `catch` can recover.
                 Err(format!("{THROW_TAG}{}", v.to_display()))
             }
-            Stmt::Try { body, param, catch, finally } => {
+            Stmt::Try {
+                body,
+                param,
+                catch,
+                finally,
+            } => {
                 let result = self.exec_body(body);
                 let outcome = match result {
                     Err(e) => {
@@ -444,7 +474,11 @@ impl Interp {
                 }
                 outcome
             }
-            Stmt::ClassDecl { name, parent, methods } => {
+            Stmt::ClassDecl {
+                name,
+                parent,
+                methods,
+            } => {
                 // A class is an object of methods. `extends` copies the parent's
                 // methods in first, so subclass definitions override them — a
                 // flattened prototype chain rather than a linked one.
@@ -469,10 +503,17 @@ impl Interp {
                     Env::define(&self.env, SUPER_KEY.into(), parent);
                 }
                 for (method, params, body) in methods {
-                    map.insert(method.clone(), self.make_function(params.clone(), body.clone()));
+                    map.insert(
+                        method.clone(),
+                        self.make_function(params.clone(), body.clone()),
+                    );
                 }
                 self.env = saved;
-                Env::define(&self.env, name.clone(), Value::Object(Rc::new(RefCell::new(map))));
+                Env::define(
+                    &self.env,
+                    name.clone(),
+                    Value::Object(Rc::new(RefCell::new(map))),
+                );
                 Ok(Flow::Normal)
             }
         }
@@ -500,7 +541,11 @@ impl Interp {
             Expr::Func { params, body } => Ok(self.make_function(params.clone(), body.clone())),
             Expr::This => Ok(Env::get(&self.env, "this").unwrap_or(Value::Undefined)),
             Expr::Super => Ok(Env::get(&self.env, SUPER_KEY).unwrap_or(Value::Undefined)),
-            Expr::Ternary { cond, then, otherwise } => {
+            Expr::Ternary {
+                cond,
+                then,
+                otherwise,
+            } => {
                 // Only the taken branch is evaluated.
                 if self.eval(cond)?.truthy() {
                     self.eval(then)
@@ -652,16 +697,22 @@ impl Interp {
                             }
                         }
                         "textContent" | "innerText" => {
-                            self.out.mutations.push(Mutation::SetText(i, v.to_display()));
+                            self.out
+                                .mutations
+                                .push(Mutation::SetText(i, v.to_display()));
                             self.reflect(i, |e| e.text = v.to_display());
                         }
                         "innerHTML" => {
-                            self.out.mutations.push(Mutation::SetHtml(i, v.to_display()));
+                            self.out
+                                .mutations
+                                .push(Mutation::SetHtml(i, v.to_display()));
                             self.reflect(i, |e| e.text = v.to_display());
                         }
                         // Restyling: swapping the class re-runs the cascade for this node.
                         "className" => {
-                            self.out.mutations.push(Mutation::SetClass(i, v.to_display()));
+                            self.out
+                                .mutations
+                                .push(Mutation::SetClass(i, v.to_display()));
                             self.reflect(i, |e| e.class = v.to_display());
                         }
                         _ => {} // other properties aren't modelled yet
@@ -698,10 +749,12 @@ impl Interp {
 
     fn get_property(&self, obj: &Value, property: &str) -> Value {
         match obj {
-            Value::Object(map) => map.borrow().get(property).cloned().unwrap_or(Value::Undefined),
-            Value::Array(items) if property == "length" => {
-                Value::Num(items.borrow().len() as f64)
-            }
+            Value::Object(map) => map
+                .borrow()
+                .get(property)
+                .cloned()
+                .unwrap_or(Value::Undefined),
+            Value::Array(items) if property == "length" => Value::Num(items.borrow().len() as f64),
             Value::Str(s) if property == "length" => Value::Num(s.chars().count() as f64),
             Value::Element(i) => self.element_property(*i, property),
             _ => Value::Undefined,
@@ -722,15 +775,21 @@ impl Interp {
             }
             (Value::Array(items), "pop") => items.borrow_mut().pop().unwrap_or(Value::Undefined),
             (Value::Array(items), "join") => {
-                let sep = args.first().map(Value::to_display).unwrap_or_else(|| ",".into());
-                let joined =
-                    items.borrow().iter().map(Value::to_display).collect::<Vec<_>>().join(&sep);
+                let sep = args
+                    .first()
+                    .map(Value::to_display)
+                    .unwrap_or_else(|| ",".into());
+                let joined = items
+                    .borrow()
+                    .iter()
+                    .map(Value::to_display)
+                    .collect::<Vec<_>>()
+                    .join(&sep);
                 Value::Str(joined)
             }
             (Value::Element(i), "addEventListener") => {
                 let event = args.first().map(Value::to_display);
-                if let (Some(event), Some(f), Some(id)) =
-                    (event, args.get(1), self.node_id_of(*i))
+                if let (Some(event), Some(f), Some(id)) = (event, args.get(1), self.node_id_of(*i))
                 {
                     self.handlers.insert((id, event), f.clone());
                 }
@@ -788,7 +847,11 @@ impl Interp {
     fn call(&mut self, callee: Value, args: Vec<Value>) -> Result<Value, String> {
         match callee {
             Value::Native(name) => {
-                let text = args.iter().map(Value::to_display).collect::<Vec<_>>().join(" ");
+                let text = args
+                    .iter()
+                    .map(Value::to_display)
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 match name {
                     "console.log" => self.out.console.push(text),
                     "document.write" => self.out.writes.push_str(&text),
@@ -861,8 +924,12 @@ impl Interp {
                             "document.getElementsByTagName" => text.clone(),
                             _ => text.clone(),
                         };
-                        let found: Vec<Value> =
-                            self.dom.query(&selector).into_iter().map(Value::Element).collect();
+                        let found: Vec<Value> = self
+                            .dom
+                            .query(&selector)
+                            .into_iter()
+                            .map(Value::Element)
+                            .collect();
                         return Ok(Value::Array(Rc::new(RefCell::new(found))));
                     }
                     "document.getElementById" => {

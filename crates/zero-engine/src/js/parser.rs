@@ -14,35 +14,88 @@ pub enum Expr {
     Null,
     Undefined,
     Ident(String),
-    Unary { op: String, expr: Box<Expr> },
-    Binary { op: String, left: Box<Expr>, right: Box<Expr> },
-    Assign { target: Box<Expr>, value: Box<Expr> },
-    Call { callee: Box<Expr>, args: Vec<Expr> },
-    Member { object: Box<Expr>, property: String },
-    Index { object: Box<Expr>, index: Box<Expr> },
+    Unary {
+        op: String,
+        expr: Box<Expr>,
+    },
+    Binary {
+        op: String,
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    Assign {
+        target: Box<Expr>,
+        value: Box<Expr>,
+    },
+    Call {
+        callee: Box<Expr>,
+        args: Vec<Expr>,
+    },
+    Member {
+        object: Box<Expr>,
+        property: String,
+    },
+    Index {
+        object: Box<Expr>,
+        index: Box<Expr>,
+    },
     ObjectLit(Vec<(String, Expr)>),
     ArrayLit(Vec<Expr>),
     /// A function expression, which captures the scope it was created in.
-    Func { params: Vec<String>, body: Vec<Stmt> },
+    Func {
+        params: Vec<String>,
+        body: Vec<Stmt>,
+    },
     This,
-    New { callee: Box<Expr>, args: Vec<Expr> },
+    New {
+        callee: Box<Expr>,
+        args: Vec<Expr>,
+    },
     /// `super` — resolves to the parent class's method table.
     Super,
-    Ternary { cond: Box<Expr>, then: Box<Expr>, otherwise: Box<Expr> },
+    Ternary {
+        cond: Box<Expr>,
+        then: Box<Expr>,
+        otherwise: Box<Expr>,
+    },
 }
 
 #[derive(Debug, Clone)]
 pub enum Stmt {
-    VarDecl { name: String, init: Option<Expr> },
+    VarDecl {
+        name: String,
+        init: Option<Expr>,
+    },
     ExprStmt(Expr),
-    If { cond: Expr, then: Box<Stmt>, otherwise: Option<Box<Stmt>> },
-    While { cond: Expr, body: Box<Stmt> },
-    For { init: Option<Box<Stmt>>, cond: Option<Expr>, step: Option<Expr>, body: Box<Stmt> },
+    If {
+        cond: Expr,
+        then: Box<Stmt>,
+        otherwise: Option<Box<Stmt>>,
+    },
+    While {
+        cond: Expr,
+        body: Box<Stmt>,
+    },
+    For {
+        init: Option<Box<Stmt>>,
+        cond: Option<Expr>,
+        step: Option<Expr>,
+        body: Box<Stmt>,
+    },
     Block(Vec<Stmt>),
     Return(Option<Expr>),
-    FuncDecl { name: String, params: Vec<String>, body: Vec<Stmt> },
+    FuncDecl {
+        name: String,
+        params: Vec<String>,
+        body: Vec<Stmt>,
+    },
     Throw(Expr),
-    Try { body: Vec<Stmt>, param: Option<String>, catch: Vec<Stmt>, finally: Vec<Stmt> },
+    Try {
+        body: Vec<Stmt>,
+        param: Option<String>,
+        catch: Vec<Stmt>,
+        finally: Vec<Stmt>,
+    },
     /// `class C extends P { constructor(..){} method(..){} }`
     ClassDecl {
         name: String,
@@ -65,7 +118,11 @@ fn precedence(op: &str) -> Option<u8> {
 }
 
 pub fn parse(tokens: Vec<Tok>) -> Result<Vec<Stmt>, String> {
-    Parser { toks: tokens, pos: 0 }.parse_program()
+    Parser {
+        toks: tokens,
+        pos: 0,
+    }
+    .parse_program()
 }
 
 struct Parser {
@@ -133,7 +190,11 @@ impl Parser {
         }
         if self.eat_kw(Kw::Var) {
             let name = self.expect_ident()?;
-            let init = if self.eat_op("=") { Some(self.parse_expr()?) } else { None };
+            let init = if self.eat_op("=") {
+                Some(self.parse_expr()?)
+            } else {
+                None
+            };
             self.eat_op(";");
             return Ok(Stmt::VarDecl { name, init });
         }
@@ -158,13 +219,25 @@ impl Parser {
                 }
                 catch = self.parse_block_body()?;
             }
-            let finally =
-                if self.eat_kw(Kw::Finally) { self.parse_block_body()? } else { Vec::new() };
-            return Ok(Stmt::Try { body, param, catch, finally });
+            let finally = if self.eat_kw(Kw::Finally) {
+                self.parse_block_body()?
+            } else {
+                Vec::new()
+            };
+            return Ok(Stmt::Try {
+                body,
+                param,
+                catch,
+                finally,
+            });
         }
         if self.eat_kw(Kw::Class) {
             let name = self.expect_ident()?;
-            let parent = if self.eat_kw(Kw::Extends) { Some(self.expect_ident()?) } else { None };
+            let parent = if self.eat_kw(Kw::Extends) {
+                Some(self.expect_ident()?)
+            } else {
+                None
+            };
             self.expect_op("{")?;
             let mut methods = Vec::new();
             while !self.eat_op("}") {
@@ -176,7 +249,11 @@ impl Parser {
                 let body = self.parse_block_body()?;
                 methods.push((method, params, body));
             }
-            return Ok(Stmt::ClassDecl { name, parent, methods });
+            return Ok(Stmt::ClassDecl {
+                name,
+                parent,
+                methods,
+            });
         }
         if self.eat_kw(Kw::Return) {
             let value = if matches!(self.peek(), Tok::Op(o) if o == ";") || *self.peek() == Tok::Eof
@@ -193,9 +270,16 @@ impl Parser {
             let cond = self.parse_expr()?;
             self.expect_op(")")?;
             let then = Box::new(self.parse_stmt()?);
-            let otherwise =
-                if self.eat_kw(Kw::Else) { Some(Box::new(self.parse_stmt()?)) } else { None };
-            return Ok(Stmt::If { cond, then, otherwise });
+            let otherwise = if self.eat_kw(Kw::Else) {
+                Some(Box::new(self.parse_stmt()?))
+            } else {
+                None
+            };
+            return Ok(Stmt::If {
+                cond,
+                then,
+                otherwise,
+            });
         }
         if self.eat_kw(Kw::While) {
             self.expect_op("(")?;
@@ -206,7 +290,11 @@ impl Parser {
         }
         if self.eat_kw(Kw::For) {
             self.expect_op("(")?;
-            let init = if self.eat_op(";") { None } else { Some(Box::new(self.parse_stmt()?)) };
+            let init = if self.eat_op(";") {
+                None
+            } else {
+                Some(Box::new(self.parse_stmt()?))
+            };
             let cond = if self.eat_op(";") {
                 None
             } else {
@@ -221,7 +309,12 @@ impl Parser {
             };
             self.expect_op(")")?;
             let body = Box::new(self.parse_stmt()?);
-            return Ok(Stmt::For { init, cond, step, body });
+            return Ok(Stmt::For {
+                init,
+                cond,
+                step,
+                body,
+            });
         }
 
         let expr = self.parse_expr()?;
@@ -265,7 +358,13 @@ impl Parser {
     fn parse_assign(&mut self) -> Result<Expr, String> {
         let left = self.parse_ternary()?;
         // Compound assignment desugars to `x = x op v`.
-        for (op, bin) in [("=", ""), ("+=", "+"), ("-=", "-"), ("*=", "*"), ("/=", "/")] {
+        for (op, bin) in [
+            ("=", ""),
+            ("+=", "+"),
+            ("-=", "-"),
+            ("*=", "*"),
+            ("/=", "/"),
+        ] {
             if matches!(self.peek(), Tok::Op(o) if o == op) {
                 self.pos += 1;
                 let value = self.parse_assign()?;
@@ -278,7 +377,10 @@ impl Parser {
                         right: Box::new(value),
                     }
                 };
-                return Ok(Expr::Assign { target: Box::new(left), value: Box::new(value) });
+                return Ok(Expr::Assign {
+                    target: Box::new(left),
+                    value: Box::new(value),
+                });
             }
         }
         Ok(left)
@@ -314,7 +416,11 @@ impl Parser {
             };
             self.pos += 1;
             let right = self.parse_binary(bp + 1)?;
-            left = Expr::Binary { op, left: Box::new(left), right: Box::new(right) };
+            left = Expr::Binary {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
         }
         Ok(left)
     }
@@ -324,7 +430,10 @@ impl Parser {
             if matches!(self.peek(), Tok::Op(o) if o == op) {
                 self.pos += 1;
                 let expr = self.parse_unary()?;
-                return Ok(Expr::Unary { op: op.to_string(), expr: Box::new(expr) });
+                return Ok(Expr::Unary {
+                    op: op.to_string(),
+                    expr: Box::new(expr),
+                });
             }
         }
         // `++x` / `x++` both desugar to `x = x + 1` (value-of-expression ignored).
@@ -347,20 +456,33 @@ impl Parser {
         loop {
             if self.eat_op(".") {
                 let property = self.expect_ident()?;
-                expr = Expr::Member { object: Box::new(expr), property };
+                expr = Expr::Member {
+                    object: Box::new(expr),
+                    property,
+                };
             } else if self.eat_op("[") {
                 let index = self.parse_expr()?;
                 self.expect_op("]")?;
-                expr = Expr::Index { object: Box::new(expr), index: Box::new(index) };
+                expr = Expr::Index {
+                    object: Box::new(expr),
+                    index: Box::new(index),
+                };
             } else if self.eat_op("(") {
                 let mut args = Vec::new();
                 while !self.eat_op(")") {
                     args.push(self.parse_expr()?);
                     self.eat_op(",");
                 }
-                expr = Expr::Call { callee: Box::new(expr), args };
+                expr = Expr::Call {
+                    callee: Box::new(expr),
+                    args,
+                };
             } else if matches!(self.peek(), Tok::Op(o) if o == "++" || o == "--") {
-                let op = if matches!(self.peek(), Tok::Op(o) if o == "++") { "+" } else { "-" };
+                let op = if matches!(self.peek(), Tok::Op(o) if o == "++") {
+                    "+"
+                } else {
+                    "-"
+                };
                 self.pos += 1;
                 expr = Expr::Assign {
                     target: Box::new(expr.clone()),
@@ -397,7 +519,10 @@ impl Parser {
                         self.eat_op(",");
                     }
                 }
-                Ok(Expr::New { callee: Box::new(callee), args })
+                Ok(Expr::New {
+                    callee: Box::new(callee),
+                    args,
+                })
             }
             Tok::Op(op) if op == "(" => {
                 let e = self.parse_expr()?;
@@ -451,7 +576,10 @@ mod tests {
         let ast = parse(tokenize("var x = 1 + 2 * 3;").unwrap()).unwrap();
         // Should nest as 1 + (2 * 3), not (1 + 2) * 3.
         match &ast[0] {
-            Stmt::VarDecl { init: Some(Expr::Binary { op, right, .. }), .. } => {
+            Stmt::VarDecl {
+                init: Some(Expr::Binary { op, right, .. }),
+                ..
+            } => {
                 assert_eq!(op, "+");
                 assert!(matches!(**right, Expr::Binary { .. }));
             }
@@ -462,8 +590,20 @@ mod tests {
     #[test]
     fn parses_literals_and_indexing() {
         let ast = parse(tokenize("var a = [1, 2]; var o = {x: 1}; a[0]; o.x;").unwrap()).unwrap();
-        assert!(matches!(ast[0], Stmt::VarDecl { init: Some(Expr::ArrayLit(_)), .. }));
-        assert!(matches!(ast[1], Stmt::VarDecl { init: Some(Expr::ObjectLit(_)), .. }));
+        assert!(matches!(
+            ast[0],
+            Stmt::VarDecl {
+                init: Some(Expr::ArrayLit(_)),
+                ..
+            }
+        ));
+        assert!(matches!(
+            ast[1],
+            Stmt::VarDecl {
+                init: Some(Expr::ObjectLit(_)),
+                ..
+            }
+        ));
         assert!(matches!(ast[2], Stmt::ExprStmt(Expr::Index { .. })));
         assert!(matches!(ast[3], Stmt::ExprStmt(Expr::Member { .. })));
     }

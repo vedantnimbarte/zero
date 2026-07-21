@@ -96,7 +96,11 @@ pub type Specificity = (usize, usize, usize);
 impl Selector {
     pub fn specificity(&self) -> Specificity {
         let Selector::Simple(ref s) = *self;
-        (s.id.iter().count(), s.class.len(), s.tag_name.iter().count())
+        (
+            s.id.iter().count(),
+            s.class.len(),
+            s.tag_name.iter().count(),
+        )
     }
 }
 
@@ -128,8 +132,13 @@ impl Value {
 }
 
 pub fn parse(source: String) -> Stylesheet {
-    let mut parser = Parser { pos: 0, input: source };
-    Stylesheet { rules: parser.parse_rules() }
+    let mut parser = Parser {
+        pos: 0,
+        input: source,
+    };
+    Stylesheet {
+        rules: parser.parse_rules(),
+    }
 }
 
 fn is_ident(c: char) -> bool {
@@ -137,8 +146,7 @@ fn is_ident(c: char) -> bool {
 }
 
 /// Properties whose values are lists we parse later, not single tokens.
-const RAW_VALUE_PROPERTIES: &[&str] =
-    &[
+const RAW_VALUE_PROPERTIES: &[&str] = &[
     "grid-template-columns",
     "grid-template-rows",
     "grid-column",
@@ -159,9 +167,12 @@ fn classify_value(s: &str) -> Option<Value> {
     if s.starts_with("linear-gradient(") {
         return Some(Value::Raw(s.to_string()));
     }
-    for (suffix, unit) in
-        [("px", Unit::Px), ("rem", Unit::Rem), ("em", Unit::Em), ("%", Unit::Percent)]
-    {
+    for (suffix, unit) in [
+        ("px", Unit::Px),
+        ("rem", Unit::Rem),
+        ("em", Unit::Em),
+        ("%", Unit::Percent),
+    ] {
         // Only a *numeric* prefix makes this a length; otherwise fall through so
         // keywords that merely end in a unit name (e.g. `system`) still parse.
         if let Some(num) = s.strip_suffix(suffix) {
@@ -190,9 +201,12 @@ pub fn parse_color_token(hex: &str) -> Option<Value> {
 
 /// Parse a single length token (`12px`, `1.5em`, `50%`) to px.
 pub fn parse_length_token(token: &str, ctx: LengthContext) -> f32 {
-    for (suffix, unit) in
-        [("px", Unit::Px), ("rem", Unit::Rem), ("em", Unit::Em), ("%", Unit::Percent)]
-    {
+    for (suffix, unit) in [
+        ("px", Unit::Px),
+        ("rem", Unit::Rem),
+        ("em", Unit::Em),
+        ("%", Unit::Percent),
+    ] {
         if let Some(n) = token.strip_suffix(suffix) {
             if let Ok(v) = n.trim().parse::<f32>() {
                 return Value::Length(v, unit).resolve(ctx);
@@ -212,10 +226,20 @@ fn parse_hex_color(hex: &str) -> Option<Value> {
             b: byte(&hex[4..6])?,
             a: byte(&hex[6..8])?,
         },
-        6 => Color { r: byte(&hex[0..2])?, g: byte(&hex[2..4])?, b: byte(&hex[4..6])?, a: 255 },
+        6 => Color {
+            r: byte(&hex[0..2])?,
+            g: byte(&hex[2..4])?,
+            b: byte(&hex[4..6])?,
+            a: 255,
+        },
         3 => {
             let dup = |c: &str| byte(&format!("{c}{c}"));
-            Color { r: dup(&hex[0..1])?, g: dup(&hex[1..2])?, b: dup(&hex[2..3])?, a: 255 }
+            Color {
+                r: dup(&hex[0..1])?,
+                g: dup(&hex[1..2])?,
+                b: dup(&hex[2..3])?,
+                a: 255,
+            }
         }
         _ => return None,
     };
@@ -252,7 +276,10 @@ impl Parser {
         if selectors.is_empty() {
             None
         } else {
-            Some(Rule { selectors, declarations })
+            Some(Rule {
+                selectors,
+                declarations,
+            })
         }
     }
 
@@ -280,7 +307,11 @@ impl Parser {
     }
 
     fn parse_simple_selector(&mut self) -> SimpleSelector {
-        let mut selector = SimpleSelector { tag_name: None, id: None, class: Vec::new() };
+        let mut selector = SimpleSelector {
+            tag_name: None,
+            id: None,
+            class: Vec::new(),
+        };
         loop {
             match self.next_char_or('\0') {
                 '#' => {
@@ -443,7 +474,12 @@ mod tests {
         assert_eq!(rule.declarations[0].value, Value::Length(120.0, Unit::Px));
         assert_eq!(
             rule.declarations[1].value,
-            Value::ColorValue(Color { r: 0xff, g: 0x88, b: 0x00, a: 255 })
+            Value::ColorValue(Color {
+                r: 0xff,
+                g: 0x88,
+                b: 0x00,
+                a: 255
+            })
         );
     }
 
@@ -463,7 +499,11 @@ mod tests {
 
     #[test]
     fn resolves_relative_units() {
-        let ctx = LengthContext { percent_base: 800.0, font_size: 20.0, root_font_size: 16.0 };
+        let ctx = LengthContext {
+            percent_base: 800.0,
+            font_size: 20.0,
+            root_font_size: 16.0,
+        };
         assert_eq!(Value::Length(50.0, Unit::Percent).resolve(ctx), 400.0);
         assert_eq!(Value::Length(1.5, Unit::Em).resolve(ctx), 30.0);
         assert_eq!(Value::Length(2.0, Unit::Rem).resolve(ctx), 32.0);
@@ -480,7 +520,7 @@ mod tests {
                 .to_string(),
         );
         assert_eq!(s.rules.len(), 1); // only `.ok`
-        // color + width(%) + padding all understood now.
+                                      // color + width(%) + padding all understood now.
         assert_eq!(s.rules[0].declarations.len(), 3);
     }
 }

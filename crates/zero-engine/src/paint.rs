@@ -21,9 +21,19 @@ enum DisplayCommand {
     /// A rounded rectangle: same as SolidColor but with a corner radius.
     RoundedColor(Color, Rect, f32),
     /// A linear gradient between stops, vertical unless `horizontal`.
-    Gradient { rect: Rect, radius: f32, stops: Vec<Color>, horizontal: bool },
+    Gradient {
+        rect: Rect,
+        radius: f32,
+        stops: Vec<Color>,
+        horizontal: bool,
+    },
     /// A soft drop shadow behind a box.
-    Shadow { rect: Rect, radius: f32, blur: f32, color: Color },
+    Shadow {
+        rect: Rect,
+        radius: f32,
+        blur: f32,
+        color: Color,
+    },
     Text(TextFragment),
     Image(String, Rect), // image src, destination content box
 }
@@ -32,8 +42,17 @@ type DisplayList = Vec<DisplayCommand>;
 
 impl Canvas {
     fn new(width: usize, height: usize) -> Canvas {
-        let white = Color { r: 255, g: 255, b: 255, a: 255 };
-        Canvas { pixels: vec![white; width * height], width, height }
+        let white = Color {
+            r: 255,
+            g: 255,
+            b: 255,
+            a: 255,
+        };
+        Canvas {
+            pixels: vec![white; width * height],
+            width,
+            height,
+        }
     }
 
     fn paint_solid(&mut self, color: Color, rect: Rect) {
@@ -64,8 +83,20 @@ impl Canvas {
             for x in x0..x1 {
                 let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
                 // Distance outside the nearest corner circle, or 0 in the straight parts.
-                let dx = if px < left { left - px } else if px > right { px - right } else { 0.0 };
-                let dy = if py < top { top - py } else if py > bottom { py - bottom } else { 0.0 };
+                let dx = if px < left {
+                    left - px
+                } else if px > right {
+                    px - right
+                } else {
+                    0.0
+                };
+                let dy = if py < top {
+                    top - py
+                } else if py > bottom {
+                    py - bottom
+                } else {
+                    0.0
+                };
                 let coverage = if dx == 0.0 || dy == 0.0 {
                     1.0
                 } else {
@@ -103,8 +134,20 @@ impl Canvas {
                 let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
                 // Reuse the rounded-corner coverage so gradients can be rounded too.
                 let coverage = if radius > 0.0 {
-                    let dx = if px < left { left - px } else if px > right { px - right } else { 0.0 };
-                    let dy = if py < top { top - py } else if py > bottom { py - bottom } else { 0.0 };
+                    let dx = if px < left {
+                        left - px
+                    } else if px > right {
+                        px - right
+                    } else {
+                        0.0
+                    };
+                    let dy = if py < top {
+                        top - py
+                    } else if py > bottom {
+                        py - bottom
+                    } else {
+                        0.0
+                    };
                     if dx == 0.0 || dy == 0.0 {
                         1.0
                     } else {
@@ -116,7 +159,11 @@ impl Canvas {
                 if coverage <= 0.0 {
                     continue;
                 }
-                let t = if horizontal { (px - rect.x) / span } else { (py - rect.y) / span };
+                let t = if horizontal {
+                    (px - rect.x) / span
+                } else {
+                    (py - rect.y) / span
+                };
                 let color = sample_stops(stops, t.clamp(0.0, 1.0));
                 let idx = y * self.width + x;
                 self.pixels[idx] = blend(self.pixels[idx], color, (coverage * 255.0) as u8);
@@ -138,11 +185,28 @@ impl Canvas {
         for y in y0..y1 {
             for x in x0..x1 {
                 let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
-                let dx = if px < left { left - px } else if px > right { px - right } else { 0.0 };
-                let dy = if py < top { top - py } else if py > bottom { py - bottom } else { 0.0 };
+                let dx = if px < left {
+                    left - px
+                } else if px > right {
+                    px - right
+                } else {
+                    0.0
+                };
+                let dy = if py < top {
+                    top - py
+                } else if py > bottom {
+                    py - bottom
+                } else {
+                    0.0
+                };
                 let dist = (dx * dx + dy * dy).sqrt() - radius;
-                let coverage =
-                    if dist <= 0.0 { 1.0 } else if blur > 0.0 { 1.0 - dist / blur } else { 0.0 };
+                let coverage = if dist <= 0.0 {
+                    1.0
+                } else if blur > 0.0 {
+                    1.0 - dist / blur
+                } else {
+                    0.0
+                };
                 if coverage <= 0.0 {
                     continue;
                 }
@@ -161,7 +225,9 @@ impl Canvas {
             Some(entry) => entry.raster,
             None => return,
         };
-        let ascent = font.horizontal_line_metrics(frag.size).map_or(frag.size, |m| m.ascent);
+        let ascent = font
+            .horizontal_line_metrics(frag.size)
+            .map_or(frag.size, |m| m.ascent);
         let baseline = frag.y + ascent;
 
         for glyph in &frag.glyphs {
@@ -221,42 +287,119 @@ impl Canvas {
 fn blend(dst: Color, src: Color, coverage: u8) -> Color {
     let a = (coverage as f32 / 255.0) * (src.a as f32 / 255.0);
     let mix = |d: u8, s: u8| (s as f32 * a + d as f32 * (1.0 - a)).round() as u8;
-    Color { r: mix(dst.r, src.r), g: mix(dst.g, src.g), b: mix(dst.b, src.b), a: 255 }
+    Color {
+        r: mix(dst.r, src.r),
+        g: mix(dst.g, src.g),
+        b: mix(dst.b, src.b),
+        a: 255,
+    }
 }
 
-pub fn paint(layout_root: &LayoutBox, bounds: Rect, fonts: Option<&FontSet>, images: &ImageMap) -> Canvas {
+/// Paint a laid-out page. `find` highlights the runs matching a find-in-page
+/// query and reports where they are, so the embedder can scroll to them.
+pub fn paint(
+    layout_root: &LayoutBox,
+    bounds: Rect,
+    fonts: Option<&FontSet>,
+    images: &ImageMap,
+    find: Option<&str>,
+) -> (Canvas, Vec<Rect>) {
     let display_list = build_display_list(layout_root);
     let mut canvas = Canvas::new(bounds.width as usize, bounds.height as usize);
+    let matches = find
+        .map(|q| highlight_rects(&display_list, q))
+        .unwrap_or_default();
     // The root background paints the whole canvas, not just the root's box, so a
     // short dark page doesn't leave white below it (CSS 2.1 §14.2).
     if let Some(color) = canvas_background(layout_root) {
         canvas.paint_solid(color, bounds);
     }
-    for item in &display_list {
-        match item {
-            DisplayCommand::SolidColor(color, rect) => canvas.paint_solid(*color, *rect),
-            DisplayCommand::RoundedColor(color, rect, radius) => {
-                canvas.paint_rounded(*color, *rect, *radius)
+    // Two passes: everything under the text, then the find highlights, then the
+    // text itself — a highlight must cover page backgrounds but sit under words.
+    for pass in [Pass::Boxes, Pass::Text] {
+        if pass == Pass::Text {
+            for rect in &matches {
+                canvas.paint_solid(HIGHLIGHT, *rect);
             }
-            DisplayCommand::Gradient { rect, radius, stops, horizontal } => {
-                canvas.paint_gradient(*rect, *radius, stops, *horizontal)
-            }
-            DisplayCommand::Shadow { rect, radius, blur, color } => {
-                canvas.paint_shadow(*rect, *radius, *blur, *color)
-            }
-            DisplayCommand::Text(frag) => {
-                if let Some(fonts) = fonts {
-                    canvas.paint_text(frag, fonts);
+        }
+        for item in display_list.iter().filter(|i| pass_of(i) == pass) {
+            match item {
+                DisplayCommand::SolidColor(color, rect) => canvas.paint_solid(*color, *rect),
+                DisplayCommand::RoundedColor(color, rect, radius) => {
+                    canvas.paint_rounded(*color, *rect, *radius)
                 }
-            }
-            DisplayCommand::Image(src, rect) => {
-                if let Some(img) = images.get(src) {
-                    canvas.paint_image(img, *rect);
+                DisplayCommand::Gradient {
+                    rect,
+                    radius,
+                    stops,
+                    horizontal,
+                } => canvas.paint_gradient(*rect, *radius, stops, *horizontal),
+                DisplayCommand::Shadow {
+                    rect,
+                    radius,
+                    blur,
+                    color,
+                } => canvas.paint_shadow(*rect, *radius, *blur, *color),
+                DisplayCommand::Text(frag) => {
+                    if let Some(fonts) = fonts {
+                        canvas.paint_text(frag, fonts);
+                    }
+                }
+                DisplayCommand::Image(src, rect) => {
+                    if let Some(img) = images.get(src) {
+                        canvas.paint_image(img, *rect);
+                    }
                 }
             }
         }
     }
-    canvas
+    (canvas, matches)
+}
+
+/// Text paints above every box, so highlights can slot between the two.
+#[derive(PartialEq, Clone, Copy)]
+enum Pass {
+    Boxes,
+    Text,
+}
+
+fn pass_of(item: &DisplayCommand) -> Pass {
+    match item {
+        DisplayCommand::Text(_) => Pass::Text,
+        _ => Pass::Boxes,
+    }
+}
+
+/// Amber, matching the bookmark star: visible on light and dark pages alike.
+const HIGHLIGHT: Color = Color {
+    r: 245,
+    g: 165,
+    b: 36,
+    a: 190,
+};
+
+/// Boxes of the text runs containing `query`, case-insensitively.
+///
+/// ponytail: highlights the whole word a match falls in, not the exact
+/// substring — runs are shaped per word, and glyphs no longer map to characters.
+fn highlight_rects(list: &DisplayList, query: &str) -> Vec<Rect> {
+    let needle = query.to_lowercase();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    list.iter()
+        .filter_map(|item| match item {
+            DisplayCommand::Text(frag) if frag.text.to_lowercase().contains(&needle) => {
+                Some(Rect {
+                    x: frag.x,
+                    y: frag.y,
+                    width: frag.width,
+                    height: frag.size * 1.25,
+                })
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 fn build_display_list(layout_root: &LayoutBox) -> DisplayList {
@@ -274,21 +417,39 @@ fn render_layout_box(list: &mut DisplayList, layout_box: &LayoutBox) {
     }
     // Inline element backgrounds sit under their own text but over the block's.
     for inline in &layout_box.inline_boxes {
-        let rect =
-            Rect { x: inline.x, y: inline.y, width: inline.width, height: inline.height };
+        let rect = Rect {
+            x: inline.x,
+            y: inline.y,
+            width: inline.width,
+            height: inline.height,
+        };
         if let Some(background) = inline.background {
             if inline.radius > 0.0 {
-                list.push(DisplayCommand::RoundedColor(background, rect, inline.radius));
+                list.push(DisplayCommand::RoundedColor(
+                    background,
+                    rect,
+                    inline.radius,
+                ));
             } else {
                 list.push(DisplayCommand::SolidColor(background, rect));
             }
         }
         if let Some(border) = inline.border_color {
             // A hairline outline is enough until inline border widths are modelled.
-            list.push(DisplayCommand::SolidColor(border, Rect { height: 1.0, ..rect }));
             list.push(DisplayCommand::SolidColor(
                 border,
-                Rect { y: rect.y + rect.height - 1.0, height: 1.0, ..rect },
+                Rect {
+                    height: 1.0,
+                    ..rect
+                },
+            ));
+            list.push(DisplayCommand::SolidColor(
+                border,
+                Rect {
+                    y: rect.y + rect.height - 1.0,
+                    height: 1.0,
+                    ..rect
+                },
             ));
         }
     }
@@ -324,7 +485,12 @@ fn render_shadow(list: &mut DisplayList, layout_box: &LayoutBox) {
     };
     let ctx = style.length_context(0.0);
     let mut offset = [0.0_f32; 3]; // x, y, blur
-    let mut color = Color { r: 0, g: 0, b: 0, a: 80 };
+    let mut color = Color {
+        r: 0,
+        g: 0,
+        b: 0,
+        a: 80,
+    };
     let mut lengths = 0;
     for token in spec.split_whitespace() {
         if let Some(hex) = token.strip_prefix('#') {
@@ -337,7 +503,12 @@ fn render_shadow(list: &mut DisplayList, layout_box: &LayoutBox) {
         }
     }
     let b = layout_box.dimensions.border_box();
-    let rect = Rect { x: b.x + offset[0], y: b.y + offset[1], width: b.width, height: b.height };
+    let rect = Rect {
+        x: b.x + offset[0],
+        y: b.y + offset[1],
+        width: b.width,
+        height: b.height,
+    };
     list.push(DisplayCommand::Shadow {
         rect,
         radius: border_radius(layout_box, b),
@@ -363,7 +534,12 @@ fn render_background(list: &mut DisplayList, layout_box: &LayoutBox) {
             if let Some((stops, horizontal)) = parse_gradient(&spec) {
                 let rect = layout_box.dimensions.border_box();
                 let radius = border_radius(layout_box, rect);
-                list.push(DisplayCommand::Gradient { rect, radius, stops, horizontal });
+                list.push(DisplayCommand::Gradient {
+                    rect,
+                    radius,
+                    stops,
+                    horizontal,
+                });
                 return;
             }
         }
@@ -386,7 +562,10 @@ fn render_background(list: &mut DisplayList, layout_box: &LayoutBox) {
 /// Parse `linear-gradient(<direction>?, stop, stop, ...)` into colour stops.
 /// ponytail: no angles, no explicit stop positions — stops are spaced evenly.
 fn parse_gradient(spec: &str) -> Option<(Vec<Color>, bool)> {
-    let inner = spec.trim().strip_prefix("linear-gradient(")?.strip_suffix(')')?;
+    let inner = spec
+        .trim()
+        .strip_prefix("linear-gradient(")?
+        .strip_suffix(')')?;
     let mut horizontal = false;
     let mut stops = Vec::new();
     for (i, part) in inner.split(',').enumerate() {
@@ -420,7 +599,12 @@ fn sample_stops(stops: &[Color], t: f32) -> Color {
     let f = scaled - i as f32;
     let (a, b) = (stops[i], stops[i + 1]);
     let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * f).round() as u8;
-    Color { r: mix(a.r, b.r), g: mix(a.g, b.g), b: mix(a.b, b.b), a: mix(a.a, b.a) }
+    Color {
+        r: mix(a.r, b.r),
+        g: mix(a.g, b.g),
+        b: mix(a.b, b.b),
+        a: mix(a.a, b.a),
+    }
 }
 
 /// Resolve `border-radius`, with percentages relative to the box's smaller side.
@@ -442,16 +626,49 @@ fn render_borders(list: &mut DisplayList, layout_box: &LayoutBox) {
     let b = d.border_box();
 
     // Left, right, top, bottom border strips.
-    list.push(DisplayCommand::SolidColor(color, Rect { x: b.x, y: b.y, width: d.border.left, height: b.height }));
-    list.push(DisplayCommand::SolidColor(color, Rect { x: b.x + b.width - d.border.right, y: b.y, width: d.border.right, height: b.height }));
-    list.push(DisplayCommand::SolidColor(color, Rect { x: b.x, y: b.y, width: b.width, height: d.border.top }));
-    list.push(DisplayCommand::SolidColor(color, Rect { x: b.x, y: b.y + b.height - d.border.bottom, width: b.width, height: d.border.bottom }));
+    list.push(DisplayCommand::SolidColor(
+        color,
+        Rect {
+            x: b.x,
+            y: b.y,
+            width: d.border.left,
+            height: b.height,
+        },
+    ));
+    list.push(DisplayCommand::SolidColor(
+        color,
+        Rect {
+            x: b.x + b.width - d.border.right,
+            y: b.y,
+            width: d.border.right,
+            height: b.height,
+        },
+    ));
+    list.push(DisplayCommand::SolidColor(
+        color,
+        Rect {
+            x: b.x,
+            y: b.y,
+            width: b.width,
+            height: d.border.top,
+        },
+    ));
+    list.push(DisplayCommand::SolidColor(
+        color,
+        Rect {
+            x: b.x,
+            y: b.y + b.height - d.border.bottom,
+            width: b.width,
+            height: d.border.bottom,
+        },
+    ));
 }
 
 /// The colour that propagates to the canvas: the root element's own background,
 /// or `<body>`'s if the root has none.
 fn canvas_background(root: &LayoutBox) -> Option<Color> {
-    let of = |b: &LayoutBox| get_color(b, "background").or_else(|| get_color(b, "background-color"));
+    let of =
+        |b: &LayoutBox| get_color(b, "background").or_else(|| get_color(b, "background-color"));
     of(root).or_else(|| root.children.iter().find_map(of))
 }
 

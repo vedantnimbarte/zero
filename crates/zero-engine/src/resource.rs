@@ -46,6 +46,18 @@ pub type ImageMap = HashMap<String, DecodedImage>;
 pub fn decode_image(bytes: &[u8]) -> Option<DecodedImage> {
     let img = image::load_from_memory(bytes).ok()?.to_rgba8();
     let (w, h) = img.dimensions();
-    let pixels = img.pixels().map(|p| Color { r: p[0], g: p[1], b: p[2], a: p[3] }).collect();
-    Some(DecodedImage { width: w as usize, height: h as usize, pixels })
+    let pixels = img
+        .pixels()
+        .map(|p| Color {
+            r: p[0],
+            g: p[1],
+            b: p[2],
+            a: p[3],
+        })
+        .collect();
+    Some(DecodedImage {
+        width: w as usize,
+        height: h as usize,
+        pixels,
+    })
 }

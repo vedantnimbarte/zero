@@ -104,7 +104,9 @@ pub fn tokenize(src: &str) -> Result<Vec<Tok>, String> {
                 i += 1;
             }
             let text: String = chars[start..i].iter().collect();
-            let n = text.parse::<f64>().map_err(|_| format!("bad number: {text}"))?;
+            let n = text
+                .parse::<f64>()
+                .map_err(|_| format!("bad number: {text}"))?;
             out.push(Tok::Num(n));
             continue;
         }
@@ -135,7 +137,8 @@ pub fn tokenize(src: &str) -> Result<Vec<Tok>, String> {
         // Identifiers / keywords
         if c.is_alphabetic() || c == '_' || c == '$' {
             let start = i;
-            while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_' || chars[i] == '$')
+            while i < chars.len()
+                && (chars[i].is_alphanumeric() || chars[i] == '_' || chars[i] == '$')
             {
                 i += 1;
             }

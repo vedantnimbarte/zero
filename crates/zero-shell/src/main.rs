@@ -89,7 +89,9 @@ fn main() {
 
     if png_mode {
         let out_path = args.next().unwrap_or_else(|| "output.png".into());
-        render_to_png(&engine, &html, &css, &out_path, &address);
+        // A trailing argument is a find-in-page query, so highlighting can be
+        // eyeballed headlessly.
+        render_to_png(&engine, &html, &css, &out_path, &address, args.next());
     } else if restore_session {
         // No target given: pick up where the last session left off.
         if !app::run_window_restoring_session(engine) {
@@ -101,9 +103,22 @@ fn main() {
     }
 }
 
-fn render_to_png(engine: &Engine, html: &str, css: &str, out_path: &str, base: &str) {
+fn render_to_png(
+    engine: &Engine,
+    html: &str,
+    css: &str,
+    out_path: &str,
+    base: &str,
+    find: Option<String>,
+) {
     let loader = ShellLoader::new(base.to_string());
-    let page = engine.render_page(html, css, 800.0, 600.0, &loader);
+    let mut doc = zero_engine::Document::load_with(html, css, std::rc::Rc::new(loader));
+    doc.set_find(find);
+    let loader = ShellLoader::new(base.to_string());
+    let page = engine.render_document(&mut doc, 800.0, 600.0, &loader);
+    if !page.find_matches.is_empty() {
+        println!("{} matches highlighted", page.find_matches.len());
+    }
     for line in &page.console {
         eprintln!("[js] {line}");
     }

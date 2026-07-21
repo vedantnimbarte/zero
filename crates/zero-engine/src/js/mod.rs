@@ -33,7 +33,10 @@ pub fn run_with_dom(source: &str, dom: DomView) -> Output {
 }
 
 fn err_output(message: String) -> Output {
-    Output { errors: vec![message], ..Default::default() }
+    Output {
+        errors: vec![message],
+        ..Default::default()
+    }
 }
 
 #[cfg(test)]
@@ -62,8 +65,7 @@ mod tests {
 
     #[test]
     fn closures_capture_their_defining_scope() {
-        let out = run(
-            "function counter() {
+        let out = run("function counter() {
                  var n = 0;
                  return function() { n = n + 1; return n; };
              }
@@ -71,8 +73,7 @@ mod tests {
              next(); next();
              console.log(next());
              var other = counter();
-             console.log(other());",
-        );
+             console.log(other());");
         assert!(out.errors.is_empty(), "{:?}", out.errors);
         // Each counter keeps its own captured `n`.
         assert_eq!(out.console, vec!["3", "1"]);
@@ -80,35 +81,30 @@ mod tests {
 
     #[test]
     fn objects_and_arrays() {
-        let out = run(
-            "var user = { name: 'Zero', tags: ['fast', 'private'] };
+        let out = run("var user = { name: 'Zero', tags: ['fast', 'private'] };
              user.tags.push('indian');
              user.year = 2026;
              var nums = [1, 2, 3];
              nums[1] = 20;
              console.log(user.name + ' ' + user.year);
              console.log(user.tags.join('/'));
-             console.log(nums[1] + nums.length);",
-        );
+             console.log(nums[1] + nums.length);");
         assert!(out.errors.is_empty(), "{:?}", out.errors);
         assert_eq!(out.console, vec!["Zero 2026", "fast/private/indian", "23"]);
     }
 
     #[test]
     fn functions_are_values() {
-        let out = run(
-            "function apply(f, v) { return f(v); }
+        let out = run("function apply(f, v) { return f(v); }
              var double = function(x) { return x * 2; };
-             console.log(apply(double, 21));",
-        );
+             console.log(apply(double, 21));");
         assert!(out.errors.is_empty(), "{:?}", out.errors);
         assert_eq!(out.console, vec!["42"]);
     }
 
     #[test]
     fn classes_bind_this_and_construct_instances() {
-        let out = run(
-            "class Counter {
+        let out = run("class Counter {
                  constructor(start) { this.n = start; }
                  bump(by) { this.n = this.n + by; return this.n; }
              }
@@ -116,8 +112,7 @@ mod tests {
              var b = new Counter(100);
              a.bump(5);
              console.log(a.bump(1));
-             console.log(b.bump(1));",
-        );
+             console.log(b.bump(1));");
         assert!(out.errors.is_empty(), "{:?}", out.errors);
         // Instances keep separate state, and `this` resolves inside methods.
         assert_eq!(out.console, vec!["16", "101"]);
@@ -125,8 +120,7 @@ mod tests {
 
     #[test]
     fn classes_inherit_methods_and_call_super() {
-        let out = run(
-            "class Animal {
+        let out = run("class Animal {
                  constructor(name) { this.name = name; }
                  speak() { return this.name + ' makes a sound'; }
                  describe() { return 'I am ' + this.name; }
@@ -140,8 +134,7 @@ mod tests {
              console.log(d.describe());
              console.log(d.legs);
              var a = new Animal('Cat');
-             console.log(a.speak());",
-        );
+             console.log(a.speak());");
         assert!(out.errors.is_empty(), "{:?}", out.errors);
         assert_eq!(
             out.console,
@@ -166,12 +159,10 @@ mod tests {
 
     #[test]
     fn try_catch_recovers_and_finally_always_runs() {
-        let out = run(
-            "try { throw 'boom'; console.log('unreachable'); }
+        let out = run("try { throw 'boom'; console.log('unreachable'); }
              catch (e) { console.log('caught ' + e); }
              finally { console.log('cleanup'); }
-             console.log('after');",
-        );
+             console.log('after');");
         assert!(out.errors.is_empty(), "{:?}", out.errors);
         assert_eq!(out.console, vec!["caught boom", "cleanup", "after"]);
     }
@@ -246,7 +237,11 @@ mod tests {
         assert!(doc.click(3), "handler should have fired");
         assert!(doc.click(3));
         assert!(!doc.click(999), "unknown element has no handler");
-        assert!(doc.text_of(3).contains("clicks: 2"), "got {:?}", doc.text_of(3));
+        assert!(
+            doc.text_of(3).contains("clicks: 2"),
+            "got {:?}",
+            doc.text_of(3)
+        );
     }
 
     #[test]
@@ -268,7 +263,11 @@ mod tests {
         // A script reads the typed value, not the original attribute.
         doc.blur();
         assert!(doc.click(3));
-        assert!(doc.text_of(4).contains("saw:abc"), "got {:?}", doc.text_of(4));
+        assert!(
+            doc.text_of(4).contains("saw:abc"),
+            "got {:?}",
+            doc.text_of(4)
+        );
     }
 
     #[test]
@@ -290,11 +289,19 @@ mod tests {
         assert!(doc.focus(3));
         doc.insert_text("hi");
         // `input` fires on every keystroke.
-        assert!(doc.text_of(4).contains("typing:hi"), "got {:?}", doc.text_of(4));
+        assert!(
+            doc.text_of(4).contains("typing:hi"),
+            "got {:?}",
+            doc.text_of(4)
+        );
         // `change` waits for blur.
         assert_eq!(doc.text_of(5), "-");
         doc.blur();
-        assert!(doc.text_of(5).contains("final:hi"), "got {:?}", doc.text_of(5));
+        assert!(
+            doc.text_of(5).contains("final:hi"),
+            "got {:?}",
+            doc.text_of(5)
+        );
     }
 
     #[test]
@@ -318,10 +325,14 @@ mod tests {
             "",
         );
         let out = doc.text_of(6); // the #out div
-        // 2 paragraphs, 3 elements carrying `note`, compound class match, id match,
-        // and a miss reads as null rather than erroring.
+                                  // 2 paragraphs, 3 elements carrying `note`, compound class match, id match,
+                                  // and a miss reads as null rather than erroring.
         assert!(out.contains("2/3/two/DIV/null"), "got {out:?}");
-        assert!(doc.console.iter().all(|l| !l.contains("error")), "{:?}", doc.console);
+        assert!(
+            doc.console.iter().all(|l| !l.contains("error")),
+            "{:?}",
+            doc.console
+        );
     }
 
     #[test]
@@ -339,7 +350,11 @@ mod tests {
         );
         // The write reached the DOM, so a later event observes the new class.
         assert!(doc.click(3));
-        assert!(doc.text_of(4).contains("now:active"), "got {:?}", doc.text_of(4));
+        assert!(
+            doc.text_of(4).contains("now:active"),
+            "got {:?}",
+            doc.text_of(4)
+        );
     }
 
     #[test]

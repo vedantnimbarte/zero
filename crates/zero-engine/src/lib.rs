@@ -33,9 +33,9 @@ pub use paint::Canvas;
 pub use resource::{DecodedImage, KeyValueStore, ResourceLoader};
 
 use dom::{Node, NodeType};
-use std::collections::HashMap;
 use fontdue::Font;
 use resource::{ImageMap, NullLoader};
+use std::collections::HashMap;
 use text::{FontEntry, FontSet};
 
 /// The result of rendering: pixels plus clickable link regions (page coordinates).
@@ -46,6 +46,8 @@ pub struct Page {
     pub console: Vec<String>,
     /// Painted element boxes, so the embedder can hit-test clicks for scripts.
     pub element_rects: Vec<ElementRect>,
+    /// Boxes of the find-in-page matches, in document order.
+    pub find_matches: Vec<layout::Rect>,
 }
 
 /// A loaded document with a **persistent** JavaScript runtime.
@@ -66,6 +68,8 @@ pub struct Document {
     /// Each `<select>`'s chosen (label, value), captured before its options are
     /// collapsed into the closed control's text.
     selections: HashMap<usize, (String, String)>,
+    /// The find-in-page query, highlighted on the next render.
+    find: Option<String>,
     pub console: Vec<String>,
 }
 
@@ -115,6 +119,7 @@ impl Document {
             focused: None,
             focus_baseline: String::new(),
             selections: HashMap::new(),
+            find: None,
             console: Vec::new(),
         };
         doc.assign_node_ids();
@@ -150,9 +155,11 @@ impl Document {
                     if let Some(option) = chosen {
                         let label = text_content(option).trim().to_string();
                         let value = match &option.node_type {
-                            NodeType::Element(o) => {
-                                o.attributes.get("value").cloned().unwrap_or_else(|| label.clone())
-                            }
+                            NodeType::Element(o) => o
+                                .attributes
+                                .get("value")
+                                .cloned()
+                                .unwrap_or_else(|| label.clone()),
                             NodeType::Text(_) => label.clone(),
                         };
                         out.insert(e.node_id, (label, value));
@@ -237,7 +244,9 @@ impl Document {
 
     /// Drop focus, firing `change` if the value actually moved while focused.
     pub fn blur(&mut self) {
-        let Some(id) = self.focused.take() else { return };
+        let Some(id) = self.focused.take() else {
+            return;
+        };
         self.refresh_fields();
         let current = self.form_values.get(&id).cloned().unwrap_or_default();
         if current != self.focus_baseline {
@@ -247,6 +256,11 @@ impl Document {
 
     pub fn is_focused(&self) -> bool {
         self.focused.is_some()
+    }
+
+    /// Highlight every occurrence of `query` on the next render; `None` clears it.
+    pub fn set_find(&mut self, query: Option<String>) {
+        self.find = query.filter(|q| !q.is_empty());
     }
 
     /// Which field has focus, so the embedder can act on it (submit, say).
@@ -295,13 +309,21 @@ impl Document {
             NodeType::Element(e) => e,
             NodeType::Text(_) => return None,
         };
-        if element.attributes.get("method").is_some_and(|m| m.eq_ignore_ascii_case("post")) {
+        if element
+            .attributes
+            .get("method")
+            .is_some_and(|m| m.eq_ignore_ascii_case("post"))
+        {
             return None;
         }
         let mut fields = Vec::new();
         collect_fields(form, &self.form_values, &self.selections, &mut fields);
         Some(Submission {
-            action: element.attributes.get("action").cloned().unwrap_or_default(),
+            action: element
+                .attributes
+                .get("action")
+                .cloned()
+                .unwrap_or_default(),
             query: fields
                 .iter()
                 .map(|(k, v)| format!("{}={}", percent_encode(k), percent_encode(v)))
@@ -354,7 +376,8 @@ impl Document {
     fn absorb_script_output(&mut self) {
         let out = std::mem::take(&mut self.interp.out);
         self.console.extend(out.console);
-        self.console.extend(out.errors.iter().map(|e| format!("[error] {e}")));
+        self.console
+            .extend(out.errors.iter().map(|e| format!("[error] {e}")));
 
         apply_mutations(&mut self.root, &out.mutations);
         if !out.writes.trim().is_empty() {
@@ -410,10 +433,16 @@ impl Document {
     pub fn headings(&self) -> Vec<(u8, String)> {
         fn walk(node: &Node, out: &mut Vec<(u8, String)>) {
             if let NodeType::Element(ref e) = node.node_type {
-                if let Some(level) = e.tag_name.strip_prefix('h').and_then(|d| d.parse::<u8>().ok())
+                if let Some(level) = e
+                    .tag_name
+                    .strip_prefix('h')
+                    .and_then(|d| d.parse::<u8>().ok())
                 {
                     if (1..=6).contains(&level) {
-                        let text = text_content(node).split_whitespace().collect::<Vec<_>>().join(" ");
+                        let text = text_content(node)
+                            .split_whitespace()
+                            .collect::<Vec<_>>()
+                            .join(" ");
                         if !text.is_empty() {
                             out.push((level, text));
                         }
@@ -439,7 +468,9 @@ impl Document {
             }
             node.children.iter().find_map(|c| find(c, node_id))
         }
-        find(&self.root, node_id).map(text_content).unwrap_or_default()
+        find(&self.root, node_id)
+            .map(text_content)
+            .unwrap_or_default()
     }
 
     fn assign_node_ids(&mut self) {
@@ -492,7 +523,12 @@ impl Engine {
     /// Build an engine that renders text using the given TrueType font bytes.
     pub fn new(font_bytes: &[u8]) -> Result<Engine, &'static str> {
         let raster = Font::from_bytes(font_bytes, fontdue::FontSettings::default())?;
-        Ok(Engine { fonts: vec![LoadedFont { raster, bytes: font_bytes.to_vec() }] })
+        Ok(Engine {
+            fonts: vec![LoadedFont {
+                raster,
+                bytes: font_bytes.to_vec(),
+            }],
+        })
     }
 
     /// Build an engine with a prioritized font fallback chain. Fonts that fail to
@@ -518,7 +554,8 @@ impl Engine {
     /// Render an HTML + CSS document to a pixel [`Canvas`], without loading any
     /// external resources (images render blank). See [`Engine::render_page`].
     pub fn render(&self, html_source: &str, css_source: &str, width: f32, height: f32) -> Canvas {
-        self.render_page(html_source, css_source, width, height, &NullLoader).canvas
+        self.render_page(html_source, css_source, width, height, &NullLoader)
+            .canvas
     }
 
     /// Render a full [`Page`] (pixels + clickable links), using `loader` to fetch
@@ -549,6 +586,7 @@ impl Engine {
         let root = &doc.root;
         let console = std::mem::take(&mut doc.console);
         let css_source = doc.css.clone();
+        let find = doc.find.clone();
         let css_source = css_source.as_str();
 
         // Cascade order (later wins on ties):
@@ -560,7 +598,9 @@ impl Engine {
         let mut page_css = String::new();
         collect_style_text(root, &mut page_css);
         stylesheet.rules.extend(css::parse(page_css).rules);
-        stylesheet.rules.extend(css::parse(css_source.to_string()).rules);
+        stylesheet
+            .rules
+            .extend(css::parse(css_source.to_string()).rules);
 
         let style_root = style::style_tree(root, &stylesheet);
 
@@ -573,30 +613,57 @@ impl Engine {
         viewport.content.height = height;
 
         // Shaping faces are built per render; they borrow the stored font bytes.
-        let faces: Vec<Option<rustybuzz::Face>> =
-            self.fonts.iter().map(|f| rustybuzz::Face::from_slice(&f.bytes, 0)).collect();
+        let faces: Vec<Option<rustybuzz::Face>> = self
+            .fonts
+            .iter()
+            .map(|f| rustybuzz::Face::from_slice(&f.bytes, 0))
+            .collect();
         let entries: Vec<FontEntry> = self
             .fonts
             .iter()
             .zip(faces.iter())
             .filter_map(|(f, face)| {
-                face.as_ref().map(|shaper| FontEntry { raster: &f.raster, shaper })
+                face.as_ref().map(|shaper| FontEntry {
+                    raster: &f.raster,
+                    shaper,
+                })
             })
             .collect();
-        let fonts = if entries.is_empty() { None } else { Some(FontSet { entries }) };
+        let fonts = if entries.is_empty() {
+            None
+        } else {
+            Some(FontSet { entries })
+        };
 
         let layout_root = layout::layout_tree(&style_root, viewport, fonts.as_ref(), &images);
         // Canvas is at least the viewport, but grows to the full document height so
         // the embedder can scroll through overflow.
         let doc_height = layout_root.dimensions.margin_box().height.max(height);
-        let bounds = layout::Rect { x: 0.0, y: 0.0, width, height: doc_height };
-        let canvas = paint::paint(&layout_root, bounds, fonts.as_ref(), &images);
+        let bounds = layout::Rect {
+            x: 0.0,
+            y: 0.0,
+            width,
+            height: doc_height,
+        };
+        let (canvas, find_matches) = paint::paint(
+            &layout_root,
+            bounds,
+            fonts.as_ref(),
+            &images,
+            find.as_deref(),
+        );
 
         let mut links = Vec::new();
         layout::collect_links(&layout_root, &mut links);
         let mut element_rects = Vec::new();
         layout::collect_element_rects(&layout_root, &mut element_rects);
-        Page { canvas, links, console, element_rects }
+        Page {
+            canvas,
+            links,
+            console,
+            element_rects,
+            find_matches,
+        }
     }
 }
 
@@ -632,10 +699,10 @@ fn collect_linked_css(node: &Node, loader: &dyn ResourceLoader, out: &mut String
 
 /// `rel` is a space-separated token list, and matching is case-insensitive.
 fn is_stylesheet(element: &dom::ElementData) -> bool {
-    element
-        .attributes
-        .get("rel")
-        .is_some_and(|rel| rel.split_whitespace().any(|t| t.eq_ignore_ascii_case("stylesheet")))
+    element.attributes.get("rel").is_some_and(|rel| {
+        rel.split_whitespace()
+            .any(|t| t.eq_ignore_ascii_case("stylesheet"))
+    })
 }
 
 fn collect_and_load_images(node: &Node, loader: &dyn ResourceLoader, out: &mut ImageMap) {

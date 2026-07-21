@@ -31,7 +31,8 @@ impl FontSet<'_> {
         self.entries
             .iter()
             .position(|e| {
-                text.chars().all(|c| c.is_whitespace() || e.raster.lookup_glyph_index(c) != 0)
+                text.chars()
+                    .all(|c| c.is_whitespace() || e.raster.lookup_glyph_index(c) != 0)
             })
             .unwrap_or(0)
     }
