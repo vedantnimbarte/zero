@@ -1,6 +1,9 @@
 //! Style: match CSS rules to DOM nodes and produce a styled tree (the cascade).
 
-use crate::css::{Rule, Selector, SimpleSelector, Specificity, Stylesheet, Value};
+use crate::css::{
+    LengthContext, Rule, Selector, SimpleSelector, Specificity, Stylesheet, Unit, Value,
+    DEFAULT_FONT_SIZE,
+};
 use crate::dom::{ElementData, Node, NodeType};
 use std::collections::HashMap;
 
@@ -24,6 +27,30 @@ pub enum Display {
 impl<'a> StyledNode<'a> {
     pub fn value(&self, name: &str) -> Option<Value> {
         self.specified_values.get(name).cloned()
+    }
+
+    /// The element's computed font size in px. Resolved during styling, so `em`
+    /// elsewhere can be resolved without walking back up the tree.
+    pub fn font_size(&self) -> f32 {
+        match self.specified_values.get("font-size") {
+            Some(Value::Length(v, Unit::Px)) => *v,
+            _ => DEFAULT_FONT_SIZE,
+        }
+    }
+
+    /// Length context for this element: percentages against `percent_base`,
+    /// `em` against this element's own font size.
+    pub fn length_context(&self, percent_base: f32) -> LengthContext {
+        LengthContext {
+            percent_base,
+            font_size: self.font_size(),
+            root_font_size: DEFAULT_FONT_SIZE,
+        }
+    }
+
+    /// Resolve a property to px in this element's context.
+    pub fn px(&self, name: &str, percent_base: f32) -> Option<f32> {
+        self.value(name).map(|v| v.resolve(self.length_context(percent_base)))
     }
 
     /// Return `name`, else `fallback_name` (for shorthand like `margin`), else `default`.
@@ -117,6 +144,21 @@ fn style_tree_inner<'a>(
             }
         }
     }
+
+    // Collapse font-size to absolute px now: `em` is relative to the *parent's*
+    // font size, which is only knowable here during the top-down walk.
+    let parent_font = match inherited.get("font-size") {
+        Some(Value::Length(v, Unit::Px)) => *v,
+        _ => DEFAULT_FONT_SIZE,
+    };
+    let font_px = match specified.get("font-size") {
+        Some(Value::Length(v, Unit::Px)) => *v,
+        Some(Value::Length(v, Unit::Em)) => v * parent_font,
+        Some(Value::Length(v, Unit::Rem)) => v * DEFAULT_FONT_SIZE,
+        Some(Value::Length(v, Unit::Percent)) => v / 100.0 * parent_font,
+        _ => parent_font,
+    };
+    specified.insert("font-size".to_string(), Value::Length(font_px, Unit::Px));
     let children =
         root.children.iter().map(|child| style_tree_inner(child, stylesheet, &specified)).collect();
     StyledNode { node: root, specified_values: specified, children }
