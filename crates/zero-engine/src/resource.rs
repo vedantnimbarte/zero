@@ -12,6 +12,17 @@ pub trait ResourceLoader {
     fn load(&self, url: &str) -> Option<Vec<u8>>;
 }
 
+/// Key/value storage for scripts (`localStorage`), supplied by the embedder.
+///
+/// The engine never decides *where* this lives; the embedder partitions it per
+/// site so one origin cannot read another's state.
+pub trait KeyValueStore {
+    fn get(&self, key: &str) -> Option<String>;
+    fn set(&self, key: &str, value: &str);
+    fn remove(&self, key: &str);
+    fn clear(&self);
+}
+
 /// A loader that fetches nothing — used by the plain `render` path.
 pub struct NullLoader;
 

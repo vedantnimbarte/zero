@@ -8,7 +8,7 @@
 //! are plain maps and only a handful of built-in methods exist.
 
 use super::dom::{DomView, Mutation};
-use crate::resource::ResourceLoader;
+use crate::resource::{KeyValueStore, ResourceLoader};
 use super::parser::{Expr, Stmt};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -168,6 +168,8 @@ pub struct Interp {
     timer_seq: usize,
     /// Supplied by the embedder so `fetch` can reach the network.
     loader: Option<Rc<dyn ResourceLoader>>,
+    /// Backing store for `localStorage`, partitioned by the embedder.
+    store: Option<Rc<dyn KeyValueStore>>,
     pub out: Output,
 }
 
@@ -193,6 +195,16 @@ impl Interp {
         Env::define(&env, "fetch".into(), Value::Native("fetch"));
         Env::define(
             &env,
+            "localStorage".into(),
+            namespace(&[
+                ("getItem", "localStorage.getItem"),
+                ("setItem", "localStorage.setItem"),
+                ("removeItem", "localStorage.removeItem"),
+                ("clear", "localStorage.clear"),
+            ]),
+        );
+        Env::define(
+            &env,
             "document".into(),
             namespace(&[
                 ("write", "document.write"),
@@ -207,6 +219,7 @@ impl Interp {
             timers: Vec::new(),
             timer_seq: 0,
             loader: None,
+            store: None,
             out: Output::default(),
         }
     }
@@ -234,6 +247,11 @@ impl Interp {
     /// Give scripts network access through the embedder.
     pub fn set_loader(&mut self, loader: Rc<dyn ResourceLoader>) {
         self.loader = Some(loader);
+    }
+
+    /// Give scripts persistent key/value storage through the embedder.
+    pub fn set_store(&mut self, store: Rc<dyn KeyValueStore>) {
+        self.store = Some(store);
     }
 
     /// Refresh the snapshot after the document changed, so later events see new text.
@@ -783,6 +801,32 @@ impl Interp {
                         );
                         response.insert("text".into(), Value::Str(body.unwrap_or_default()));
                         return Ok(Value::Object(Rc::new(RefCell::new(response))));
+                    }
+                    "localStorage.getItem" => {
+                        let key = args.first().map(Value::to_display).unwrap_or_default();
+                        return Ok(match self.store.as_ref().and_then(|s| s.get(&key)) {
+                            Some(v) => Value::Str(v),
+                            None => Value::Null, // absent keys read as null, like the web
+                        });
+                    }
+                    "localStorage.setItem" => {
+                        if let (Some(store), Some(key)) = (&self.store, args.first()) {
+                            let value = args.get(1).map(Value::to_display).unwrap_or_default();
+                            store.set(&key.to_display(), &value);
+                        }
+                        return Ok(Value::Undefined);
+                    }
+                    "localStorage.removeItem" => {
+                        if let (Some(store), Some(key)) = (&self.store, args.first()) {
+                            store.remove(&key.to_display());
+                        }
+                        return Ok(Value::Undefined);
+                    }
+                    "localStorage.clear" => {
+                        if let Some(store) = &self.store {
+                            store.clear();
+                        }
+                        return Ok(Value::Undefined);
                     }
                     "document.getElementById" => {
                         return Ok(match self.dom.find_by_id(&text) {
