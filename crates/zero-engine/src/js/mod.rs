@@ -124,6 +124,37 @@ mod tests {
     }
 
     #[test]
+    fn classes_inherit_methods_and_call_super() {
+        let out = run(
+            "class Animal {
+                 constructor(name) { this.name = name; }
+                 speak() { return this.name + ' makes a sound'; }
+                 describe() { return 'I am ' + this.name; }
+             }
+             class Dog extends Animal {
+                 constructor(name) { super(name); this.legs = 4; }
+                 speak() { return super.speak() + ' (a bark)'; }
+             }
+             var d = new Dog('Rex');
+             console.log(d.speak());
+             console.log(d.describe());
+             console.log(d.legs);
+             var a = new Animal('Cat');
+             console.log(a.speak());",
+        );
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(
+            out.console,
+            vec![
+                "Rex makes a sound (a bark)", // override calling super
+                "I am Rex",                   // inherited method
+                "4",                          // subclass constructor ran after super()
+                "Cat makes a sound",          // parent unaffected by the subclass
+            ]
+        );
+    }
+
+    #[test]
     fn this_works_on_object_methods() {
         let out = run(
             "var obj = { name: 'Zero', greet: function() { return 'hi ' + this.name; } };

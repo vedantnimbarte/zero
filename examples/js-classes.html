@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html><head><style>
+body { background: #0e0f12; color: #f2f3f5; padding: 26px; font-size: 15px; }
+h1 { color: #e5484d; font-size: 26px; }
+.grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; }
+.card { background: linear-gradient(to right, #17181c, #23262e); padding: 14px; border-radius: 10px; box-shadow: 0px 4px 14px #00000099; }
+.hi { background: linear-gradient(to right, #30a46c, #2b8f5e); color: #06251a; padding: 14px; border-radius: 10px; }
+</style></head><body>
+<h1>Class inheritance</h1>
+<div class="grid" id="out"></div>
+<script>
+  class Shape {
+    constructor(name) { this.name = name; }
+    area() { return 0; }
+    describe() { return this.name + ' area=' + this.area(); }
+  }
+  class Rect extends Shape {
+    constructor(w, h) { super('rect'); this.w = w; this.h = h; }
+    area() { return this.w * this.h; }
+  }
+  class Square extends Rect {
+    constructor(side) { super(side, side); this.name = 'square'; }
+    describe() { return 'a ' + super.describe(); }
+  }
+
+  var shapes = [new Shape('blank'), new Rect(6, 7), new Square(5)];
+  var html = '';
+  for (var i = 0; i < shapes.length; i++) {
+    var cls = i === 0 ? 'card' : 'hi';
+    html = html + '<div class="' + cls + '">' + shapes[i].describe() + '</div>';
+  }
+  html = html + '<div class="card">two levels of extends, super() chained</div>';
+  document.getElementById('out').innerHTML = html;
+</script>
+</body></html>
