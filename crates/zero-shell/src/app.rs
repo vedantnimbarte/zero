@@ -15,6 +15,7 @@
 
 use crate::ai::{Assistant, LocalAssistant, PageContext};
 use crate::net::{load_target, normalize_target, resolve_url, ShellLoader};
+use crate::storage;
 use std::num::NonZeroU32;
 use std::rc::Rc;
 use winit::application::ApplicationHandler;
@@ -151,6 +152,38 @@ pub fn run_window(engine: Engine, html: String, css: String, address: String) {
     event_loop.run_app(&mut app).expect("event loop error");
 }
 
+/// Reopen the tabs from the previous session, if any were saved.
+pub fn run_window_restoring_session(engine: Engine) -> bool {
+    let Some((urls, active)) = storage::load_session() else { return false };
+    let event_loop = EventLoop::new().expect("failed to create event loop");
+    let tabs: Vec<Tab> = urls
+        .iter()
+        .map(|url| {
+            let fetched = load_target(url);
+            let loader = Rc::new(ShellLoader::new(fetched.url.clone()));
+            let mut tab = Tab::new(fetched.url.clone(), String::new(), String::new());
+            tab.doc = zero_engine::Document::load_with(&fetched.body, "", loader);
+            tab.secure = fetched.secure;
+            tab
+        })
+        .collect();
+    let mut app = App {
+        engine,
+        active: active.min(tabs.len() - 1),
+        tabs,
+        modifiers: ModifiersState::default(),
+        cursor: (0.0, 0.0),
+        ai_open: false,
+        ai_text: String::new(),
+        toolbar_rects: Vec::new(),
+        dragging_scrollbar: false,
+        window: None,
+        surface: None,
+    };
+    event_loop.run_app(&mut app).expect("event loop error");
+    true
+}
+
 struct App {
     engine: Engine,
     tabs: Vec<Tab>,
@@ -243,9 +276,17 @@ impl App {
 
     // --- tab management ---
 
+    /// Write the open tabs to disk so the next launch can restore them.
+    fn save_session(&self) {
+        let urls: Vec<String> =
+            self.tabs.iter().map(|t| t.address.clone()).filter(|a| !a.is_empty()).collect();
+        storage::save_session(&urls, self.active.min(urls.len().saturating_sub(1)));
+    }
+
     fn new_tab(&mut self) {
         self.tabs.push(Tab::blank());
         self.active = self.tabs.len() - 1;
+        self.save_session();
     }
 
     fn close_tab(&mut self) {
@@ -254,6 +295,7 @@ impl App {
             self.tabs.push(Tab::blank()); // always keep one tab open
         }
         self.active = self.active.min(self.tabs.len() - 1);
+        self.save_session();
     }
 
     fn next_tab(&mut self) {
@@ -472,9 +514,11 @@ impl App {
         tab.scroll_y = 0.0;
         tab.page_canvas = None; // force re-render of the new page
         let title = tab.address.clone();
+        storage::record_visit(&title, &tab_title(&title));
         if let Some(window) = &self.window {
             window.set_title(&format!("Zero Browser — {title}"));
         }
+        self.save_session();
         if self.ai_open {
             self.run_assistant(); // keep the panel in sync with the new page
         }

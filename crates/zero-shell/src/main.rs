@@ -11,12 +11,14 @@
 //!   zero [target] [css]              # window   (target = file or URL)
 //!   zero --png [target] [css] [out]  # headless PNG
 //!   zero --ai [target]               # headless assistant report
+//!   zero --history                   # print saved browsing history
 
 mod ai;
 mod app;
 mod blocker;
 mod fonts;
 mod net;
+mod storage;
 
 use ai::Assistant;
 use net::{is_url, load_target, ShellLoader};
@@ -25,6 +27,12 @@ use zero_engine::Engine;
 
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(|a| a == "--history").unwrap_or(false) {
+        for visit in storage::load_history() {
+            println!("{}	{}	{}", visit.when, visit.url, visit.title);
+        }
+        return;
+    }
     let png_mode = args.first().map(|a| a == "--png").unwrap_or(false);
     let ai_mode = args.first().map(|a| a == "--ai").unwrap_or(false);
     if png_mode || ai_mode {
@@ -32,8 +40,10 @@ fn main() {
     }
     let mut args = args.into_iter().peekable();
 
+    let mut restore_session = false;
     let (html, css, address) = match args.next() {
         None => {
+            restore_session = true;
             let html = fs::read_to_string("examples/test.html").expect("read html");
             let css = fs::read_to_string("examples/test.css").expect("read css");
             (html, css, "examples/test.html".to_string())
@@ -76,6 +86,12 @@ fn main() {
     if png_mode {
         let out_path = args.next().unwrap_or_else(|| "output.png".into());
         render_to_png(&engine, &html, &css, &out_path, &address);
+    } else if restore_session {
+        // No target given: pick up where the last session left off.
+        if !app::run_window_restoring_session(engine) {
+            let engine = fonts::build_engine();
+            app::run_window(engine, html, css, address);
+        }
     } else {
         app::run_window(engine, html, css, address);
     }
