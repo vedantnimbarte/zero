@@ -16,6 +16,19 @@ const STYLE: &str = "<style>\
     .empty{background:#17181c;padding:16px;border-radius:8px;color:#9a9da6;}\
     </style>";
 
+/// Deliberately sparse: one mark, one field, one row of tiles. The UI spec asks
+/// for space rather than density (docs/02-UI-UX-SPEC.md).
+const NEWTAB_STYLE: &str = "<style>\
+    body{background:#0e0f12;color:#f2f3f5;font-size:15px;}\
+    .hero{padding:96px;}\
+    .mark{color:#e5484d;font-size:44px;padding:12px;}\
+    .q{background:#17181c;color:#f2f3f5;width:70%;padding:16px;border-radius:12px;\
+       font-size:17px;}\
+    .tiles{display:flex;flex-wrap:wrap;padding:24px;}\
+    .tile{display:inline-block;background:#17181c;color:#c9ccd3;width:160px;\
+          padding:16px;margin:8px;border-radius:10px;}\
+    </style>";
+
 fn escape(text: &str) -> String {
     text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
@@ -28,6 +41,7 @@ pub fn is_internal(target: &str) -> bool {
 /// Render a built-in page, or a "not found" page for an unknown one.
 pub fn page(target: &str) -> String {
     match target.trim_end_matches('/') {
+        "zero://newtab" => newtab_page(),
         "zero://history" => history_page(),
         "zero://bookmarks" => bookmarks_page(),
         other => wrap(
@@ -39,6 +53,62 @@ pub fn page(target: &str) -> String {
 
 fn wrap(title: &str, body: &str) -> String {
     format!("<html><head>{STYLE}</head><body><h1>{title}</h1>{body}</body></html>")
+}
+
+/// The start page: one search field, and the sites actually used most.
+///
+/// The search box is an ordinary GET form, so it goes through the same
+/// submission path as any site's search box rather than a special case.
+fn newtab_page() -> String {
+    let tiles: String = top_sites(8)
+        .iter()
+        .map(|(url, title)| {
+            format!(
+                "<a class=\"tile\" href=\"{}\">{}</a>",
+                escape(url),
+                escape(&short(title, url))
+            )
+        })
+        .collect();
+    let tiles = match tiles.is_empty() {
+        true => String::new(),
+        false => format!("<div class=\"tiles\">{tiles}</div>"),
+    };
+    format!(
+        "<html><head>{NEWTAB_STYLE}</head><body>\
+         <div class=\"hero\">\
+         <div class=\"mark\">zero</div>\
+         <form action=\"https://duckduckgo.com/html/\">\
+         <input name=\"q\" class=\"q\" placeholder=\"Search the web, privately\">\
+         </form>\
+         </div>{tiles}</body></html>"
+    )
+}
+
+/// Most-visited sites, by how often they appear in history.
+fn top_sites(limit: usize) -> Vec<(String, String)> {
+    let mut counts: std::collections::HashMap<String, (usize, String)> = Default::default();
+    for visit in storage::load_history() {
+        let entry = counts.entry(visit.url).or_insert((0, String::new()));
+        entry.0 += 1;
+        if !visit.title.is_empty() {
+            entry.1 = visit.title; // keep the latest title we saw
+        }
+    }
+    let mut sites: Vec<_> = counts.into_iter().collect();
+    // Ties broken by URL so the grid does not reshuffle between renders.
+    sites.sort_by(|a, b| b.1 .0.cmp(&a.1 .0).then_with(|| a.0.cmp(&b.0)));
+    sites.into_iter().take(limit).map(|(url, (_, title))| (url, title)).collect()
+}
+
+/// Tiles are small, so prefer a short title and fall back to the host.
+fn short(title: &str, url: &str) -> String {
+    let host = url.split("://").nth(1).unwrap_or(url).split('/').next().unwrap_or(url);
+    match title.chars().count() {
+        0 => host.to_string(),
+        n if n > 24 => title.chars().take(23).chain(['…']).collect(),
+        _ => title.to_string(),
+    }
 }
 
 /// Newest first, and only the most recent visit per URL so the list stays useful.
