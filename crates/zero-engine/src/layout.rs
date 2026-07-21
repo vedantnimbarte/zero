@@ -830,6 +830,60 @@ impl<'a> LayoutBox<'a> {
         };
         self.text_fragments = fragments;
         self.link_areas = link_areas;
+        self.align_lines(start_x, max_width);
+    }
+
+    /// Shift each finished line for `text-align`.
+    ///
+    /// Alignment is a whole-line property, but lines only exist implicitly here:
+    /// every item placed at the same `y` belongs to one. Shifting afterwards
+    /// keeps wrapping (which needs a left-to-right cursor) independent of it.
+    fn align_lines(&mut self, start_x: f32, max_width: f32) {
+        // An anonymous block has no style of its own, but text-align inherits,
+        // so its inline children carry the value its parent set.
+        let styled = match self.box_type {
+            BoxType::BlockNode(styled) | BoxType::InlineNode(styled) => Some(styled),
+            BoxType::AnonymousBlock => self.children.iter().find_map(|child| match child.box_type {
+                BoxType::BlockNode(styled) | BoxType::InlineNode(styled) => Some(styled),
+                BoxType::AnonymousBlock => None,
+            }),
+        };
+        let align = match styled.and_then(|s| s.value("text-align")) {
+            Some(Value::Keyword(word)) => word,
+            _ => return,
+        };
+        let factor = match align.as_str() {
+            "center" => 0.5,
+            "right" | "end" => 1.0,
+            _ => return, // left/start/justify: already where they belong
+        };
+
+        // Line identity is the y coordinate the items were placed at.
+        let mut lines: Vec<f32> = self.text_fragments.iter().map(|f| f.y).collect();
+        lines.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        lines.dedup();
+
+        for line_y in lines {
+            let right = self
+                .text_fragments
+                .iter()
+                .filter(|f| f.y == line_y)
+                .map(|f| f.x + f.width)
+                .fold(f32::MIN, f32::max);
+            let shift = line_shift(right, start_x + max_width, factor);
+            if shift <= 0.0 {
+                continue;
+            }
+            for frag in self.text_fragments.iter_mut().filter(|f| f.y == line_y) {
+                frag.x += shift;
+            }
+            for link in self.link_areas.iter_mut().filter(|l| l.y == line_y) {
+                link.x += shift;
+            }
+            for boxed in self.inline_boxes.iter_mut().filter(|b| b.y == line_y) {
+                boxed.x += shift;
+            }
+        }
     }
 
     fn calculate_block_width(&mut self, containing_block: Dimensions) {
@@ -1677,6 +1731,12 @@ fn build_layout_tree<'a>(style_node: &'a StyledNode<'a>) -> LayoutBox<'a> {
     build_box(style_node, false)
 }
 
+/// How far to move a line whose content ends at `line_right` inside a box whose
+/// content ends at `content_right`. A line that overflows is never pulled back.
+fn line_shift(line_right: f32, content_right: f32, factor: f32) -> f32 {
+    (content_right - line_right).max(0.0) * factor
+}
+
 /// Does this node have a block-level child? Inline-block does not count: it is
 /// inline-level and sits happily in a line.
 fn contains_block(style_node: &StyledNode) -> bool {
@@ -1741,6 +1801,16 @@ mod tests {
     use crate::css::{Unit, Value};
     use crate::dom;
     use std::collections::HashMap;
+
+    #[test]
+    fn lines_shift_by_their_leftover_space() {
+        // A 100px-wide line in a 300px box: centred moves half the slack, right all.
+        assert_eq!(line_shift(100.0, 300.0, 0.5), 100.0);
+        assert_eq!(line_shift(100.0, 300.0, 1.0), 200.0);
+        // A full line does not move, and an overflowing one is not pulled back.
+        assert_eq!(line_shift(300.0, 300.0, 1.0), 0.0);
+        assert_eq!(line_shift(420.0, 300.0, 1.0), 0.0);
+    }
 
     #[test]
     fn explicit_block_width_is_respected() {

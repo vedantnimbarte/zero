@@ -210,6 +210,12 @@ fn presentation_hints(elem: &ElementData) -> PropertyMap {
             hints.insert("color".to_string(), color);
         }
     }
+    // `align="center"` on a cell or paragraph is the old spelling of text-align.
+    if let Some(align) = attr("align") {
+        if matches!(align.as_str(), "left" | "center" | "right") {
+            hints.insert("text-align".to_string(), Value::Keyword(align));
+        }
+    }
     for name in ["width", "height"] {
         if let Some(length) = attr(name).and_then(|v| parse_attr_length(&v)) {
             hints.insert(name.to_string(), length);
@@ -239,7 +245,7 @@ fn parse_attr_length(value: &str) -> Option<Value> {
 
 /// Properties that flow from parent to child when the child doesn't set them.
 /// Text nodes have no rules of their own, so this is how they get color/size.
-const INHERITED_PROPERTIES: [&str; 2] = ["color", "font-size"];
+const INHERITED_PROPERTIES: [&str; 3] = ["color", "font-size", "text-align"];
 
 pub fn style_tree<'a>(root: &'a Node, stylesheet: &'a Stylesheet) -> StyledNode<'a> {
     style_tree_inner(root, stylesheet, &HashMap::new(), &mut Vec::new())
