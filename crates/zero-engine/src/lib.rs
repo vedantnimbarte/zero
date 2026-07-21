@@ -430,6 +430,24 @@ impl Document {
     }
 
     /// Headings in document order, as (level, text) — a structural outline.
+    /// The document's `<title>`, collapsed to one line. Empty when the page has
+    /// none, so the embedder can fall back to the URL.
+    pub fn title(&self) -> String {
+        fn find(node: &Node) -> Option<String> {
+            if let NodeType::Element(ref e) = node.node_type {
+                if e.tag_name == "title" {
+                    return Some(text_content(node));
+                }
+            }
+            node.children.iter().find_map(find)
+        }
+        find(&self.root)
+            .unwrap_or_default()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     pub fn headings(&self) -> Vec<(u8, String)> {
         fn walk(node: &Node, out: &mut Vec<(u8, String)>) {
             if let NodeType::Element(ref e) = node.node_type {
@@ -1005,6 +1023,21 @@ mod tests {
 
         let field = first_input(&doc);
         assert_eq!(doc.submit(field).unwrap().query, "q=x&region=in");
+    }
+
+    #[test]
+    fn the_document_title_is_one_tidy_line() {
+        let doc = super::Document::load(
+            "<html><head><title>
+  Rust (programming language)
+  - Wikipedia
+</title></head>             <body><title>not this one</title></body></html>",
+            "",
+        );
+        // Whitespace collapses, and the first title wins.
+        assert_eq!(doc.title(), "Rust (programming language) - Wikipedia");
+        // A page with no title reports nothing, so the embedder can fall back.
+        assert_eq!(super::Document::load("<p>hi</p>", "").title(), "");
     }
 
     #[test]
