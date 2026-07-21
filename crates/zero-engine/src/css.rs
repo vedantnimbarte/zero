@@ -137,7 +137,8 @@ fn is_ident(c: char) -> bool {
 }
 
 /// Properties whose values are lists we parse later, not single tokens.
-const RAW_VALUE_PROPERTIES: &[&str] = &["grid-template-columns", "grid-template-rows"];
+const RAW_VALUE_PROPERTIES: &[&str] =
+    &["grid-template-columns", "grid-template-rows", "box-shadow", "background-image"];
 
 /// Interpret a raw value string, returning `None` for anything unsupported.
 fn classify_value(s: &str) -> Option<Value> {
@@ -146,6 +147,10 @@ fn classify_value(s: &str) -> Option<Value> {
     }
     if let Some(hex) = s.strip_prefix('#') {
         return parse_hex_color(hex);
+    }
+    // Functions we interpret later (gradients) are kept verbatim.
+    if s.starts_with("linear-gradient(") {
+        return Some(Value::Raw(s.to_string()));
     }
     for (suffix, unit) in
         [("px", Unit::Px), ("rem", Unit::Rem), ("em", Unit::Em), ("%", Unit::Percent)]
@@ -171,9 +176,35 @@ fn classify_value(s: &str) -> Option<Value> {
     None
 }
 
+/// Parse a bare hex colour body (no leading `#`).
+pub fn parse_color_token(hex: &str) -> Option<Value> {
+    parse_hex_color(hex)
+}
+
+/// Parse a single length token (`12px`, `1.5em`, `50%`) to px.
+pub fn parse_length_token(token: &str, ctx: LengthContext) -> f32 {
+    for (suffix, unit) in
+        [("px", Unit::Px), ("rem", Unit::Rem), ("em", Unit::Em), ("%", Unit::Percent)]
+    {
+        if let Some(n) = token.strip_suffix(suffix) {
+            if let Ok(v) = n.trim().parse::<f32>() {
+                return Value::Length(v, unit).resolve(ctx);
+            }
+        }
+    }
+    token.parse::<f32>().unwrap_or(0.0)
+}
+
 fn parse_hex_color(hex: &str) -> Option<Value> {
     let byte = |s: &str| u8::from_str_radix(s, 16).ok();
     let color = match hex.len() {
+        // #rrggbbaa carries alpha, which shadows and overlays rely on.
+        8 => Color {
+            r: byte(&hex[0..2])?,
+            g: byte(&hex[2..4])?,
+            b: byte(&hex[4..6])?,
+            a: byte(&hex[6..8])?,
+        },
         6 => Color { r: byte(&hex[0..2])?, g: byte(&hex[2..4])?, b: byte(&hex[4..6])?, a: 255 },
         3 => {
             let dup = |c: &str| byte(&format!("{c}{c}"));
