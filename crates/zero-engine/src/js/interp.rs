@@ -5,6 +5,7 @@
 //! stack, so functions see globals and their own locals but do NOT capture their
 //! defining environment: real closures need an environment chain.
 
+use super::dom::{DomView, Mutation};
 use super::parser::{Expr, Stmt};
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -21,6 +22,8 @@ pub enum Value {
     Native(&'static str),
     /// A namespace object like `console`; property -> value.
     Object(Rc<HashMap<String, Value>>),
+    /// A handle into the document snapshot (see [`super::dom`]).
+    Element(usize),
 }
 
 pub struct FuncData {
@@ -44,6 +47,7 @@ impl Value {
             Value::Undefined => "undefined".into(),
             Value::Func(_) | Value::Native(_) => "function".into(),
             Value::Object(_) => "[object]".into(),
+            Value::Element(_) => "[object HTMLElement]".into(),
         }
     }
 
@@ -80,15 +84,22 @@ pub struct Output {
     /// HTML emitted by `document.write`, appended to the document before layout.
     pub writes: String,
     pub errors: Vec<String>,
+    /// DOM writes recorded by scripts, applied by the engine after the run.
+    pub mutations: Vec<Mutation>,
 }
 
 pub struct Interp {
     scopes: Vec<HashMap<String, Value>>,
+    dom: DomView,
     pub out: Output,
 }
 
 impl Interp {
     pub fn new() -> Interp {
+        Interp::with_dom(DomView::default())
+    }
+
+    pub fn with_dom(dom: DomView) -> Interp {
         let mut globals = HashMap::new();
         globals.insert(
             "console".to_string(),
@@ -102,9 +113,12 @@ impl Interp {
             Value::Object(Rc::new(HashMap::from([(
                 "write".to_string(),
                 Value::Native("document.write"),
+            ), (
+                "getElementById".to_string(),
+                Value::Native("document.getElementById"),
             )]))),
         );
-        Interp { scopes: vec![globals], out: Output::default() }
+        Interp { scopes: vec![globals], dom, out: Output::default() }
     }
 
     pub fn run(&mut self, program: &[Stmt]) {
@@ -281,6 +295,20 @@ impl Interp {
                         self.assign(name, v.clone());
                         Ok(v)
                     }
+                    Expr::Member { object, property } => {
+                        if let Value::Element(i) = self.eval(object)? {
+                            match property.as_str() {
+                                "textContent" | "innerText" => {
+                                    self.out.mutations.push(Mutation::SetText(i, v.to_display()))
+                                }
+                                "innerHTML" => {
+                                    self.out.mutations.push(Mutation::SetHtml(i, v.to_display()))
+                                }
+                                _ => {} // other properties aren't modelled yet
+                            }
+                        }
+                        Ok(v)
+                    }
                     _ => Err("invalid assignment target".into()),
                 }
             }
@@ -289,6 +317,7 @@ impl Interp {
                 Ok(match obj {
                     Value::Object(map) => map.get(property).cloned().unwrap_or(Value::Undefined),
                     Value::Str(s) if property == "length" => Value::Num(s.chars().count() as f64),
+                    Value::Element(i) => self.element_property(i, property),
                     _ => Value::Undefined,
                 })
             }
@@ -303,6 +332,19 @@ impl Interp {
         }
     }
 
+    fn element_property(&self, index: usize, property: &str) -> Value {
+        let element = match self.dom.elements.get(index) {
+            Some(e) => e,
+            None => return Value::Undefined,
+        };
+        match property {
+            "textContent" | "innerText" | "innerHTML" => Value::Str(element.text.clone()),
+            "id" => Value::Str(element.id.clone()),
+            "tagName" => Value::Str(element.tag.to_ascii_uppercase()),
+            _ => Value::Undefined,
+        }
+    }
+
     fn call(&mut self, callee: Value, args: Vec<Value>) -> Result<Value, String> {
         match callee {
             Value::Native(name) => {
@@ -311,6 +353,12 @@ impl Interp {
                 match name {
                     "console.log" => self.out.console.push(text),
                     "document.write" => self.out.writes.push_str(&text),
+                    "document.getElementById" => {
+                        return Ok(match self.dom.find_by_id(&text) {
+                            Some(i) => Value::Element(i),
+                            None => Value::Null,
+                        })
+                    }
                     _ => return Err(format!("unknown builtin {name}")),
                 }
                 Ok(Value::Undefined)
