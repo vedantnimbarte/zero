@@ -60,8 +60,26 @@ pub struct Document {
 }
 
 impl Document {
+    /// Parse `html` and run its scripts, giving them network access via `loader`.
+    pub fn load_with(
+        html_source: &str,
+        css_source: &str,
+        loader: std::rc::Rc<dyn ResourceLoader>,
+    ) -> Document {
+        let mut doc = Document::prepare(html_source, css_source);
+        doc.interp.set_loader(loader);
+        doc.run_initial_scripts();
+        doc
+    }
+
     /// Parse `html`, then run its `<script>` content once.
     pub fn load(html_source: &str, css_source: &str) -> Document {
+        let mut doc = Document::prepare(html_source, css_source);
+        doc.run_initial_scripts();
+        doc
+    }
+
+    fn prepare(html_source: &str, css_source: &str) -> Document {
         let mut doc = Document {
             root: html::parse(html_source.to_string()),
             css: css_source.to_string(),
@@ -71,23 +89,38 @@ impl Document {
         };
         doc.assign_node_ids();
         doc.interp.set_dom(build_dom_view(&doc.root));
+        doc
+    }
 
+    fn run_initial_scripts(&mut self) {
         let mut source = String::new();
-        collect_script_text(&doc.root, &mut source);
+        collect_script_text(&self.root, &mut source);
         if !source.trim().is_empty() {
             match js::lexer::tokenize(&source).and_then(js::parser::parse) {
-                Ok(program) => doc.interp.run(&program),
-                Err(e) => doc.interp.out.errors.push(format!("SyntaxError: {e}")),
+                Ok(program) => self.interp.run(&program),
+                Err(e) => self.interp.out.errors.push(format!("SyntaxError: {e}")),
             }
         }
-        doc.absorb_script_output();
-        doc
+        self.absorb_script_output();
+        // Zero-delay timers are a common "run after load" idiom, so drain once.
+        self.run_timers();
     }
 
     /// Fire an element's click handler, applying whatever it changed.
     /// Returns true if a handler ran (so the embedder knows to repaint).
     pub fn click(&mut self, node_id: usize) -> bool {
         if !self.interp.dispatch_click(node_id) {
+            return false;
+        }
+        self.absorb_script_output();
+        self.run_timers();
+        true
+    }
+
+    /// Run any callbacks queued with `setTimeout`, applying what they changed.
+    /// Returns true if anything ran, so the embedder knows to repaint.
+    pub fn run_timers(&mut self) -> bool {
+        if !self.interp.run_timers() {
             return false;
         }
         self.absorb_script_output();
