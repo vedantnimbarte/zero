@@ -107,12 +107,17 @@ pub enum Stmt {
 /// Binding power for binary operators; higher binds tighter.
 fn precedence(op: &str) -> Option<u8> {
     Some(match op {
-        "||" => 1,
+        "||" | "??" => 1,
         "&&" => 2,
-        "==" | "!=" | "===" | "!==" => 3,
-        "<" | ">" | "<=" | ">=" => 4,
-        "+" | "-" => 5,
-        "*" | "/" | "%" => 6,
+        "|" => 3,
+        "^" => 4,
+        "&" => 5,
+        "==" | "!=" | "===" | "!==" => 6,
+        "<" | ">" | "<=" | ">=" => 7,
+        "<<" | ">>" | ">>>" => 8,
+        "+" | "-" => 9,
+        "*" | "/" | "%" => 10,
+        "**" => 11,
         _ => return None,
     })
 }
@@ -426,7 +431,7 @@ impl Parser {
     }
 
     fn parse_unary(&mut self) -> Result<Expr, String> {
-        for op in ["!", "-", "+"] {
+        for op in ["!", "-", "+", "~"] {
             if matches!(self.peek(), Tok::Op(o) if o == op) {
                 self.pos += 1;
                 let expr = self.parse_unary()?;

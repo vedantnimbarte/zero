@@ -581,6 +581,7 @@ impl Interp {
                 Ok(match op.as_str() {
                     "!" => Value::Bool(!v.truthy()),
                     "-" => Value::Num(-v.as_number()),
+                    "~" => Value::Num(!to_i32(&v) as f64),
                     _ => Value::Num(v.as_number()),
                 })
             }
@@ -593,6 +594,15 @@ impl Interp {
                 if op == "||" {
                     let l = self.eval(left)?;
                     return if l.truthy() { Ok(l) } else { self.eval(right) };
+                }
+                // `??` differs from `||`: it only falls through for null and
+                // undefined, so an empty string or 0 on the left still wins.
+                if op == "??" {
+                    let l = self.eval(left)?;
+                    return match l {
+                        Value::Undefined | Value::Null => self.eval(right),
+                        value => Ok(value),
+                    };
                 }
                 let l = self.eval(left)?;
                 let r = self.eval(right)?;
@@ -992,8 +1002,30 @@ fn binary_op(op: &str, l: &Value, r: &Value) -> Value {
         ">=" => Value::Bool(l.as_number() >= r.as_number()),
         "==" | "===" => Value::Bool(loose_eq(l, r)),
         "!=" | "!==" => Value::Bool(!loose_eq(l, r)),
+        "**" => Value::Num(l.as_number().powf(r.as_number())),
+        // Bitwise work on 32-bit integers in JS, and shifts count modulo 32.
+        "&" => Value::Num((to_i32(l) & to_i32(r)) as f64),
+        "|" => Value::Num((to_i32(l) | to_i32(r)) as f64),
+        "^" => Value::Num((to_i32(l) ^ to_i32(r)) as f64),
+        "<<" => Value::Num((to_i32(l) << (to_u32(r) & 31)) as f64),
+        ">>" => Value::Num((to_i32(l) >> (to_u32(r) & 31)) as f64),
+        ">>>" => Value::Num(((to_i32(l) as u32) >> (to_u32(r) & 31)) as f64),
         _ => Value::Undefined,
     }
+}
+
+/// JS converts to a signed 32-bit integer for bitwise work, wrapping rather
+/// than saturating — NaN and infinities become zero.
+fn to_i32(value: &Value) -> i32 {
+    let n = value.as_number();
+    if !n.is_finite() {
+        return 0;
+    }
+    (n.trunc() as i64 & 0xffff_ffff) as u32 as i32
+}
+
+fn to_u32(value: &Value) -> u32 {
+    to_i32(value) as u32
 }
 
 fn loose_eq(l: &Value, r: &Value) -> bool {

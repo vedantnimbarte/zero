@@ -200,6 +200,25 @@ mod tests {
     }
 
     #[test]
+    fn bitwise_shift_and_nullish_operators() {
+        // One unsupported character used to fail the whole script, so these
+        // being missing cost a page all of its JavaScript.
+        let out = run("console.log(5 & 3, 5 | 3, 5 ^ 3, ~5);");
+        assert_eq!(out.console, ["1 7 6 -6"]);
+
+        let out = run("console.log(1 << 5, -16 >> 2, -16 >>> 28, 2 ** 10);");
+        assert_eq!(out.console, ["32 -4 15 1024"]);
+
+        // `??` falls through only for null and undefined, unlike `||`.
+        let out = run("console.log(0 ?? 9, '' ?? 9, null ?? 9, undefined ?? 9);");
+        assert_eq!(out.console, ["0  9 9"]);
+
+        // Precedence: & binds tighter than |, and shifts tighter than compares.
+        let out = run("console.log(1 | 2 & 0, 1 << 2 > 3);");
+        assert_eq!(out.console, ["1 true"]);
+    }
+
+    #[test]
     fn reads_and_mutates_the_dom() {
         let dom = DomView {
             elements: vec![ElementInfo {
