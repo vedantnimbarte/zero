@@ -226,6 +226,29 @@ impl Interp {
                 ("getElementsByTagName", "document.getElementsByTagName"),
             ]),
         );
+        // `window` is the global object in a browser, and scripts reach for it
+        // constantly — feature-detecting on it, or just calling
+        // window.addEventListener. Without it they fail at the first mention.
+        //
+        // ponytail: the objects it holds are the same ones defined above; it is
+        // not a live alias, so `window.foo = 1` does not create a global `foo`.
+        let window = Value::Object(Rc::new(RefCell::new(HashMap::from([
+            ("document".to_string(), Env::get(&env, "document").unwrap_or(Value::Undefined)),
+            ("console".to_string(), Env::get(&env, "console").unwrap_or(Value::Undefined)),
+            (
+                "localStorage".to_string(),
+                Env::get(&env, "localStorage").unwrap_or(Value::Undefined),
+            ),
+            ("setTimeout".to_string(), Value::Native("setTimeout")),
+            ("fetch".to_string(), Value::Native("fetch")),
+            // Listening is accepted and does nothing: the events these ask for
+            // (load, resize, scroll) are not dispatched, and pretending to
+            // register is better than failing the script outright.
+            ("addEventListener".to_string(), Value::Native("window.addEventListener")),
+            ("removeEventListener".to_string(), Value::Native("window.addEventListener")),
+        ]))));
+        Env::define(&env, "window".into(), window);
+
         Interp {
             env,
             depth: 0,
@@ -353,12 +376,14 @@ impl Interp {
 
     fn exec(&mut self, stmt: &Stmt) -> Result<Flow, String> {
         match stmt {
-            Stmt::VarDecl { name, init } => {
-                let v = match init {
-                    Some(e) => self.eval(e)?,
-                    None => Value::Undefined,
-                };
-                Env::define(&self.env, name.clone(), v);
+            Stmt::VarDecl { names } => {
+                for (name, init) in names {
+                    let value = match init {
+                        Some(e) => self.eval(e)?,
+                        None => Value::Undefined,
+                    };
+                    Env::define(&self.env, name.clone(), value);
+                }
                 Ok(Flow::Normal)
             }
             Stmt::ExprStmt(e) => {
@@ -576,6 +601,16 @@ impl Interp {
                 }
                 Ok(Value::Object(Rc::new(RefCell::new(map))))
             }
+            Expr::Unary { op, expr } if op == "typeof" => {
+                // `typeof` is how scripts ask whether something exists at all,
+                // so an unknown name answers "undefined" instead of failing.
+                let value = match self.eval(expr) {
+                    Ok(value) => value,
+                    Err(_) if matches!(**expr, Expr::Ident(_)) => Value::Undefined,
+                    Err(e) => return Err(e),
+                };
+                Ok(Value::Str(type_name(&value).to_string()))
+            }
             Expr::Unary { op, expr } => {
                 let v = self.eval(expr)?;
                 Ok(match op.as_str() {
@@ -584,6 +619,13 @@ impl Interp {
                     "~" => Value::Num(!to_i32(&v) as f64),
                     _ => Value::Num(v.as_number()),
                 })
+            }
+            Expr::Sequence(parts) => {
+                let mut last = Value::Undefined;
+                for part in parts {
+                    last = self.eval(part)?;
+                }
+                Ok(last)
             }
             Expr::Binary { op, left, right } => {
                 // Short-circuit before evaluating the right side.
@@ -865,6 +907,8 @@ impl Interp {
                 match name {
                     "console.log" => self.out.console.push(text),
                     "document.write" => self.out.writes.push_str(&text),
+                    // Accepted and ignored: load/resize/scroll are never fired.
+                    "window.addEventListener" => {}
                     "setTimeout" => {
                         // No real clock: callbacks queue and the embedder drains them.
                         let delay = args.get(1).map(Value::as_number).unwrap_or(0.0);
@@ -1026,6 +1070,18 @@ fn to_i32(value: &Value) -> i32 {
 
 fn to_u32(value: &Value) -> u32 {
     to_i32(value) as u32
+}
+
+/// What `typeof` reports. Arrays and elements are objects, as in a browser.
+fn type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Num(_) => "number",
+        Value::Str(_) => "string",
+        Value::Bool(_) => "boolean",
+        Value::Undefined => "undefined",
+        Value::Func(_) | Value::Native(_) => "function",
+        Value::Null | Value::Object(_) | Value::Array(_) | Value::Element(_) => "object",
+    }
 }
 
 fn loose_eq(l: &Value, r: &Value) -> bool {
