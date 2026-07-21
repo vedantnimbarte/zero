@@ -19,6 +19,9 @@ type EnvRef = Rc<RefCell<Env>>;
 /// Marks an error as a JS `throw` (catchable) rather than an engine failure.
 const THROW_TAG: &str = "\u{1}throw\u{1}";
 
+/// Hidden slot holding a class's parent method table, for `super`.
+const SUPER_KEY: &str = "\u{1}super";
+
 /// One lexical scope, linked to the scope enclosing it.
 pub struct Env {
     vars: HashMap<String, Value>,
@@ -406,18 +409,35 @@ impl Interp {
                 }
                 outcome
             }
-            Stmt::ClassDecl { name, methods } => {
-                // A class is modelled as an object of methods; `new` copies it and
-                // binds `this`. No prototype chain or inheritance.
+            Stmt::ClassDecl { name, parent, methods } => {
+                // A class is an object of methods. `extends` copies the parent's
+                // methods in first, so subclass definitions override them — a
+                // flattened prototype chain rather than a linked one.
                 let mut map = HashMap::new();
+                let mut parent_table = None;
+                if let Some(parent_name) = parent {
+                    match Env::get(&self.env, parent_name) {
+                        Some(Value::Object(base)) => {
+                            map.extend(base.borrow().iter().map(|(k, v)| (k.clone(), v.clone())));
+                            parent_table = Some(Value::Object(base.clone()));
+                        }
+                        _ => return Err(format!("{parent_name} is not a class")),
+                    }
+                }
+                // Methods capture a scope where `super` is *this* class's parent.
+                // Resolving it from the instance instead would make an inherited
+                // constructor call itself, since the instance's parent is the
+                // subclass's parent, not the defining class's.
+                let saved = self.env.clone();
+                self.env = Env::child(&saved);
+                if let Some(parent) = parent_table {
+                    Env::define(&self.env, SUPER_KEY.into(), parent);
+                }
                 for (method, params, body) in methods {
                     map.insert(method.clone(), self.make_function(params.clone(), body.clone()));
                 }
-                Env::define(
-                    &self.env,
-                    name.clone(),
-                    Value::Object(Rc::new(RefCell::new(map))),
-                );
+                self.env = saved;
+                Env::define(&self.env, name.clone(), Value::Object(Rc::new(RefCell::new(map))));
                 Ok(Flow::Normal)
             }
         }
@@ -444,6 +464,15 @@ impl Interp {
             }
             Expr::Func { params, body } => Ok(self.make_function(params.clone(), body.clone())),
             Expr::This => Ok(Env::get(&self.env, "this").unwrap_or(Value::Undefined)),
+            Expr::Super => Ok(Env::get(&self.env, SUPER_KEY).unwrap_or(Value::Undefined)),
+            Expr::Ternary { cond, then, otherwise } => {
+                // Only the taken branch is evaluated.
+                if self.eval(cond)?.truthy() {
+                    self.eval(then)
+                } else {
+                    self.eval(otherwise)
+                }
+            }
             Expr::New { callee, args } => {
                 let class = self.eval(callee)?;
                 let mut values = Vec::with_capacity(args.len());
@@ -519,9 +548,30 @@ impl Interp {
                 for a in args {
                     values.push(self.eval(a)?);
                 }
+                // `super(...)` calls the parent constructor on the current `this`.
+                if matches!(**callee, Expr::Super) {
+                    let parent = Env::get(&self.env, SUPER_KEY).unwrap_or(Value::Undefined);
+                    let this = Env::get(&self.env, "this").unwrap_or(Value::Undefined);
+                    let ctor = self.get_property(&parent, "constructor");
+                    if let Value::Func(ref data) = ctor {
+                        let bound = Interp::bind_this(data, this);
+                        return self.call(bound, values);
+                    }
+                    return Ok(Value::Undefined);
+                }
                 // Method calls need the receiver, so handle `obj.m()` specially.
                 if let Expr::Member { object, property } = &**callee {
                     let receiver = self.eval(object)?;
+                    // `super.m()` runs the parent's method against the current `this`.
+                    if matches!(**object, Expr::Super) {
+                        let this = Env::get(&self.env, "this").unwrap_or(Value::Undefined);
+                        let method = self.get_property(&receiver, property);
+                        if let Value::Func(ref data) = method {
+                            let bound = Interp::bind_this(data, this);
+                            return self.call(bound, values);
+                        }
+                        return Ok(Value::Undefined);
+                    }
                     if let Some(result) = self.call_method(&receiver, property, &values)? {
                         return Ok(result);
                     }
