@@ -18,6 +18,7 @@ mod app;
 mod blocker;
 mod cookies;
 mod fonts;
+mod localstore;
 mod net;
 mod storage;
 

@@ -75,6 +75,17 @@ fn escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
+/// The storage partition for a target: its site for URLs, the file name for local
+/// pages, so two local examples don't share one bucket.
+fn storage_site(address: &str) -> String {
+    let site = crate::cookies::site_of(address);
+    if site.is_empty() {
+        tab_title(address)
+    } else {
+        site
+    }
+}
+
 /// A short label for a tab: the host for URLs, the file name for paths.
 fn tab_title(address: &str) -> String {
     if address.is_empty() {
@@ -113,10 +124,16 @@ struct Tab {
 
 impl Tab {
     fn new(address: String, html: String, css: String) -> Tab {
+        let doc = zero_engine::Document::load_hosted(
+            &html,
+            &css,
+            Some(Rc::new(ShellLoader::new(address.clone()))),
+            Some(Rc::new(crate::localstore::SiteStore::for_site(&storage_site(&address)))),
+        );
         Tab {
             history: vec![address.clone()],
             address,
-            doc: zero_engine::Document::load_with(&html, &css, Rc::new(ShellLoader::new(String::new()))),
+            doc,
             element_rects: Vec::new(),
             history_index: 0,
             scroll_y: 0.0,
@@ -510,7 +527,10 @@ impl App {
         // A new page means a new document and a fresh JS runtime. The loader goes
         // in so page scripts can fetch relative to this URL.
         let loader = Rc::new(ShellLoader::new(tab.address.clone()));
-        tab.doc = zero_engine::Document::load_with(&fetched.body, "", loader);
+        // localStorage is partitioned by site, like cookies.
+        let store = Rc::new(crate::localstore::SiteStore::for_site(&storage_site(&tab.address)));
+        tab.doc =
+            zero_engine::Document::load_hosted(&fetched.body, "", Some(loader), Some(store));
         tab.scroll_y = 0.0;
         tab.page_canvas = None; // force re-render of the new page
         let title = tab.address.clone();
