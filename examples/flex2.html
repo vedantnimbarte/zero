@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html><head><style>
+body { background: #0e0f12; color: #f2f3f5; padding: 22px; font-size: 14px; }
+h1 { color: #e5484d; font-size: 26px; }
+h2 { color: #9a9da6; font-size: 13px; }
+.bar { display: flex; gap: 10px; background: #17181c; padding: 10px; border-radius: 10px; }
+.between { display: flex; justify-content: space-between; gap: 0px; background: #17181c; padding: 10px; border-radius: 10px; }
+.center { display: flex; justify-content: center; gap: 10px; background: #17181c; padding: 10px; border-radius: 10px; }
+.evenly { display: flex; justify-content: space-evenly; gap: 0px; background: #17181c; padding: 10px; border-radius: 10px; }
+.wrapper { display: flex; flex-wrap: wrap; gap: 10px; background: #17181c; padding: 10px; border-radius: 10px; }
+.tall { display: flex; align-items: center; gap: 10px; background: #17181c; padding: 10px; border-radius: 10px; }
+.box { background: #30a46c; color: #0e0f12; width: 150px; padding: 10px; border-radius: 8px; }
+.big { background: #e5484d; color: #fff; width: 150px; height: 60px; padding: 10px; border-radius: 8px; }
+.wide { background: #66ccff; color: #0e0f12; width: 260px; padding: 12px; border-radius: 8px; }
+</style></head><body>
+<h1>Flex: wrap, justify, align</h1>
+<h2>justify-content: space-between</h2>
+<div class="between"><div class="box">one</div><div class="box">two</div><div class="box">three</div></div>
+<h2>justify-content: center</h2>
+<div class="center"><div class="box">one</div><div class="box">two</div></div>
+<h2>justify-content: space-evenly</h2>
+<div class="evenly"><div class="box">one</div><div class="box">two</div><div class="box">three</div></div>
+<h2>flex-wrap: wrap (four 260px items)</h2>
+<div class="wrapper"><div class="wide">alpha</div><div class="wide">beta</div><div class="wide">gamma</div><div class="wide">delta</div></div>
+<h2>align-items: center (mixed heights)</h2>
+<div class="tall"><div class="big">tall</div><div class="box">short, centred</div></div>
+</body></html>
