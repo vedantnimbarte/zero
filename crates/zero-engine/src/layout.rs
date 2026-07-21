@@ -197,6 +197,7 @@ impl<'a> LayoutBox<'a> {
         match self.get_style_node().display() {
             Display::Flex => self.layout_flex_children(fonts, images),
             Display::Grid => self.layout_grid_children(fonts, images),
+            Display::Table => self.layout_table_children(fonts, images),
             _ => self.layout_block_children(fonts, images),
         }
         self.calculate_block_height(containing_block);
@@ -254,6 +255,130 @@ impl<'a> LayoutBox<'a> {
             .or_else(|| img.map(|i| i.height as f32))
             .unwrap_or(w);
         Some((w, h))
+    }
+
+    /// Table layout: align cells into shared columns.
+    ///
+    /// Column widths come from each column's widest cell, then scale to fill the
+    /// table. Rows take the height of their tallest cell, and every cell is
+    /// stretched to that height so backgrounds line up.
+    ///
+    /// ponytail: no `colspan`/`rowspan`, no `<caption>`/`<colgroup>`, and no
+    /// border-collapse — one level of `thead`/`tbody`/`tfoot` nesting is understood.
+    fn layout_table_children(&mut self, fonts: Option<&FontSet>, images: &ImageMap) {
+        let container = self.dimensions.content;
+        let style = self.get_style_node();
+        let ctx = style.length_context(container.width);
+        let spacing = style.value("border-spacing").map(|v| v.resolve(ctx)).unwrap_or(0.0);
+
+        // Rows may sit directly under the table or inside a section element.
+        let mut rows: Vec<(usize, Option<usize>)> = Vec::new();
+        for (i, child) in self.children.iter().enumerate() {
+            match tag_name_of(child) {
+                Some(tag) if tag == "tr" => rows.push((i, None)),
+                Some(tag) if matches!(tag.as_str(), "tbody" | "thead" | "tfoot") => {
+                    for (j, grandchild) in child.children.iter().enumerate() {
+                        if tag_name_of(grandchild).as_deref() == Some("tr") {
+                            rows.push((i, Some(j)));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if rows.is_empty() {
+            return self.layout_block_children(fonts, images);
+        }
+
+        // Each column is as wide as its widest cell, then scaled to fill the table.
+        let mut widths: Vec<f32> = Vec::new();
+        for &path in &rows {
+            let row = row_at(&self.children, path);
+            for (c, cell) in row.children.iter().enumerate() {
+                let wanted = match cell.box_type {
+                    BoxType::AnonymousBlock => 0.0,
+                    _ => max_content_width(cell.get_style_node(), fonts, images),
+                };
+                if c == widths.len() {
+                    widths.push(wanted);
+                } else {
+                    widths[c] = widths[c].max(wanted);
+                }
+            }
+        }
+        if widths.is_empty() {
+            return self.layout_block_children(fonts, images);
+        }
+        let gaps = spacing * widths.len().saturating_sub(1) as f32;
+        let natural: f32 = widths.iter().sum();
+        let available = (container.width - gaps).max(1.0);
+        if natural > 0.0 {
+            let scale = available / natural;
+            for w in widths.iter_mut() {
+                *w *= scale;
+            }
+        } else {
+            let even = available / widths.len() as f32;
+            widths.iter_mut().for_each(|w| *w = even);
+        }
+
+        // Place cells column by column, then equalise each row's height.
+        let mut cursor_y = container.y;
+        let mut total_height = 0.0_f32;
+        for (index, &path) in rows.iter().enumerate() {
+            let mut row_height = 0.0_f32;
+            {
+                let row = row_at_mut(&mut self.children, path);
+                let mut cursor_x = container.x;
+                for (c, cell) in row.children.iter_mut().enumerate() {
+                    let width = widths.get(c).copied().unwrap_or(0.0);
+                    let mut slot: Dimensions = Default::default();
+                    slot.content = Rect { x: cursor_x, y: cursor_y, width, height: 0.0 };
+                    cell.layout(slot, fonts, images);
+                    row_height = row_height.max(cell.dimensions.margin_box().height);
+                    cursor_x += width + spacing;
+                }
+                // Stretch cells so a row's backgrounds share one baseline.
+                for cell in row.children.iter_mut() {
+                    let outer = cell.dimensions.margin_box().height;
+                    if outer < row_height {
+                        cell.dimensions.content.height += row_height - outer;
+                    }
+                }
+                row.dimensions.content = Rect {
+                    x: container.x,
+                    y: cursor_y,
+                    width: container.width,
+                    height: row_height,
+                };
+            }
+            cursor_y += row_height + spacing;
+            total_height += row_height;
+            if index + 1 < rows.len() {
+                total_height += spacing;
+            }
+        }
+
+        // Sections wrap their rows, so give them the union of what they contain.
+        for (i, child) in self.children.iter_mut().enumerate() {
+            if matches!(tag_name_of(child).as_deref(), Some("tbody" | "thead" | "tfoot")) {
+                let top = child.children.first().map(|r| r.dimensions.content.y);
+                let bottom = child
+                    .children
+                    .last()
+                    .map(|r| r.dimensions.content.y + r.dimensions.content.height);
+                if let (Some(top), Some(bottom)) = (top, bottom) {
+                    child.dimensions.content = Rect {
+                        x: container.x,
+                        y: top,
+                        width: container.width,
+                        height: bottom - top,
+                    };
+                }
+            }
+            let _ = i;
+        }
+        self.dimensions.content.height = total_height;
     }
 
     /// Grid layout: place items into a track grid, honouring explicit placement.
@@ -1172,6 +1297,36 @@ fn measure_text(text: &str, size: f32, fonts: Option<&FontSet>) -> f32 {
     shape_run(&fonts.entries[fonts.pick(&trimmed)], &trimmed, size).1
 }
 
+/// The tag of an element box, if it is one.
+fn tag_name_of(bx: &LayoutBox) -> Option<String> {
+    let style = match bx.box_type {
+        BoxType::BlockNode(s) | BoxType::InlineNode(s) => s,
+        BoxType::AnonymousBlock => return None,
+    };
+    match style.node.node_type {
+        NodeType::Element(ref e) => Some(e.tag_name.clone()),
+        _ => None,
+    }
+}
+
+/// A table row, addressed either directly or through a section element.
+fn row_at<'b, 'a>(children: &'b [LayoutBox<'a>], path: (usize, Option<usize>)) -> &'b LayoutBox<'a> {
+    match path.1 {
+        None => &children[path.0],
+        Some(j) => &children[path.0].children[j],
+    }
+}
+
+fn row_at_mut<'b, 'a>(
+    children: &'b mut [LayoutBox<'a>],
+    path: (usize, Option<usize>),
+) -> &'b mut LayoutBox<'a> {
+    match path.1 {
+        None => &mut children[path.0],
+        Some(j) => &mut children[path.0].children[j],
+    }
+}
+
 /// Gather the painted box of every element, so the embedder can hit-test clicks./// Gather the painted box of every element, so the embedder can hit-test clicks.
 pub fn collect_element_rects(bx: &LayoutBox, out: &mut Vec<ElementRect>) {
     if let BoxType::BlockNode(styled) | BoxType::InlineNode(styled) = bx.box_type {
@@ -1208,7 +1363,9 @@ fn build_layout_tree<'a>(style_node: &'a StyledNode<'a>) -> LayoutBox<'a> {
 fn build_box<'a>(style_node: &'a StyledNode<'a>, force_block: bool) -> LayoutBox<'a> {
     let display = style_node.display();
     let mut root = LayoutBox::new(match display {
-        Display::Block | Display::Flex | Display::Grid => BoxType::BlockNode(style_node),
+        Display::Block | Display::Flex | Display::Grid | Display::Table => {
+            BoxType::BlockNode(style_node)
+        }
         Display::Inline if force_block => BoxType::BlockNode(style_node),
         Display::Inline => BoxType::InlineNode(style_node),
         Display::None => panic!("Root node has display: none."),
@@ -1219,7 +1376,7 @@ fn build_box<'a>(style_node: &'a StyledNode<'a>, force_block: bool) -> LayoutBox
     for child in &style_node.children {
         match child.display() {
             Display::None => {} // skip
-            Display::Block | Display::Flex | Display::Grid => {
+            Display::Block | Display::Flex | Display::Grid | Display::Table => {
                 root.children.push(build_box(child, false))
             }
             Display::Inline if blockifies => root.children.push(build_box(child, true)),
