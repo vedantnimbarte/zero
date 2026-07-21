@@ -91,6 +91,13 @@ impl CookieJar {
         }
     }
 
+    /// How many cookies are stored, across every partition. Only the tests ask,
+    /// but they ask about the thing that matters: what survives a restart.
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.partitions.values().map(Vec::len).sum()
+    }
+
     /// Persist non-session cookies as tab-separated lines.
     pub fn save(&self, dir: &Path) {
         let now = now_secs();
@@ -245,6 +252,7 @@ fn parse_set_cookie(header: &str, url: &str) -> Option<Cookie> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn stores_and_returns_cookies_for_matching_requests() {
