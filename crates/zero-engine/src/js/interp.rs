@@ -209,6 +209,10 @@ impl Interp {
             namespace(&[
                 ("write", "document.write"),
                 ("getElementById", "document.getElementById"),
+                ("querySelector", "document.querySelector"),
+                ("querySelectorAll", "document.querySelectorAll"),
+                ("getElementsByClassName", "document.getElementsByClassName"),
+                ("getElementsByTagName", "document.getElementsByTagName"),
             ]),
         );
         Interp {
@@ -273,6 +277,16 @@ impl Interp {
             self.out.errors.push(e);
         }
         true
+    }
+
+    /// Mirror a write into the snapshot so the *same* script can read it back.
+    ///
+    /// The real DOM is still updated after the run; without this, a script that
+    /// sets a class and then queries for it would find nothing.
+    fn reflect(&mut self, index: usize, update: impl FnOnce(&mut super::dom::ElementInfo)) {
+        if let Some(element) = self.dom.elements.get_mut(index) {
+            update(element);
+        }
     }
 
     fn node_id_of(&self, index: usize) -> Option<usize> {
@@ -629,6 +643,7 @@ impl Interp {
                             if let Some(id) = self.node_id_of(i) {
                                 self.out.field_writes.push((id, v.to_display()));
                             }
+                            self.reflect(i, |e| e.text = v.to_display());
                         }
                         // `onclick`, `oninput`, `onchange`, ... all register the same way.
                         name if name.starts_with("on") => {
@@ -637,14 +652,17 @@ impl Interp {
                             }
                         }
                         "textContent" | "innerText" => {
-                            self.out.mutations.push(Mutation::SetText(i, v.to_display()))
+                            self.out.mutations.push(Mutation::SetText(i, v.to_display()));
+                            self.reflect(i, |e| e.text = v.to_display());
                         }
                         "innerHTML" => {
-                            self.out.mutations.push(Mutation::SetHtml(i, v.to_display()))
+                            self.out.mutations.push(Mutation::SetHtml(i, v.to_display()));
+                            self.reflect(i, |e| e.text = v.to_display());
                         }
                         // Restyling: swapping the class re-runs the cascade for this node.
                         "className" => {
-                            self.out.mutations.push(Mutation::SetClass(i, v.to_display()))
+                            self.out.mutations.push(Mutation::SetClass(i, v.to_display()));
+                            self.reflect(i, |e| e.class = v.to_display());
                         }
                         _ => {} // other properties aren't modelled yet
                     },
@@ -827,6 +845,25 @@ impl Interp {
                             store.clear();
                         }
                         return Ok(Value::Undefined);
+                    }
+                    "document.querySelector" => {
+                        return Ok(match self.dom.query(&text).first() {
+                            Some(i) => Value::Element(*i),
+                            None => Value::Null,
+                        })
+                    }
+                    "document.querySelectorAll"
+                    | "document.getElementsByClassName"
+                    | "document.getElementsByTagName" => {
+                        // The two legacy helpers are just selectors in disguise.
+                        let selector = match name {
+                            "document.getElementsByClassName" => format!(".{text}"),
+                            "document.getElementsByTagName" => text.clone(),
+                            _ => text.clone(),
+                        };
+                        let found: Vec<Value> =
+                            self.dom.query(&selector).into_iter().map(Value::Element).collect();
+                        return Ok(Value::Array(Rc::new(RefCell::new(found))));
                     }
                     "document.getElementById" => {
                         return Ok(match self.dom.find_by_id(&text) {
