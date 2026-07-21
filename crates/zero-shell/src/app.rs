@@ -30,9 +30,16 @@ const SIDEBAR_HEAD_H: u32 = 44; // header row height, so tab hit-testing is exac
 const TAB_ROW_H: u32 = 40; // padding(10*2) + height(20)
 const TOOLBAR_H: u32 = 48;
 const AI_PANEL_W: u32 = 320;
+const SCROLLBAR_W: u32 = 12;
 
-const TOOLBAR_CSS: &str =
-    "body{background:#1f2127;color:#f2f3f5;font-size:16px;} #bar{padding:14px;height:20px;}";
+const TOOLBAR_CSS: &str = "body{background:#1f2127;color:#f2f3f5;font-size:15px;} \
+     #bar{padding:9px;height:30px;} \
+     .btn{display:inline-block;background:#2b2e37;color:#f2f3f5;width:30px;padding:7px;\
+          border-radius:6px;} \
+     .off{display:inline-block;background:#24262d;color:#5f636d;width:30px;padding:7px;\
+          border-radius:6px;} \
+     .addr{display:inline-block;background:#141519;color:#f2f3f5;padding:7px;\
+           border-radius:6px;}";
 
 const AI_CSS: &str = "body{background:#141519;color:#c9ccd3;font-size:14px;}      #head{background:#26282f;color:#f2f3f5;padding:12px;height:20px;}      .line{padding:2px;} .src{color:#6b7280;padding:10px;}";
 
@@ -41,6 +48,27 @@ const NEW_TAB_HTML: &str = "<html><head><style>\
     h1{color:#e5484d;font-size:40px;}\
     </style></head><body><h1>Zero</h1>\
     <p>Type a URL above and press Enter.</p></body></html>";
+
+/// Where the scrollbar thumb sits within the page area, as (offset, height).
+/// `None` when the content fits and no scrollbar is warranted.
+fn scrollbar_thumb(content: f32, viewport: f32, scroll: f32) -> Option<(f32, f32)> {
+    if content <= viewport || viewport <= 0.0 {
+        return None;
+    }
+    // Thumb length reflects the visible fraction, with a floor so it stays grabbable.
+    let thumb = (viewport * viewport / content).clamp(24.0_f32.min(viewport), viewport);
+    let travel = (viewport - thumb).max(0.0);
+    let progress = (scroll / (content - viewport)).clamp(0.0, 1.0);
+    Some((travel * progress, thumb))
+}
+
+/// Scroll offset for a cursor at `y` within the page area, centring the thumb.
+fn scroll_for_cursor(content: f32, viewport: f32, y: f32) -> f32 {
+    let Some((_, thumb)) = scrollbar_thumb(content, viewport, 0.0) else { return 0.0 };
+    let travel = (viewport - thumb).max(1.0);
+    let ratio = ((y - thumb / 2.0) / travel).clamp(0.0, 1.0);
+    ratio * (content - viewport)
+}
 
 fn escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
@@ -115,6 +143,8 @@ pub fn run_window(engine: Engine, html: String, css: String, address: String) {
         cursor: (0.0, 0.0),
         ai_open: false,
         ai_text: String::new(),
+        toolbar_rects: Vec::new(),
+        dragging_scrollbar: false,
         window: None,
         surface: None,
     };
@@ -129,6 +159,9 @@ struct App {
     cursor: (f32, f32),
     ai_open: bool,
     ai_text: String,
+    /// Clickable regions of the toolbar, refreshed every frame.
+    toolbar_rects: Vec<zero_engine::ElementRect>,
+    dragging_scrollbar: bool,
     window: Option<Rc<Window>>,
     surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
 }
@@ -167,6 +200,16 @@ impl ApplicationHandler for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x as f32, position.y as f32);
+                if self.dragging_scrollbar {
+                    let (_, h) = self.window_size();
+                    let page_top = TOOLBAR_H.min(h) as f32;
+                    let page_height = (h as f32 - page_top).max(1.0);
+                    self.scroll_to_cursor(self.cursor.1, page_top, page_height);
+                    self.request_redraw();
+                }
+            }
+            WindowEvent::MouseInput { state: ElementState::Released, .. } => {
+                self.dragging_scrollbar = false;
             }
             WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
             WindowEvent::MouseInput { state: ElementState::Pressed, button, .. } => {
@@ -281,9 +324,20 @@ impl App {
         }
     }
 
-    /// Route a click: sidebar switches tabs, page follows links, toolbar is inert.
+    fn window_size(&self) -> (u32, u32) {
+        match &self.window {
+            Some(window) => {
+                let s = window.inner_size();
+                (s.width.max(1), s.height.max(1))
+            }
+            None => (1, 1),
+        }
+    }
+
+    /// Route a click: sidebar switches tabs, toolbar buttons act, page follows links.
     fn handle_click(&mut self) {
         let (cx, cy) = self.cursor;
+        let (w, h) = self.window_size();
 
         if cx < SIDEBAR_W as f32 {
             if cy >= SIDEBAR_HEAD_H as f32 {
@@ -295,7 +349,21 @@ impl App {
             return;
         }
         if cy < TOOLBAR_H as f32 {
-            return; // toolbar clicks don't navigate
+            if self.handle_toolbar_click(cx, cy) {
+                self.request_redraw();
+            }
+            return;
+        }
+
+        // The scrollbar sits at the right edge of the page area.
+        let ai_width = if self.ai_open { AI_PANEL_W.min(w.saturating_sub(SIDEBAR_W)) } else { 0 };
+        let page_right = w.saturating_sub(ai_width) as f32;
+        if cx >= page_right - SCROLLBAR_W as f32 && cx < page_right {
+            let page_top = TOOLBAR_H.min(h) as f32;
+            self.dragging_scrollbar = true;
+            self.scroll_to_cursor(cy, page_top, (h as f32 - page_top).max(1.0));
+            self.request_redraw();
+            return;
         }
         if self.ai_open {
             let panel_x0 = self.window.as_ref().map(|w| w.inner_size().width).unwrap_or(0)
@@ -450,16 +518,58 @@ impl App {
 
     fn toolbar_html(&self) -> String {
         let tab = self.tab();
-        let lock = if tab.secure { "" } else { "Not secure  .  " };
+        let lock = if tab.secure { "" } else { "Not secure - " };
         let shield = if tab.blocked_count > 0 {
-            format!("     .     {} trackers blocked", tab.blocked_count)
+            format!("  -  {} blocked", tab.blocked_count)
         } else {
             String::new()
         };
+        // Disabled buttons get a dim class, so the chrome reflects real state.
+        let back = if tab.history_index > 0 { "btn" } else { "off" };
+        let fwd = if tab.history_index + 1 < tab.history.len() { "btn" } else { "off" };
         format!(
-            "<html><body><div id=\"bar\">{lock}{}|{shield}</div></body></html>",
+            "<html><body><div id=\"bar\">\
+             <span id=\"back\" class=\"{back}\">&lt;</span>\
+             <span id=\"fwd\" class=\"{fwd}\">&gt;</span>\
+             <span id=\"reload\" class=\"btn\">R</span>\
+             <span id=\"addr\" class=\"addr\">{lock}{}|{shield}</span>\
+             </div></body></html>",
             escape(&tab.address)
         )
+    }
+
+    /// Act on a toolbar button, if the cursor is over one.
+    fn handle_toolbar_click(&mut self, x: f32, y: f32) -> bool {
+        let local_x = x - SIDEBAR_W as f32;
+        let hit = self
+            .toolbar_rects
+            .iter()
+            .filter(|r| {
+                !r.id.is_empty()
+                    && local_x >= r.x
+                    && local_x <= r.x + r.width
+                    && y >= r.y
+                    && y <= r.y + r.height
+            })
+            .map(|r| r.id.clone())
+            .next_back();
+        match hit.as_deref() {
+            Some("back") => self.back(),
+            Some("fwd") => self.forward(),
+            Some("reload") => {
+                let target = self.tab().address.clone();
+                self.load(target);
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Scroll from a click or drag on the scrollbar track.
+    fn scroll_to_cursor(&mut self, y: f32, page_top: f32, page_height: f32) {
+        let tab = self.tab_mut();
+        let content = tab.page_canvas.as_ref().map_or(0, |c| c.height) as f32;
+        tab.scroll_y = scroll_for_cursor(content, page_height, y - page_top);
     }
 
     fn sidebar_html(&self) -> String {
@@ -533,8 +643,15 @@ impl App {
         // Chrome is cheap; render fresh each frame so typing/tab changes show.
         let sidebar =
             self.engine.render(&self.sidebar_html(), &Self::sidebar_css(h), sw as f32, h as f32);
-        let toolbar =
-            self.engine.render(&self.toolbar_html(), TOOLBAR_CSS, content_w as f32, tb as f32);
+        let toolbar_page = self.engine.render_page(
+            &self.toolbar_html(),
+            TOOLBAR_CSS,
+            content_w as f32,
+            tb as f32,
+            &crate::net::ShellLoader::new(String::new()),
+        );
+        self.toolbar_rects = toolbar_page.element_rects;
+        let toolbar = toolbar_page.canvas;
         let ai_panel = if aw > 0 {
             Some(self.engine.render(&self.ai_html(), AI_CSS, aw as f32, h as f32))
         } else {
@@ -570,6 +687,65 @@ impl App {
                 buffer[y * w + x] = (px.r as u32) << 16 | (px.g as u32) << 8 | px.b as u32;
             }
         }
+
+        // Scrollbar: a track down the right edge of the page, with a thumb sized
+        // to the visible fraction. Only shown when the page actually overflows.
+        let content_h = page.height as f32;
+        let viewport_h = (h as usize - tb) as f32;
+        if let Some((offset, thumb_h)) = scrollbar_thumb(content_h, viewport_h, scroll as f32) {
+            let bar_w = SCROLLBAR_W as usize;
+            let x0 = (w - aw).saturating_sub(bar_w);
+            let thumb = thumb_h as usize;
+            let thumb_top = tb + offset as usize;
+            for y in tb..h as usize {
+                for x in x0..(x0 + bar_w).min(w) {
+                    let on_thumb = y >= thumb_top && y < thumb_top + thumb;
+                    let shade: u32 = if on_thumb { 0x5f636d } else { 0x1a1c21 };
+                    buffer[y * w + x] = shade;
+                }
+            }
+        }
         buffer.present().expect("buffer present");
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_scrollbar_when_content_fits() {
+        assert!(scrollbar_thumb(500.0, 600.0, 0.0).is_none());
+        assert!(scrollbar_thumb(600.0, 600.0, 0.0).is_none());
+    }
+
+    #[test]
+    fn thumb_shrinks_with_content_and_tracks_scroll() {
+        // Twice the viewport of content -> half-height thumb.
+        let (top, height) = scrollbar_thumb(1200.0, 600.0, 0.0).unwrap();
+        assert_eq!(height, 300.0);
+        assert_eq!(top, 0.0);
+
+        // Fully scrolled puts the thumb at the bottom of its travel.
+        let (top, height) = scrollbar_thumb(1200.0, 600.0, 600.0).unwrap();
+        assert_eq!(top + height, 600.0);
+
+        // Halfway down sits halfway along the travel.
+        let (top, _) = scrollbar_thumb(1200.0, 600.0, 300.0).unwrap();
+        assert_eq!(top, 150.0);
+    }
+
+    #[test]
+    fn dragging_maps_cursor_back_to_scroll_offset() {
+        let (content, viewport) = (1200.0, 600.0);
+        // Cursor at the track top clamps to the start.
+        assert_eq!(scroll_for_cursor(content, viewport, 0.0), 0.0);
+        // Cursor at the bottom clamps to full overflow.
+        assert_eq!(scroll_for_cursor(content, viewport, viewport), 600.0);
+        // Round-trip: drag to a position, and the thumb lands back under the cursor.
+        let scroll = scroll_for_cursor(content, viewport, 300.0);
+        let (top, thumb) = scrollbar_thumb(content, viewport, scroll).unwrap();
+        assert!((top + thumb / 2.0 - 300.0).abs() < 1.0, "thumb centre should follow cursor");
     }
 }
