@@ -1146,6 +1146,31 @@ mod tests {
         assert_eq!(rgb(at(5, 15)), WHITE);
     }
 
+    #[test]
+    fn opacity_fades_and_z_index_reorders() {
+        let engine = super::Engine::shapes_only();
+        let canvas = engine.render(
+            "<body><div id=\"under\"></div><div id=\"over\"></div>\
+             <div id=\"faded\"></div></body>",
+            // `under` is declared first but claims the higher layer, so it wins
+            // the overlap; both sit at the same place.
+            "#under { position: absolute; top: 0; left: 0; width: 20px; height: 20px;
+                      background: #0000ff; z-index: 2; }
+             #over { position: absolute; top: 0; left: 0; width: 20px; height: 20px;
+                     background: #00ff00; z-index: 1; }
+             #faded { width: 20px; height: 20px; background: #000000; opacity: 0.5;
+                      margin-top: 30px; }",
+            40.0,
+            60.0,
+        );
+        let at = |x: usize, y: usize| canvas.pixels[y * canvas.width + x];
+        assert_eq!((at(5, 5).r, at(5, 5).g, at(5, 5).b), (0, 0, 255));
+        // Half-opaque black over white is mid grey, give or take rounding.
+        let grey = at(5, 35);
+        assert!((120..=136).contains(&grey.r), "expected mid grey, got {}", grey.r);
+        assert_eq!(grey.r, grey.b);
+    }
+
     /// A search box: type into a field nested inside the form, press Enter.
     #[test]
     fn submitting_a_field_builds_a_get_query() {

@@ -415,7 +415,7 @@ fn highlight_rects(list: &DisplayList, query: &str) -> Vec<Rect> {
 
 fn build_display_list(layout_root: &LayoutBox) -> DisplayList {
     let mut list = Vec::new();
-    render_layout_box(&mut list, layout_root, UNCLIPPED);
+    render_layout_box(&mut list, layout_root, UNCLIPPED, 1.0);
     list
 }
 
@@ -505,17 +505,90 @@ fn is_invisible(layout_box: &LayoutBox) -> bool {
     matches!(style.value("visibility"), Some(Value::Keyword(ref k)) if k == "hidden" || k == "collapse")
 }
 
-fn render_layout_box(list: &mut DisplayList, layout_box: &LayoutBox, clip: Rect) {
-    if !is_invisible(layout_box) {
+/// `opacity`, as a factor to scale everything this box paints by.
+///
+/// ponytail: applied per command, not to a composited layer, so overlapping
+/// children of a half-transparent box show through each other. Real group
+/// opacity needs an offscreen buffer.
+fn opacity_of(layout_box: &LayoutBox) -> f32 {
+    let style = match layout_box.box_type {
+        BoxType::BlockNode(s) | BoxType::InlineNode(s) => s,
+        BoxType::AnonymousBlock => return 1.0,
+    };
+    match style.value("opacity") {
+        Some(Value::Number(n)) => n.clamp(0.0, 1.0),
+        _ => 1.0,
+    }
+}
+
+/// Scale a command's alpha. Images have no per-command colour, so a translucent
+/// `<img>` still paints solid.
+fn fade(item: DisplayCommand, alpha: f32) -> DisplayCommand {
+    let dim = |c: Color| Color {
+        a: (c.a as f32 * alpha) as u8,
+        ..c
+    };
+    match item {
+        DisplayCommand::SolidColor(c, rect) => DisplayCommand::SolidColor(dim(c), rect),
+        DisplayCommand::RoundedColor(c, rect, radius) => {
+            DisplayCommand::RoundedColor(dim(c), rect, radius)
+        }
+        DisplayCommand::Gradient { rect, radius, stops, horizontal } => DisplayCommand::Gradient {
+            rect,
+            radius,
+            stops: stops.into_iter().map(dim).collect(),
+            horizontal,
+        },
+        DisplayCommand::Shadow { rect, radius, blur, color } => DisplayCommand::Shadow {
+            rect,
+            radius,
+            blur,
+            color: dim(color),
+        },
+        DisplayCommand::Text(frag) => DisplayCommand::Text(TextFragment {
+            color: dim(frag.color),
+            ..frag
+        }),
+        other => other,
+    }
+}
+
+/// `z-index`, which decides paint order among siblings. Everything else keeps
+/// document order, so 0 is both the default and what an unpositioned box gets.
+fn z_index_of(layout_box: &LayoutBox) -> i32 {
+    let style = match layout_box.box_type {
+        BoxType::BlockNode(s) | BoxType::InlineNode(s) => s,
+        BoxType::AnonymousBlock => return 0,
+    };
+    match style.value("z-index") {
+        Some(Value::Number(n)) => n as i32,
+        _ => 0,
+    }
+}
+
+fn render_layout_box(list: &mut DisplayList, layout_box: &LayoutBox, clip: Rect, alpha: f32) {
+    let alpha = alpha * opacity_of(layout_box);
+    if !is_invisible(layout_box) && alpha > 0.0 {
         let mut own = Vec::new();
         render_own(&mut own, layout_box);
-        list.extend(own.into_iter().filter_map(|item| clip_command(item, clip)));
+        list.extend(
+            own.into_iter()
+                .filter_map(|item| clip_command(item, clip))
+                .map(|item| fade(item, alpha)),
+        );
     }
     // An empty clip still has to be handed down: a child of a hidden box is
     // hidden too, however visible it declares itself.
     let inner = child_clip(layout_box, clip).unwrap_or(Rect::default());
-    for child in &layout_box.children {
-        render_layout_box(list, child, inner);
+    // A higher `z-index` paints later, and equal ones keep document order.
+    //
+    // ponytail: one flat order rather than real stacking contexts, so a child's
+    // z-index competes with its uncles. Nested contexts need the display list to
+    // become a tree.
+    let mut order: Vec<&LayoutBox> = layout_box.children.iter().collect();
+    order.sort_by_key(|child| z_index_of(child));
+    for child in order {
+        render_layout_box(list, child, inner, alpha);
     }
 }
 
