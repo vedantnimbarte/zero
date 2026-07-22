@@ -3,9 +3,16 @@
 //! Scopes form an environment chain, so a function captures the scope it was
 //! defined in — that is what makes closures work.
 //!
-//! ponytail: a straightforward AST interpreter — no bytecode VM, inline caches, or
-//! JIT (those are Phase 2/3 in docs/01-ARCHITECTURE.md §4). No prototypes: objects
-//! are plain maps and only a handful of built-in methods exist.
+//! Still an AST interpreter rather than a bytecode VM, because measuring said
+//! the AST walk was never the cost: cloning a loop body every time round the
+//! loop was, then allocating a scope per iteration, then hashing variable names
+//! with SipHash. Fixing those three made this 4–18x faster (see
+//! `examples/jsbench.rs`) and left the evaluator small enough to read.
+//!
+//! ponytail: no inline caches or JIT (Phase 2/3 in docs/01-ARCHITECTURE.md §4).
+//! A bytecode VM buys resolved variable slots, which is the next real win —
+//! worth doing when a page's scripts, rather than a microbenchmark, are what is
+//! slow. No prototypes either: objects are plain maps with a few built-ins.
 
 use super::dom::{DomView, Mutation};
 use super::parser::{Expr, Stmt};
@@ -22,23 +29,62 @@ const THROW_TAG: &str = "\u{1}throw\u{1}";
 /// Hidden slot holding a class's parent method table, for `super`.
 const SUPER_KEY: &str = "\u{1}super";
 
+/// A hash built for short identifiers rather than for hostile keys.
+///
+/// The standard hasher is SipHash, which exists to make collisions hard to
+/// arrange — the right default for a map holding data a site sent, and the
+/// wrong one for a scope's variable names, which are looked up on every read of
+/// every variable and dominated the cost of running a loop.
+///
+/// A page writes its own identifiers, so it could fill one scope with names
+/// that collide here. It would be slowing down only its own variable lookups,
+/// in a map that holds a handful of entries. Object properties — which *can*
+/// hold keys straight out of `JSON.parse` — keep the standard hasher.
+#[derive(Default, Clone, Copy)]
+pub struct NameHasher(u64);
+
+impl std::hash::Hasher for NameHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        // FNV-1a: one multiply and one xor per byte, and identifiers are short.
+        for byte in bytes {
+            self.0 ^= *byte as u64;
+            self.0 = self.0.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+}
+
+impl std::hash::BuildHasher for NameHasher {
+    type Hasher = NameHasher;
+
+    fn build_hasher(&self) -> NameHasher {
+        NameHasher(0xcbf2_9ce4_8422_2325) // the FNV offset basis
+    }
+}
+
+/// A map keyed by names a script wrote, as opposed to data a site sent.
+pub type NameMap<V> = HashMap<String, V, NameHasher>;
+
 /// One lexical scope, linked to the scope enclosing it.
 pub struct Env {
-    vars: HashMap<String, Value>,
+    vars: NameMap<Value>,
     parent: Option<EnvRef>,
 }
 
 impl Env {
     fn root() -> EnvRef {
         Rc::new(RefCell::new(Env {
-            vars: HashMap::new(),
+            vars: NameMap::default(),
             parent: None,
         }))
     }
 
     fn child(parent: &EnvRef) -> EnvRef {
         Rc::new(RefCell::new(Env {
-            vars: HashMap::new(),
+            vars: NameMap::default(),
             parent: Some(parent.clone()),
         }))
     }
@@ -54,8 +100,10 @@ impl Env {
     /// Assign to an existing binding somewhere up the chain; returns false if unbound.
     fn set(env: &EnvRef, name: &str, value: Value) -> bool {
         let mut e = env.borrow_mut();
-        if e.vars.contains_key(name) {
-            e.vars.insert(name.to_string(), value);
+        // Overwrite in place: re-inserting would allocate a second copy of the
+        // name on every assignment, which in a loop is most of the work.
+        if let Some(slot) = e.vars.get_mut(name) {
+            *slot = value;
             return true;
         }
         match e.parent.clone() {
@@ -419,15 +467,57 @@ impl Interp {
     }
 
     /// Run `body` in a fresh child scope, restoring the previous scope afterwards.
-    fn in_child_scope(
+    /// Enter a fresh scope, returning the one to restore afterwards.
+    ///
+    /// Deliberately not a closure taking `&mut self`: a closure would have to
+    /// own the statements it runs, and *cloning a loop body every time round
+    /// the loop* was costing more than executing it.
+    fn push_scope(&mut self) -> EnvRef {
+        let child = Env::child(&self.env);
+        std::mem::replace(&mut self.env, child)
+    }
+
+    /// Does this block introduce a binding? Only then does it need a scope.
+    fn declares(body: &[Stmt]) -> bool {
+        body.iter().any(|stmt| {
+            matches!(
+                stmt,
+                Stmt::VarDecl { .. } | Stmt::FuncDecl { .. } | Stmt::ClassDecl { .. }
+            )
+        })
+    }
+
+    fn run_for(
         &mut self,
-        run: impl FnOnce(&mut Self) -> Result<Flow, String>,
+        init: Option<&Stmt>,
+        cond: Option<&Expr>,
+        step: Option<&Expr>,
+        body: &Stmt,
     ) -> Result<Flow, String> {
-        let saved = self.env.clone();
-        self.env = Env::child(&saved);
-        let result = run(self);
-        self.env = saved;
-        result
+        if let Some(init) = init {
+            self.exec(init)?;
+        }
+        let mut guard = 0;
+        loop {
+            let keep_going = match cond {
+                Some(c) => self.eval(c)?.truthy(),
+                None => true,
+            };
+            if !keep_going {
+                return Ok(Flow::Normal);
+            }
+            if let Flow::Return(v) = self.exec(body)? {
+                return Ok(Flow::Return(v));
+            }
+            if let Some(step) = step {
+                self.eval(step)?;
+            }
+            guard += 1;
+            // A page that loops forever must not take the browser with it.
+            if guard > 1_000_000 {
+                return Err("loop iteration limit exceeded".into());
+            }
+        }
     }
 
     fn exec(&mut self, stmt: &Stmt) -> Result<Flow, String> {
@@ -447,8 +537,16 @@ impl Interp {
                 Ok(Flow::Normal)
             }
             Stmt::Block(body) => {
-                let body = body.clone();
-                self.in_child_scope(|me| me.exec_body(&body))
+                // A block that declares nothing cannot shadow anything, so it
+                // needs no scope of its own — and a loop body runs this every
+                // time round.
+                if !Self::declares(body) {
+                    return self.exec_body(body);
+                }
+                let saved = self.push_scope();
+                let result = self.exec_body(body);
+                self.env = saved;
+                result
             }
             Stmt::If {
                 cond,
@@ -482,34 +580,11 @@ impl Interp {
                 step,
                 body,
             } => {
-                let (init, cond, step, body) =
-                    (init.clone(), cond.clone(), step.clone(), body.clone());
-                self.in_child_scope(move |me| {
-                    if let Some(init) = &init {
-                        me.exec(init)?;
-                    }
-                    let mut guard = 0;
-                    loop {
-                        let keep_going = match &cond {
-                            Some(c) => me.eval(c)?.truthy(),
-                            None => true,
-                        };
-                        if !keep_going {
-                            break;
-                        }
-                        if let Flow::Return(v) = me.exec(&body)? {
-                            return Ok(Flow::Return(v));
-                        }
-                        if let Some(step) = &step {
-                            me.eval(step)?;
-                        }
-                        guard += 1;
-                        if guard > 1_000_000 {
-                            return Err("loop iteration limit exceeded".into());
-                        }
-                    }
-                    Ok(Flow::Normal)
-                })
+                // The loop variable belongs to the loop, not to what surrounds it.
+                let saved = self.push_scope();
+                let result = self.run_for(init.as_deref(), cond.as_ref(), step.as_ref(), body);
+                self.env = saved;
+                result
             }
             Stmt::Return(value) => {
                 let v = match value {
