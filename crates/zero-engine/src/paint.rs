@@ -1,8 +1,13 @@
 //! Paint: turn layout boxes into a display list, then rasterize to a pixel canvas.
 //!
-//! ponytail: solid-color backgrounds + borders + anti-aliased text + nearest-neighbor
-//! images. No gradients, shadows, border-radius, or GPU compositing yet
-//! (docs/01-ARCHITECTURE.md §3 [6]-[7]).
+//! Backgrounds (solid, gradient, rounded), borders, shadows, anti-aliased text
+//! and nearest-neighbour images, with `opacity`, `z-index`, `visibility`,
+//! `overflow` clipping and `transform: translate` applied as the list is built.
+//!
+//! ponytail: the display list is flat, so `z-index` orders siblings rather than
+//! establishing stacking contexts, and opacity is applied per command rather
+//! than to a composited layer. Rasterizing is on the CPU — no GPU compositor
+//! yet (docs/01-ARCHITECTURE.md §3 [6]-[7]).
 
 use crate::css::{Color, Value};
 use crate::dom::NodeType;
