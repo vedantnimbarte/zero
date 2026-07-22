@@ -358,7 +358,7 @@ fn settings_page() -> String {
          <div class=\"sec\">{appearance}</div>{}{}{}{}{}{}{}\
          <div class=\"sec\">{search}</div>{}\
          <div class=\"sec\">{privacy}</div>{}{}\
-         <div class=\"sec\">{about}</div>{}{}{}{}{}",
+         <div class=\"sec\">{about}</div>{}{}{}{}{}{}",
         setting_t("Tab layout", "A rail down the side, or a strip across the top", &layout),
         setting_t("Tab rail", "How much of the vertical rail stays open", &rail),
         setting_t("Page zoom", "The size new tabs open at. Ctrl+= and Ctrl+- change one tab", &zoom),
@@ -400,6 +400,14 @@ fn settings_page() -> String {
         ),
         setting_t("Profile folder", "Where history, bookmarks and this file live",
             &format!("<span class=\"fact\">{}</span>", escape(&profile))),
+        setting_t(
+            "Process hardening",
+            "Applied at startup, before any page is parsed. Not site isolation: page content still runs in this process",
+            &format!(
+                "<span class=\"fact\">{}</span>",
+                escape(&t(crate::sandbox::describe()))
+            ),
+        ),
         setting_t(
             "Sync",
             "One sealed file and a code that opens it. Put the file wherever you              like — there is no server",

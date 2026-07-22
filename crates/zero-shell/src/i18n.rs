@@ -95,6 +95,11 @@ const HINDI: &[(&str, &str)] = &[
     ("Not available on this system", "इस प्रणाली पर उपलब्ध नहीं"),
     ("Profile folder", "प्रोफ़ाइल फ़ोल्डर"),
     ("Where history, bookmarks and this file live", "इतिहास, सहेजे पृष्ठ और यह फ़ाइल यहाँ रहते हैं"),
+    ("Process hardening", "प्रक्रिया की सुरक्षा"),
+    (
+        "Applied at startup, before any page is parsed. Not site isolation: page content still runs in this process",
+        "शुरू होते ही लागू, किसी पृष्ठ को पढ़ने से पहले। यह साइट-पृथक्करण नहीं है: पृष्ठ की सामग्री इसी प्रक्रिया में चलती है",
+    ),
     ("Sync", "समन्वय"),
     (
         "One sealed file and a code that opens it. Put the file wherever you like — there is no server",

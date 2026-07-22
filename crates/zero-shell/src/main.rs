@@ -23,6 +23,7 @@ mod i18n;
 mod internal;
 mod localstore;
 mod net;
+mod sandbox;
 mod settings;
 mod spaces;
 mod storage;
@@ -34,6 +35,10 @@ use std::fs;
 use zero_engine::Engine;
 
 fn main() {
+    // Before a byte of anything a website sent is parsed: narrow what this
+    // process is permitted to do, permanently.
+    sandbox::harden();
+
     // Say so when profile data is not encrypted, rather than leaving the user to
     // assume it is — see crypto's note on which platforms have a backend.
     if !crypto::is_available() {
