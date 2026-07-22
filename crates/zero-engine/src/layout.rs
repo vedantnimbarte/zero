@@ -861,6 +861,27 @@ impl<'a> LayoutBox<'a> {
                     placed_any = true;
                     continue;
                 }
+                InlinePiece::Break => {
+                    // An empty line still takes a line's height, so <br><br>
+                    // leaves a gap rather than collapsing to nothing.
+                    let height = match line_height {
+                        0.0 => default_size * 1.25,
+                        h => h,
+                    };
+                    for boxed in open.iter_mut() {
+                        boxed.height = boxed.height.max(height);
+                        inline_boxes.push(boxed.close(cursor_x));
+                        boxed.start_x = start_x;
+                        boxed.line_y = cursor_y + height;
+                        boxed.height = 0.0;
+                    }
+                    cursor_y += height;
+                    cursor_x = start_x;
+                    line_height = 0.0;
+                    pending_space = false;
+                    placed_any = true;
+                    continue;
+                }
                 InlinePiece::Text(piece) => piece,
             };
 
@@ -1463,6 +1484,8 @@ enum InlinePiece {
     Text(TextPiece),
     Enter(InlineStyle),
     Exit,
+    /// A `<br>`: end this line here, whatever room is left on it.
+    Break,
     /// An `inline-block` child, laid out as a block but placed on the line.
     /// Holds its index among this box's children.
     Atomic(usize),
@@ -1504,7 +1527,11 @@ fn collect_inline_text(
     let mut decorated = false;
 
     if let BoxType::InlineNode(styled) = bx.box_type {
-        if let NodeType::Element(_) = styled.node.node_type {
+        if let NodeType::Element(ref e) = styled.node.node_type {
+            if e.tag_name == "br" {
+                out.push(InlinePiece::Break);
+                return; // a void element: nothing inside it to walk
+            }
             if let Some(h) = href_of(styled) {
                 current_href = Some(h.to_string());
             }
