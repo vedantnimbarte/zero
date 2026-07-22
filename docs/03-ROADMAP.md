@@ -13,18 +13,23 @@
 >
 > **What is genuinely not built, and why it is not a matter of polish:**
 >
-> * **Multi-process + sandbox (R5).** The browser runs in one process. Page
->   state — the DOM, the JS heap, form contents — lives where the UI can reach
->   it, and moving it behind IPC is the change, not spawning a process. A
->   half-done sandbox is worse than none, because it implies a boundary that is
->   not there.
-> * **GPU compositing.** Pixels are rastered on the CPU and blitted through
->   `softbuffer`. Uploading that same CPU-rastered frame to the GPU would buy
->   nothing; the win is in layerizing and rastering on the GPU, which is the
->   real work.
-> * **`zero-js` bytecode VM and JIT.** Still a tree-walking interpreter. This is
->   a rewrite of the evaluator, and everything that currently runs is the thing
->   it would put at risk.
+> * **Multi-process + sandbox (R5).** Partly built. Startup mitigations apply to
+>   every process, and the headless render path runs page content in a separate,
+>   privilege-dropped renderer with no network of its own. **Interactive tabs
+>   still render in-process**: every click, keystroke and hover has to cross the
+>   same pipe, and that protocol is the next increment. Site isolation and a
+>   filesystem jail (restricted token / AppContainer) come after it.
+> * **GPU compositing.** Measured, on a real page at 1280x900: 25 ms to render
+>   the page, 1.5 ms to composite the frame. Presenting that same CPU-rastered
+>   frame through the GPU competes for the 1.5 ms and cannot touch the 25 ms —
+>   so the dependency is not worth its weight until rasterization itself moves,
+>   which is the engine work, not a presenting change. (The compositing pass got
+>   2.6x faster for free once it stopped doing per-pixel coordinate arithmetic
+>   at zoom 1.)
+> * **`zero-js` bytecode VM and JIT.** Still a tree-walking interpreter — but
+>   4–18x faster than it was, because measuring found the cost was never the AST
+>   walk (see `crates/zero-engine/examples/jsbench.rs`). A VM buys resolved
+>   variable slots next; worth doing when a real page's scripts are what is slow.
 > * **The compat bridge.** Embedding another engine behind a flag remains
 >   specified and unbuilt.
 > * **CSS transitions.** Deliberately not animated: the engine renders the

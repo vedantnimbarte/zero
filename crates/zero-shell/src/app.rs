@@ -2179,7 +2179,11 @@ impl App {
         }
         tab.doc.set_time(now);
         let loader = tab.loader.clone();
+        let render_start = std::time::Instant::now();
         let page = engine.render_document(&mut tab.doc, w, h, loader.as_ref());
+        if timing_wanted() {
+            eprintln!("page render {:?}", render_start.elapsed());
+        }
         tab.blocked_count = loader.blocked.get();
         for line in &page.console {
             eprintln!("[js] {line}");
@@ -2379,6 +2383,7 @@ impl App {
         }
 
         // --- compose ---
+        let compose_start = std::time::Instant::now();
         // Starts as the canvas colour rather than black, because mid-animation
         // the page can be narrower than the area it is being slid into.
         let mut buffer = vec![CANVAS_RGB; (w * h) as usize];
@@ -2471,6 +2476,9 @@ impl App {
         }
 
         self.hits = hits;
+        if timing_wanted() {
+            eprintln!("compose {:?}", compose_start.elapsed());
+        }
         buffer
     }
 
@@ -2541,6 +2549,14 @@ impl App {
 /// Copy a rendered surface into the window buffer, clipped at its edges.
 /// Blit a page canvas into one pane: `(x, y, width)` in the window, scrolled and
 /// zoomed. Two panes differ only in where they land and how far each is scrolled.
+/// Whether to report where frame time goes (`ZERO_FRAME_TIMES=1`).
+///
+/// Read once: this is consulted every frame, and the answer cannot change.
+fn timing_wanted() -> bool {
+    static WANTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *WANTED.get_or_init(|| std::env::var_os("ZERO_FRAME_TIMES").is_some())
+}
+
 fn blit_page(
     buffer: &mut [u32],
     w: u32,
@@ -2551,11 +2567,25 @@ fn blit_page(
     zoom: f32,
 ) {
     let inv_zoom = 1.0 / zoom;
+    let right = (x0 + pane_w).min(w);
     for y in y0..h {
         let sy = ((y - y0) as f32 + scroll) * inv_zoom;
         let sy = (sy as usize).min(page.height.saturating_sub(1));
         let row = sy * page.width;
-        for x in x0..(x0 + pane_w).min(w) {
+        // Unzoomed, a row of the page is a row of the window: the per-pixel
+        // coordinate arithmetic is the same answer as walking forwards, and it
+        // was most of the time spent compositing a frame.
+        if zoom == 1.0 {
+            let span = (right - x0) as usize;
+            let take = span.min(page.width);
+            let source = &page.pixels[row..row + take];
+            let start = (y * w + x0) as usize;
+            for (slot, px) in buffer[start..start + take].iter_mut().zip(source) {
+                *slot = (px.r as u32) << 16 | (px.g as u32) << 8 | px.b as u32;
+            }
+            continue;
+        }
+        for x in x0..right {
             let sx = ((x - x0) as f32 * inv_zoom) as usize;
             if sx >= page.width {
                 break; // a stale layout narrower than the area it is sliding into
