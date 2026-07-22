@@ -496,6 +496,53 @@ mod tests {
     }
 
     #[test]
+    fn json_round_trips() {
+        let out = run(
+            "var o = JSON.parse('{\"name\":\"Zero\",\"tags\":[1,2],\"ok\":true,\"nil\":null}');
+             console.log(o.name + ' ' + o.tags[1] + ' ' + o.ok + ' ' + o.nil);
+             console.log(JSON.stringify({ b: [1, 'two'], a: 'x\\ny' }));
+             console.log(JSON.parse('nonsense') === undefined);",
+        );
+        assert_eq!(out.console[0], "Zero 2 true null");
+        // Keys are emitted in sorted order, and control characters escape.
+        assert_eq!(out.console[1], r#"{"a":"x\ny","b":[1,"two"]}"#);
+        // Malformed JSON throws rather than returning a half-read value.
+        assert!(!out.errors.is_empty());
+    }
+
+    #[test]
+    fn promises_settle_and_await_unwraps_them() {
+        let out = run(
+            "async function load() { return 41; }
+             async function main() {
+               var n = await load();
+               console.log(n + 1);
+               await Promise.reject('nope').catch(function (e) { console.log('caught ' + e); });
+               var all = await Promise.all([Promise.resolve(1), 2]);
+               console.log(all.join('-'));
+             }
+             main();
+             Promise.resolve('chain')
+               .then(function (v) { return v + '!'; })
+               .then(function (v) { console.log(v); });",
+        );
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(out.console, vec!["42", "caught nope", "1-2", "chain!"]);
+    }
+
+    #[test]
+    fn a_rejected_promise_throws_where_it_is_awaited() {
+        let out = run(
+            "async function main() {
+               try { await Promise.reject('boom'); } catch (e) { console.log('caught ' + e); }
+             }
+             main();",
+        );
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(out.console, vec!["caught boom"]);
+    }
+
+    #[test]
     fn missing_element_is_null_not_an_error() {
         let out = run("var el = document.getElementById('nope'); console.log(el);");
         assert!(out.errors.is_empty(), "{:?}", out.errors);

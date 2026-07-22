@@ -40,6 +40,33 @@ pub enum Kw {
     Undefined,
 }
 
+/// The word a keyword token came from, for the places a reserved word is
+/// allowed to be an ordinary name (after a `.`, or as an object-literal key).
+pub fn keyword_name(kw: Kw) -> &'static str {
+    match kw {
+        Kw::Var => "var",
+        Kw::Function => "function",
+        Kw::Return => "return",
+        Kw::If => "if",
+        Kw::Else => "else",
+        Kw::While => "while",
+        Kw::For => "for",
+        Kw::This => "this",
+        Kw::New => "new",
+        Kw::Class => "class",
+        Kw::Extends => "extends",
+        Kw::Super => "super",
+        Kw::Try => "try",
+        Kw::Catch => "catch",
+        Kw::Finally => "finally",
+        Kw::Throw => "throw",
+        Kw::True => "true",
+        Kw::False => "false",
+        Kw::Null => "null",
+        Kw::Undefined => "undefined",
+    }
+}
+
 fn keyword(word: &str) -> Option<Kw> {
     Some(match word {
         // `let`/`const` behave like `var` here — no block-scoping yet.

@@ -1,10 +1,9 @@
 //! JavaScript parser: tokens -> AST, via recursive descent with precedence climbing.
 //!
-//! ponytail: supports declarations, assignment, calls, member/index access, object
-//! and array literals, if/while/for, and function declarations/expressions. No
-//! arrow functions, classes, `new`, try/catch, or destructuring yet.
+//! ponytail: no destructuring, generators, template literals or modules. `async`
+//! is accepted and ignored — see [`Parser::eat_async`].
 
-use super::lexer::{Kw, Tok};
+use super::lexer::{keyword_name, Kw, Tok};
 
 #[derive(Debug, Clone)]
 pub enum Expr {
@@ -177,6 +176,27 @@ impl Parser {
         }
     }
 
+    /// Consume an `async` marker before a function, arrow or method.
+    ///
+    /// ponytail: async functions are ordinary functions here — every promise is
+    /// already settled, so there is nothing for the marker to change. The one
+    /// visible difference is that such a function returns its value bare rather
+    /// than wrapped in a promise, which is why `.then` works on any value.
+    fn eat_async(&mut self) -> bool {
+        let is_async = matches!(self.peek(), Tok::Ident(name) if name == "async")
+            && matches!(
+                self.toks.get(self.pos + 1),
+                Some(Tok::Kw(Kw::Function)) | Some(Tok::Ident(_)) | Some(Tok::Op(_))
+            )
+            // `async` on its own line, or used as a plain variable, is not a marker.
+            && !matches!(self.toks.get(self.pos + 1), Some(Tok::Op(op))
+                if op != "(" && op != "*");
+        if is_async {
+            self.pos += 1;
+        }
+        is_async
+    }
+
     fn parse_program(&mut self) -> Result<Vec<Stmt>, String> {
         let mut stmts = Vec::new();
         while *self.peek() != Tok::Eof {
@@ -215,11 +235,16 @@ impl Parser {
             self.eat_op(";");
             return Ok(Stmt::VarDecl { names });
         }
+        // `async function f() {}` at statement level.
+        let async_decl = self.eat_async();
         if self.eat_kw(Kw::Function) {
             let name = self.expect_ident()?;
             let params = self.parse_params()?;
             let body = self.parse_block_body()?;
             return Ok(Stmt::FuncDecl { name, params, body });
+        }
+        if async_decl {
+            return Err("expected a function after `async`".into());
         }
         if self.eat_kw(Kw::Throw) {
             let value = self.parse_expr()?;
@@ -462,14 +487,20 @@ impl Parser {
     }
 
     fn parse_unary(&mut self) -> Result<Expr, String> {
-        // `typeof` is a word, not a symbol, so it arrives as an identifier.
-        if matches!(self.peek(), Tok::Ident(name) if name == "typeof") {
-            self.pos += 1;
-            let expr = self.parse_unary()?;
-            return Ok(Expr::Unary {
-                op: "typeof".to_string(),
-                expr: Box::new(expr),
-            });
+        // `typeof` and `await` are words, not symbols, so they arrive as
+        // identifiers. Both bind like a unary operator.
+        for word in ["typeof", "await"] {
+            if matches!(self.peek(), Tok::Ident(name) if name == word) {
+                self.pos += 1;
+                let expr = self.parse_unary()?;
+                return Ok(Expr::Unary {
+                    op: word.to_string(),
+                    expr: Box::new(expr),
+                });
+            }
+        }
+        if self.eat_async() {
+            return self.parse_unary();
         }
         for op in ["!", "-", "+", "~"] {
             if matches!(self.peek(), Tok::Op(o) if o == op) {
@@ -500,7 +531,16 @@ impl Parser {
         let mut expr = self.parse_primary()?;
         loop {
             if self.eat_op(".") {
-                let property = self.expect_ident()?;
+                // After a dot, a reserved word is just a name: `.catch`,
+                // `.finally`, `.delete` are all real properties on the web.
+                let property = match self.peek() {
+                    Tok::Kw(kw) => {
+                        let name = keyword_name(*kw);
+                        self.pos += 1;
+                        name.to_string()
+                    }
+                    _ => self.expect_ident()?,
+                };
                 expr = Expr::Member {
                     object: Box::new(expr),
                     property,

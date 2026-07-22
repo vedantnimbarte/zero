@@ -72,6 +72,45 @@ impl Env {
     }
 }
 
+/// Marks an object as a promise, holding the value it settled with.
+///
+/// A promise here is always *already* settled: `fetch` blocks, so there is
+/// nothing to wait for. That makes `.then` a plain call and `await` an unwrap,
+/// with no event loop and no microtask queue.
+const PROMISE_KEY: &str = "__zero_settled";
+/// Set on a promise that settled by rejecting.
+const REJECTED_KEY: &str = "__zero_rejected";
+/// The body of a `fetch` response, read by `.text()` and `.json()`.
+const BODY_KEY: &str = "__zero_body";
+
+/// Wrap a value in a settled promise.
+fn promise(value: Value, rejected: bool) -> Value {
+    let mut map = HashMap::new();
+    map.insert(PROMISE_KEY.to_string(), value);
+    if rejected {
+        map.insert(REJECTED_KEY.to_string(), Value::Bool(true));
+    }
+    Value::Object(Rc::new(RefCell::new(map)))
+}
+
+/// What a value settles to: a promise's contents, or the value itself. A
+/// rejected promise settles by throwing, exactly as `await` would.
+fn settled(value: &Value) -> Result<Value, String> {
+    match unwrap_promise(value) {
+        Some((inner, true)) => Err(inner.to_display()),
+        Some((inner, false)) => Ok(inner),
+        None => Ok(value.clone()),
+    }
+}
+
+/// `(settled value, was it a rejection)` if this is a promise.
+fn unwrap_promise(value: &Value) -> Option<(Value, bool)> {
+    let Value::Object(map) = value else { return None };
+    let map = map.borrow();
+    let inner = map.get(PROMISE_KEY)?.clone();
+    Some((inner, map.contains_key(REJECTED_KEY)))
+}
+
 #[derive(Clone)]
 pub enum Value {
     Num(f64),
@@ -207,6 +246,20 @@ impl Interp {
         );
         Env::define(&env, "setTimeout".into(), Value::Native("setTimeout"));
         Env::define(&env, "fetch".into(), Value::Native("fetch"));
+        Env::define(
+            &env,
+            "JSON".into(),
+            namespace(&[("parse", "JSON.parse"), ("stringify", "JSON.stringify")]),
+        );
+        Env::define(
+            &env,
+            "Promise".into(),
+            namespace(&[
+                ("resolve", "Promise.resolve"),
+                ("reject", "Promise.reject"),
+                ("all", "Promise.all"),
+            ]),
+        );
         Env::define(
             &env,
             "localStorage".into(),
@@ -609,6 +662,16 @@ impl Interp {
                 }
                 Ok(Value::Object(Rc::new(RefCell::new(map))))
             }
+            // Nothing to wait for: `await` unwraps a settled promise, and a
+            // rejected one throws exactly where the `await` stands.
+            Expr::Unary { op, expr } if op == "await" => {
+                let value = self.eval(expr)?;
+                match unwrap_promise(&value) {
+                    Some((inner, true)) => Err(format!("{THROW_TAG}{}", inner.to_display())),
+                    Some((inner, false)) => Ok(inner),
+                    None => Ok(value),
+                }
+            }
             Expr::Unary { op, expr } if op == "typeof" => {
                 // `typeof` is how scripts ask whether something exists at all,
                 // so an unknown name answers "undefined" instead of failing.
@@ -828,7 +891,56 @@ impl Interp {
         method: &str,
         args: &[Value],
     ) -> Result<Option<Value>, String> {
+        // Promise plumbing first: `.then` on a settled promise is just a call,
+        // and a script may chain it on anything an async function returned.
+        //
+        // ponytail: `async` is parsed and ignored, so a user function's return
+        // value is not auto-wrapped. Treating any receiver as already settled
+        // keeps `f().then(...)` working; the cost is that `.then` on a plain
+        // object calls back with the object instead of failing.
+        if matches!(method, "then" | "catch" | "finally")
+            && !matches!(receiver, Value::Object(map) if map.borrow().contains_key(method))
+        {
+            let (value, rejected) = unwrap_promise(receiver).unwrap_or((receiver.clone(), false));
+            let handler = match method {
+                "then" if !rejected => args.first(),
+                "then" => args.get(1), // the second argument is the reject path
+                "catch" if rejected => args.first(),
+                "finally" => args.first(),
+                _ => None,
+            };
+            let Some(handler) = handler.cloned() else {
+                return Ok(Some(promise(value, rejected)));
+            };
+            let call_args = match method {
+                "finally" => Vec::new(),
+                _ => vec![value.clone()],
+            };
+            let produced = self.call(handler, call_args)?;
+            // `finally` passes the original settlement through untouched.
+            return Ok(Some(match method {
+                "finally" => promise(value, rejected),
+                // A handler that returns a promise flattens, as chaining requires.
+                _ => match unwrap_promise(&produced) {
+                    Some((inner, rejected)) => promise(inner, rejected),
+                    None => promise(produced, false),
+                },
+            }));
+        }
+
         let result = match (receiver, method) {
+            // `fetch` responses. Both are settled promises, so `await res.json()`
+            // and `res.json().then(...)` both work.
+            (Value::Object(map), "text") if map.borrow().contains_key(BODY_KEY) => {
+                promise(map.borrow()[BODY_KEY].clone(), false)
+            }
+            (Value::Object(map), "json") if map.borrow().contains_key(BODY_KEY) => {
+                let body = map.borrow()[BODY_KEY].to_display();
+                match parse_json(&body) {
+                    Some(value) => promise(value, false),
+                    None => promise(Value::Str("SyntaxError: bad JSON".into()), true),
+                }
+            }
             (Value::Array(items), "push") => {
                 items.borrow_mut().extend(args.iter().cloned());
                 Value::Num(items.borrow().len() as f64)
@@ -971,8 +1083,10 @@ impl Interp {
                         return Ok(Value::Undefined);
                     }
                     "fetch" => {
-                        // ponytail: synchronous, and returns {ok, status, text} rather
-                        // than a Promise — there is no event loop to resolve one yet.
+                        // ponytail: the request happens here and now, and the
+                        // Promise it returns is already settled. Scripts written
+                        // against `.then`/`await` work; anything relying on the
+                        // callback running *later* does not.
                         let body = self
                             .loader
                             .as_ref()
@@ -984,8 +1098,46 @@ impl Interp {
                             "status".into(),
                             Value::Num(if body.is_some() { 200.0 } else { 0.0 }),
                         );
-                        response.insert("text".into(), Value::Str(body.unwrap_or_default()));
-                        return Ok(Value::Object(Rc::new(RefCell::new(response))));
+                        response.insert(BODY_KEY.into(), Value::Str(body.unwrap_or_default()));
+                        return Ok(promise(Value::Object(Rc::new(RefCell::new(response))), false));
+                    }
+                    "Promise.resolve" => {
+                        return Ok(promise(
+                            args.first().cloned().unwrap_or(Value::Undefined),
+                            false,
+                        ))
+                    }
+                    "Promise.reject" => {
+                        return Ok(promise(
+                            args.first().cloned().unwrap_or(Value::Undefined),
+                            true,
+                        ))
+                    }
+                    // Every promise here is already settled, so "all of them" is
+                    // just their values in order.
+                    "Promise.all" => {
+                        let items = match args.first() {
+                            Some(Value::Array(items)) => items.borrow().clone(),
+                            _ => Vec::new(),
+                        };
+                        let mut out = Vec::with_capacity(items.len());
+                        for item in items {
+                            out.push(settled(&item)?);
+                        }
+                        return Ok(promise(
+                            Value::Array(Rc::new(RefCell::new(out))),
+                            false,
+                        ));
+                    }
+                    "JSON.parse" => {
+                        let text = args.first().map(Value::to_display).unwrap_or_default();
+                        return parse_json(&text)
+                            .ok_or_else(|| "SyntaxError: bad JSON".to_string());
+                    }
+                    "JSON.stringify" => {
+                        return Ok(Value::Str(
+                            args.first().map(stringify_json).unwrap_or_default(),
+                        ))
                     }
                     "localStorage.getItem" => {
                         let key = args.first().map(Value::to_display).unwrap_or_default();
@@ -1143,4 +1295,177 @@ fn loose_eq(l: &Value, r: &Value) -> bool {
         (Value::Bool(a), Value::Bool(b)) => a == b,
         _ => l.as_number() == r.as_number(),
     }
+}
+
+/// A JSON reader. Deliberately its own parser rather than the JS one: JSON is a
+/// data format from untrusted servers, and it must not accept expressions.
+fn parse_json(text: &str) -> Option<Value> {
+    let mut chars: Vec<char> = text.chars().collect();
+    chars.push('\0'); // sentinel, so peeking past the end is not a special case
+    let mut pos = 0;
+    let value = json_value(&chars, &mut pos)?;
+    json_space(&chars, &mut pos);
+    match chars[pos] {
+        '\0' => Some(value),
+        _ => None, // trailing junk: not one JSON document
+    }
+}
+
+fn json_space(chars: &[char], pos: &mut usize) {
+    while chars[*pos].is_whitespace() {
+        *pos += 1;
+    }
+}
+
+fn json_value(chars: &[char], pos: &mut usize) -> Option<Value> {
+    json_space(chars, pos);
+    match chars[*pos] {
+        '"' => Some(Value::Str(json_string(chars, pos)?)),
+        '[' => {
+            *pos += 1;
+            let mut items = Vec::new();
+            loop {
+                json_space(chars, pos);
+                if chars[*pos] == ']' {
+                    *pos += 1;
+                    return Some(Value::Array(Rc::new(RefCell::new(items))));
+                }
+                items.push(json_value(chars, pos)?);
+                json_space(chars, pos);
+                match chars[*pos] {
+                    ',' => *pos += 1,
+                    ']' => {}
+                    _ => return None,
+                }
+            }
+        }
+        '{' => {
+            *pos += 1;
+            let mut map = HashMap::new();
+            loop {
+                json_space(chars, pos);
+                if chars[*pos] == '}' {
+                    *pos += 1;
+                    return Some(Value::Object(Rc::new(RefCell::new(map))));
+                }
+                let key = json_string(chars, pos)?;
+                json_space(chars, pos);
+                if chars[*pos] != ':' {
+                    return None;
+                }
+                *pos += 1;
+                map.insert(key, json_value(chars, pos)?);
+                json_space(chars, pos);
+                match chars[*pos] {
+                    ',' => *pos += 1,
+                    '}' => {}
+                    _ => return None,
+                }
+            }
+        }
+        't' | 'f' | 'n' => {
+            for (word, value) in [
+                ("true", Value::Bool(true)),
+                ("false", Value::Bool(false)),
+                ("null", Value::Null),
+            ] {
+                if chars[*pos..].starts_with(&word.chars().collect::<Vec<char>>()[..]) {
+                    *pos += word.len();
+                    return Some(value);
+                }
+            }
+            None
+        }
+        _ => {
+            let start = *pos;
+            while matches!(chars[*pos], '0'..='9' | '-' | '+' | '.' | 'e' | 'E') {
+                *pos += 1;
+            }
+            chars[start..*pos]
+                .iter()
+                .collect::<String>()
+                .parse()
+                .ok()
+                .map(Value::Num)
+        }
+    }
+}
+
+fn json_string(chars: &[char], pos: &mut usize) -> Option<String> {
+    if chars[*pos] != '"' {
+        return None;
+    }
+    *pos += 1;
+    let mut out = String::new();
+    loop {
+        let c = chars[*pos];
+        *pos += 1;
+        match c {
+            '"' => return Some(out),
+            '\0' => return None, // unterminated
+            '\\' => {
+                let escape = chars[*pos];
+                *pos += 1;
+                out.push(match escape {
+                    'n' => '\n',
+                    't' => '\t',
+                    'r' => '\r',
+                    'b' => '\u{8}',
+                    'f' => '\u{c}',
+                    'u' => {
+                        let hex: String = chars[*pos..*pos + 4].iter().collect();
+                        *pos += 4;
+                        char::from_u32(u32::from_str_radix(&hex, 16).ok()?)?
+                    }
+                    other => other, // `\"`, `\\`, `\/`
+                });
+            }
+            other => out.push(other),
+        }
+    }
+}
+
+fn stringify_json(value: &Value) -> String {
+    match value {
+        Value::Num(n) => Value::Num(*n).to_display(),
+        Value::Bool(b) => b.to_string(),
+        Value::Null | Value::Undefined => "null".to_string(),
+        Value::Str(s) => quote_json(s),
+        Value::Array(items) => {
+            let parts: Vec<String> = items.borrow().iter().map(stringify_json).collect();
+            format!("[{}]", parts.join(","))
+        }
+        Value::Object(map) => {
+            // Sorted, because a HashMap has no order of its own and a stringify
+            // that shuffled its keys between runs would be untestable.
+            let map = map.borrow();
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let parts: Vec<String> = keys
+                .iter()
+                .map(|k| format!("{}:{}", quote_json(k), stringify_json(&map[*k])))
+                .collect();
+            format!("{{{}}}", parts.join(","))
+        }
+        // Functions and elements have no JSON form; a browser drops them.
+        _ => "null".to_string(),
+    }
+}
+
+fn quote_json(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str(r"\n"),
+            '\t' => out.push_str(r"\t"),
+            '\r' => out.push_str(r"\r"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }

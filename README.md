@@ -102,7 +102,8 @@ forms.
 - **Text**: shaping via HarfBuzz with a font fallback chain — Latin, Indic
   (Devanagari, Tamil, Telugu, Bengali and more) and CJK
 - **JavaScript**: own lexer, parser and interpreter — closures, classes with
-  `super`, `try/catch/finally`, `setTimeout`, DOM query and mutation, events
+  `super`, `try/catch/finally`, regex literals, `setTimeout`, `JSON`, `fetch`
+  with promises and `await`, DOM query and mutation, events
 - **Browser**: vertical tabs, session restore, history, bookmarks, find-in-page,
   form submission and search, an on-device page assistant
 - **Privacy**: tracker/ad filtering (Adblock syntax), HTTPS-first, cookies and
