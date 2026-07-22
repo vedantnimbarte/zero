@@ -45,19 +45,42 @@ pub enum Combinator {
     Child,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct SimpleSelector {
     pub tag_name: Option<String>,
     pub id: Option<String>,
     pub class: Vec<String>,
     pub attrs: Vec<AttrTest>,
-    /// `:hover` — matches only while the cursor is over this element or
-    /// something inside it.
-    pub hover: bool,
+    /// `:hover`, `:nth-child(2n)`, `:not(.x)` … all of which must hold.
+    pub pseudos: Vec<Pseudo>,
+}
+
+/// A pseudo-class condition. Unknown ones never reach here — the parser drops
+/// the whole rule instead, so a selector we half-understand can't misapply.
+#[derive(Debug, PartialEq)]
+pub enum Pseudo {
+    /// Matches while the cursor is over this element or something inside it.
+    Hover,
+    /// `:nth-child(an+b)`. `:first-child` is `(0, 1)`; `odd` is `(2, 1)`.
+    NthChild(i32, i32),
+    /// `:nth-last-child(an+b)` — the same, counted from the end.
+    NthLastChild(i32, i32),
+    NthOfType(i32, i32),
+    NthLastOfType(i32, i32),
+    OnlyChild,
+    OnlyOfType,
+    /// `:not(...)` over one compound selector.
+    Not(Box<SimpleSelector>),
+    /// An attribute that is present when the state is on (`checked`, `disabled`).
+    AttrPresent(&'static str),
+    AttrAbsent(&'static str),
+    /// A state the engine does not track (`:visited`, `:focus`, `:active`).
+    /// Never matches, which leaves the element at its base styling.
+    Never,
 }
 
 /// An `[attr]`, `[attr=value]`, `[attr~=value]` … condition.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct AttrTest {
     pub name: String,
     pub op: AttrOp,
@@ -99,7 +122,7 @@ impl SimpleSelector {
             && self.id.is_none()
             && self.class.is_empty()
             && self.attrs.is_empty()
-            && !self.hover
+            && self.pseudos.is_empty()
     }
 }
 
@@ -170,7 +193,11 @@ impl Selector {
         self.parts.iter().fold((0, 0, 0), |(ids, classes, tags), part| {
             (
                 ids + part.simple.id.iter().count(),
-                classes + part.simple.class.len(),
+                // A pseudo-class counts alongside classes, per the spec.
+                classes
+                    + part.simple.class.len()
+                    + part.simple.attrs.len()
+                    + part.simple.pseudos.len(),
                 tags + part.simple.tag_name.iter().count(),
             )
         })
@@ -217,6 +244,31 @@ pub fn parse(source: String) -> Stylesheet {
     Stylesheet {
         rules: parser.parse_rules(),
     }
+}
+
+/// `an+b` in any of its spellings: `odd`, `even`, `3`, `2n`, `2n+1`, `-n+3`.
+fn parse_nth(text: &str) -> Option<(i32, i32)> {
+    let text: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    match text.to_ascii_lowercase().as_str() {
+        "odd" => return Some((2, 1)),
+        "even" => return Some((2, 0)),
+        _ => {}
+    }
+    let text = text.to_ascii_lowercase();
+    let Some((a, b)) = text.split_once('n') else {
+        // A bare number selects exactly one child.
+        return Some((0, text.parse().ok()?));
+    };
+    let a = match a {
+        "" | "+" => 1,
+        "-" => -1,
+        _ => a.parse().ok()?,
+    };
+    let b = match b {
+        "" => 0,
+        _ => b.parse().ok()?, // the sign is part of the number: "+1", "-2"
+    };
+    Some((a, b))
 }
 
 fn is_ident(c: char) -> bool {
@@ -642,7 +694,7 @@ impl Parser {
             id: None,
             class: Vec::new(),
             attrs: Vec::new(),
-            hover: false,
+            pseudos: Vec::new(),
         };
         loop {
             match self.next_char_or('\0') {
@@ -661,16 +713,12 @@ impl Parser {
                     Some(test) => selector.attrs.push(test),
                     None => break, // malformed: let the caller drop the rule
                 },
-                // Sheets define their custom properties on :root, and dropping
-                // the rule for the pseudo-class would lose all of them.
-                ':' if self.starts_with(":root") => {
-                    self.pos += ":root".len();
-                    selector.tag_name = Some("html".to_string());
-                }
-                ':' if self.starts_with(":hover") => {
-                    self.pos += ":hover".len();
-                    selector.hover = true;
-                }
+                ':' => match self.parse_pseudo(&mut selector) {
+                    true => continue,
+                    // An unrecognised pseudo-class leaves the ':' unconsumed, so
+                    // the caller drops the rule rather than over-matching.
+                    false => break,
+                },
                 c if is_ident(c) => {
                     selector.tag_name = Some(self.parse_identifier().to_ascii_lowercase());
                 }
@@ -678,6 +726,91 @@ impl Parser {
             }
         }
         selector
+    }
+
+    /// One `:pseudo` or `:pseudo(args)`. Returns false, having consumed nothing,
+    /// for anything we cannot honour exactly.
+    fn parse_pseudo(&mut self, selector: &mut SimpleSelector) -> bool {
+        let start = self.pos;
+        self.consume_char(); // ':'
+        // `::before` and friends are elements, not classes, and we generate no
+        // content — the rule has to go.
+        if self.next_char_or('\0') == ':' {
+            self.pos = start;
+            return false;
+        }
+        let name = self.parse_identifier().to_ascii_lowercase();
+        let args = match self.next_char_or('\0') {
+            '(' => {
+                let Some(end) = self.input[self.pos..].find(')') else {
+                    self.pos = start;
+                    return false;
+                };
+                let args = self.input[self.pos + 1..self.pos + end].trim().to_string();
+                self.pos += end + 1;
+                Some(args)
+            }
+            _ => None,
+        };
+
+        let pseudo = match (name.as_str(), args.as_deref()) {
+            // Sheets define their custom properties on :root, and dropping the
+            // rule for the pseudo-class would lose all of them.
+            ("root", None) => {
+                selector.tag_name = Some("html".to_string());
+                return true;
+            }
+            ("hover", None) => Pseudo::Hover,
+            ("first-child", None) => Pseudo::NthChild(0, 1),
+            ("last-child", None) => Pseudo::NthLastChild(0, 1),
+            ("only-child", None) => Pseudo::OnlyChild,
+            ("first-of-type", None) => Pseudo::NthOfType(0, 1),
+            ("last-of-type", None) => Pseudo::NthLastOfType(0, 1),
+            ("only-of-type", None) => Pseudo::OnlyOfType,
+            ("nth-child", Some(a)) => match parse_nth(a) {
+                Some((a, b)) => Pseudo::NthChild(a, b),
+                None => Pseudo::Never,
+            },
+            ("nth-last-child", Some(a)) => match parse_nth(a) {
+                Some((a, b)) => Pseudo::NthLastChild(a, b),
+                None => Pseudo::Never,
+            },
+            ("nth-of-type", Some(a)) => match parse_nth(a) {
+                Some((a, b)) => Pseudo::NthOfType(a, b),
+                None => Pseudo::Never,
+            },
+            ("nth-last-of-type", Some(a)) => match parse_nth(a) {
+                Some((a, b)) => Pseudo::NthLastOfType(a, b),
+                None => Pseudo::Never,
+            },
+            ("not", Some(inner)) => {
+                let mut sub = Parser { pos: 0, input: inner.to_string() };
+                let inner = sub.parse_simple_selector();
+                // `:not(a, b)` and `:not(div p)` need more than one compound.
+                if inner.is_empty() || sub.pos < sub.input.len() {
+                    self.pos = start;
+                    return false;
+                }
+                Pseudo::Not(Box::new(inner))
+            }
+            ("checked", None) => Pseudo::AttrPresent("checked"),
+            ("disabled", None) => Pseudo::AttrPresent("disabled"),
+            ("enabled", None) => Pseudo::AttrAbsent("disabled"),
+            ("required", None) => Pseudo::AttrPresent("required"),
+            ("link", None) => Pseudo::AttrPresent("href"),
+            // States nothing here tracks. Matching nothing keeps the base rule
+            // in force, which is what an unstyled-but-visited link should look
+            // like; dropping the rule would lose the base declaration too.
+            ("visited" | "active" | "focus" | "focus-within" | "focus-visible" | "target", None) => {
+                Pseudo::Never
+            }
+            _ => {
+                self.pos = start;
+                return false;
+            }
+        };
+        selector.pseudos.push(pseudo);
+        true
     }
 
     /// `[name]`, `[name=value]`, `[name~="value"]` and friends.
@@ -965,6 +1098,42 @@ mod tests {
         assert_eq!(applies(800.0).len(), 2);
         // Narrow: only the base rule.
         assert_eq!(applies(500.0), vec![None]);
+    }
+
+    #[test]
+    fn nth_arguments_parse_in_every_spelling() {
+        assert_eq!(parse_nth("odd"), Some((2, 1)));
+        assert_eq!(parse_nth("EVEN"), Some((2, 0)));
+        assert_eq!(parse_nth("3"), Some((0, 3)));
+        assert_eq!(parse_nth("2n"), Some((2, 0)));
+        assert_eq!(parse_nth("2n + 1"), Some((2, 1)));
+        assert_eq!(parse_nth("-n+3"), Some((-1, 3)));
+        assert_eq!(parse_nth("n"), Some((1, 0)));
+        assert_eq!(parse_nth("junk"), None);
+    }
+
+    #[test]
+    fn pseudo_classes_parse_or_take_the_rule_with_them() {
+        let s = parse(
+            "li:nth-child(2n+1) { color: red; } \
+             p:not(.skip) { color: red; } \
+             input:checked { color: red; } \
+             a:visited { color: red; } \
+             p::before { content: 'x'; } \
+             div:has(> p) { color: red; }"
+                .to_string(),
+        );
+        // The four we can honour exactly; `::before` and `:has()` are dropped
+        // rather than applied to everything.
+        assert_eq!(s.rules.len(), 4);
+        let subject = |i: usize| s.rules[i].selectors[0].subject().unwrap();
+        assert_eq!(subject(0).pseudos, vec![Pseudo::NthChild(2, 1)]);
+        assert_eq!(subject(2).pseudos, vec![Pseudo::AttrPresent("checked")]);
+        assert_eq!(subject(3).pseudos, vec![Pseudo::Never]);
+        match &subject(1).pseudos[..] {
+            [Pseudo::Not(inner)] => assert_eq!(inner.class, vec!["skip".to_string()]),
+            other => panic!("expected :not(.skip), got {other:?}"),
+        }
     }
 
     #[test]

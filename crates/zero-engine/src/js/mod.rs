@@ -273,6 +273,7 @@ mod tests {
                 tag: "div".into(),
                 text: "before".into(),
                 attributes: Default::default(),
+                pos: Default::default(),
             }],
         };
         let out = run_with_dom(

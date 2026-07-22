@@ -6,8 +6,8 @@
 
 > India's first ground-up web browser — engine, shell, and AI, built from scratch in Rust.
 
-**Status:** Pre-development. This repository currently contains the product and
-engineering specification only. No application code yet.
+**Status:** Early alpha. The engine and shell both run — `cargo run` opens a
+browser that renders real sites. See [What works today](#what-works-today).
 
 Zero is an open-source, privacy-first, AI-native web browser with a minimal,
 spacious UI (inspired by Arc, Dia, and Comet) and **vertical tabs**. Unlike Arc,

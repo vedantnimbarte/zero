@@ -28,11 +28,13 @@ pub fn parse(source: String) -> dom::Node {
     // content — keeping it would wrap a well-formed document in a second,
     // synthetic <html>, which changes what the page's root element is.
     nodes.retain(|node| !matches!(&node.node_type, dom::NodeType::Text(t) if t.trim().is_empty()));
-    if nodes.len() == 1 {
+    let mut root = if nodes.len() == 1 {
         nodes.swap_remove(0)
     } else {
         dom::elem("html".to_string(), HashMap::new(), nodes)
-    }
+    };
+    dom::stamp_positions(&mut root);
+    root
 }
 
 struct Parser {

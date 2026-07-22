@@ -25,6 +25,8 @@ pub struct ElementInfo {
     /// Every attribute, so attribute selectors mean the same thing here as in
     /// the style tree.
     pub attributes: std::collections::HashMap<String, String>,
+    /// Sibling position, so `:nth-child` means the same thing here too.
+    pub pos: crate::dom::SiblingPos,
 }
 
 /// A snapshot of every element in the document, in tree order.
@@ -108,6 +110,10 @@ impl crate::style::Matchable for ElementInfo {
 
     fn attr(&self, name: &str) -> Option<&str> {
         self.attributes.get(name).map(String::as_str)
+    }
+
+    fn pos(&self) -> crate::dom::SiblingPos {
+        self.pos
     }
 }
 

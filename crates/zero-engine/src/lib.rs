@@ -516,6 +516,9 @@ impl Document {
     }
 
     fn assign_node_ids(&mut self) {
+        // A script that appended a row changed what `:last-child` means for the
+        // row before it, so positions are restamped alongside the new ids.
+        dom::stamp_positions(&mut self.root);
         fn walk(node: &mut Node, next: &mut usize) {
             if let NodeType::Element(ref mut e) = node.node_type {
                 if e.node_id == 0 {
@@ -659,7 +662,13 @@ impl Engine {
         let uses_hover = stylesheet
             .rules
             .iter()
-            .any(|rule| rule.selectors.iter().any(|s| s.parts.iter().any(|p| p.simple.hover)));
+            .any(|rule| {
+                rule.selectors.iter().any(|s| {
+                    s.parts
+                        .iter()
+                        .any(|p| p.simple.pseudos.contains(&css::Pseudo::Hover))
+                })
+            });
         let style_root = style::style_tree_indexed(root, stylesheet, rule_index, &doc.hovered);
 
         // Fetch + decode every <img> up front so layout knows their sizes.
@@ -863,6 +872,7 @@ fn build_dom_view(root: &Node) -> js::DomView {
                 tag: e.tag_name.clone(),
                 text: text_content(node),
                 attributes: e.attributes.clone(),
+                pos: e.pos,
             });
         }
         for (i, child) in node.children.iter().enumerate() {

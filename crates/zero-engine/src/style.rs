@@ -1,7 +1,7 @@
 //! Style: match CSS rules to DOM nodes and produce a styled tree (the cascade).
 
 use crate::css::{
-    Combinator, LengthContext, Rule, Selector, SelectorPart, SimpleSelector, Specificity,
+    Combinator, LengthContext, Pseudo, Rule, Selector, SelectorPart, SimpleSelector, Specificity,
     Stylesheet, Unit, Value, DEFAULT_FONT_SIZE,
 };
 use crate::dom::{ElementData, Node, NodeType};
@@ -94,11 +94,17 @@ pub trait Matchable {
     fn elem_id(&self) -> Option<&str>;
     fn has_class(&self, class: &str) -> bool;
     fn attr(&self, name: &str) -> Option<&str>;
+    /// Position among siblings, for the structural pseudo-classes.
+    fn pos(&self) -> crate::dom::SiblingPos;
 }
 
 impl Matchable for ElementData {
     fn node_id(&self) -> usize {
         self.node_id
+    }
+
+    fn pos(&self) -> crate::dom::SiblingPos {
+        self.pos
     }
 
     fn tag(&self) -> &str {
@@ -147,10 +153,7 @@ fn matches_chain<E: Matchable>(
     hovered: &HoverChain,
 ) -> bool {
     let Some((subject, rest)) = parts.split_last() else { return true };
-    if !matches_simple_selector(elem, &subject.simple) {
-        return false;
-    }
-    if subject.simple.hover && !hovered.contains(&elem.node_id()) {
+    if !matches_simple_selector(elem, &subject.simple, hovered) {
         return false;
     }
     if rest.is_empty() {
@@ -168,7 +171,11 @@ fn matches_chain<E: Matchable>(
     }
 }
 
-fn matches_simple_selector<E: Matchable>(elem: &E, selector: &SimpleSelector) -> bool {
+fn matches_simple_selector<E: Matchable>(
+    elem: &E,
+    selector: &SimpleSelector,
+    hovered: &HoverChain,
+) -> bool {
     if selector.tag_name.iter().any(|name| elem.tag() != name) {
         return false;
     }
@@ -178,7 +185,45 @@ fn matches_simple_selector<E: Matchable>(elem: &E, selector: &SimpleSelector) ->
     if selector.class.iter().any(|class| !elem.has_class(class)) {
         return false;
     }
-    selector.attrs.iter().all(|test| test.matches(elem.attr(&test.name)))
+    if !selector.attrs.iter().all(|test| test.matches(elem.attr(&test.name))) {
+        return false;
+    }
+    selector
+        .pseudos
+        .iter()
+        .all(|pseudo| matches_pseudo(elem, pseudo, hovered))
+}
+
+fn matches_pseudo<E: Matchable>(elem: &E, pseudo: &Pseudo, hovered: &HoverChain) -> bool {
+    let pos = elem.pos();
+    match pseudo {
+        Pseudo::Hover => hovered.contains(&elem.node_id()),
+        Pseudo::NthChild(a, b) => nth_matches(*a, *b, pos.index),
+        Pseudo::NthLastChild(a, b) => nth_matches(*a, *b, pos.count + 1 - pos.index.min(pos.count)),
+        Pseudo::NthOfType(a, b) => nth_matches(*a, *b, pos.type_index),
+        Pseudo::NthLastOfType(a, b) => {
+            nth_matches(*a, *b, pos.type_count + 1 - pos.type_index.min(pos.type_count))
+        }
+        Pseudo::OnlyChild => pos.count == 1,
+        Pseudo::OnlyOfType => pos.type_count == 1,
+        Pseudo::Not(inner) => !matches_simple_selector(elem, inner, hovered),
+        Pseudo::AttrPresent(name) => elem.attr(name).is_some(),
+        Pseudo::AttrAbsent(name) => elem.attr(name).is_none(),
+        Pseudo::Never => false,
+    }
+}
+
+/// Is `n` (1-based) one of the positions `an + b` picks out, for some n ≥ 0?
+fn nth_matches(a: i32, b: i32, index: u32) -> bool {
+    // An unstamped element has index 0 and is nobody's nth child.
+    if index == 0 {
+        return false;
+    }
+    let index = index as i32;
+    match a {
+        0 => index == b,
+        _ => (index - b) % a == 0 && (index - b) / a >= 0,
+    }
 }
 
 /// Rules bucketed by what their subject requires, so an element only tests the
@@ -667,6 +712,31 @@ mod tests {
         assert_eq!(cards[1].value("color"), Some(green));
         // With no fallback the declaration is dropped, not left as raw text.
         assert_eq!(cards[2].value("color"), None);
+    }
+
+    #[test]
+    fn structural_pseudo_classes_pick_out_siblings() {
+        let html = "<ul><li>one</li> <li class=\"skip\">two</li> <li>three</li></ul>";
+        let nth = |css: &str| {
+            let dom = crate::html::parse(html.to_string());
+            let sheet = crate::css::parse(css.to_string());
+            let styled = style_tree(&dom, &sheet);
+            elements(&styled)
+                .iter()
+                .map(|li| li.value("color").is_some())
+                .collect::<Vec<bool>>()
+        };
+
+        assert_eq!(nth("li:first-child { color: red; }"), [true, false, false]);
+        assert_eq!(nth("li:last-child { color: red; }"), [false, false, true]);
+        assert_eq!(nth("li:nth-child(odd) { color: red; }"), [true, false, true]);
+        assert_eq!(nth("li:nth-child(2) { color: red; }"), [false, true, false]);
+        // `-n+2` is the first two, and stops rather than wrapping.
+        assert_eq!(nth("li:nth-child(-n+2) { color: red; }"), [true, true, false]);
+        assert_eq!(nth("li:not(.skip) { color: red; }"), [true, false, true]);
+        assert_eq!(nth("li:only-child { color: red; }"), [false, false, false]);
+        // Whitespace between the tags is a text node, and must not count.
+        assert_eq!(nth("li:nth-of-type(3) { color: red; }"), [false, false, true]);
     }
 
     #[test]
