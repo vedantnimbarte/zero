@@ -322,11 +322,14 @@ impl<'a> LayoutBox<'a> {
             NodeType::Element(ref e) => e,
             _ => return None,
         };
-        if elem.tag_name != "img" {
-            return None;
-        }
-        let src = elem.attributes.get("src")?;
-        let img = images.get(src);
+        // An inline `<svg>` is a replaced element too: it has a picture, an
+        // intrinsic size, and no business laying its markup out as text.
+        let src = match elem.tag_name.as_str() {
+            "img" => elem.attributes.get("src")?.clone(),
+            "svg" => crate::inline_svg_key_of(elem.node_id),
+            _ => return None,
+        };
+        let img = images.get(&src);
         let css_px = |name: &str| styled.px(name, 0.0).filter(|v| *v > 0.0);
         let attr_px = |name: &str| {
             elem.attributes

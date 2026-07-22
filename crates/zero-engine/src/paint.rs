@@ -487,6 +487,15 @@ fn child_clip(layout_box: &LayoutBox, clip: Rect, offset: (f32, f32)) -> Option<
         BoxType::BlockNode(s) | BoxType::InlineNode(s) => s,
         BoxType::AnonymousBlock => return Some(clip),
     };
+    // `html`/`body { overflow: hidden }` is how a page says "the *viewport*
+    // does not scroll" — it is not a request to hide the document. The embedder
+    // owns scrolling here, and the whole page is painted for it to scroll
+    // through, so honouring this one would blank every site that sets it.
+    if matches!(style.node.node_type,
+        NodeType::Element(ref e) if e.tag_name == "html" || e.tag_name == "body")
+    {
+        return Some(clip);
+    }
     let overflow = match style.value("overflow") {
         Some(Value::Keyword(k)) => k,
         Some(Value::Raw(raw)) => raw.split_whitespace().next()?.to_string(),
@@ -497,11 +506,28 @@ fn child_clip(layout_box: &LayoutBox, clip: Rect, offset: (f32, f32)) -> Option<
         // what a collapsed menu or a clipped banner needs.
         "hidden" | "clip" | "auto" | "scroll" => {
             let box_rect = layout_box.dimensions.padding_box();
-            let drawn = Rect { x: box_rect.x + offset.0, y: box_rect.y + offset.1, ..box_rect };
+            let mut drawn =
+                Rect { x: box_rect.x + offset.0, y: box_rect.y + offset.1, ..box_rect };
+            // Vertically, only a height the page *stated* is worth clipping to.
+            // A content-sized box already wraps its content, so a clip there can
+            // only ever hide something this engine mis-measured — which is
+            // exactly what it did: a results list inside an auto-height
+            // `overflow: hidden` wrapper vanished entirely.
+            if !has_explicit_height(style) {
+                drawn.y = UNCLIPPED.y;
+                drawn.height = UNCLIPPED.height;
+            }
             intersect(drawn, clip)
         }
         _ => Some(clip),
     }
+}
+
+/// Did the page give this box a height, rather than letting its content decide?
+fn has_explicit_height(style: &crate::style::StyledNode) -> bool {
+    ["height", "max-height"]
+        .iter()
+        .any(|name| matches!(style.value(name), Some(Value::Length(..))))
 }
 
 /// `visibility: hidden` — the box and its text are not painted, though a
@@ -748,6 +774,9 @@ fn image_src(layout_box: &LayoutBox) -> Option<String> {
     };
     match style.node.node_type {
         NodeType::Element(ref e) if e.tag_name == "img" => e.attributes.get("src").cloned(),
+        NodeType::Element(ref e) if e.tag_name == "svg" => {
+            Some(crate::inline_svg_key_of(e.node_id))
+        }
         _ => None,
     }
 }

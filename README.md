@@ -97,6 +97,8 @@ articles render close to correctly, including their own stylesheets, tables and
 forms.
 
 - **HTML**: tolerant parser, character references, raw-text and void elements
+- **SVG**: its own rasterizer — shapes, paths, fills, strokes, `viewBox` — for
+  both `<img src=".svg">` and inline `<svg>`
 - **CSS**: external `<link>` sheets and `@import`, `@media` (type + width),
   descendant/child/sibling selectors (`div p`, `>`, `+`, `~`),
   attribute selectors (`[type=text]`, `~=`, `^=`, `$=`, `*=`),
@@ -124,7 +126,8 @@ forms.
 **Known limits.** A pseudo-class the engine cannot honour exactly (`::before`,
 `:has()`) still takes its rule with it, rather than being misapplied. Text does
 not re-widen below a short float — a block beside one keeps its narrowed width
-for its whole height. Layout and paint are single-threaded, and a page is
+for its whole height. An SVG is rasterized at its intrinsic size and scaled from
+there, so an icon shown much larger than it declares goes soft. Layout and paint are single-threaded, and a page is
 painted in full rather than by viewport.
 
 ## The documents

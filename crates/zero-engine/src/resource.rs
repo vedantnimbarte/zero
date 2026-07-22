@@ -53,6 +53,16 @@ pub type ImageMap = HashMap<String, DecodedImage>;
 
 /// Decode PNG/JPEG/GIF bytes into RGBA pixels. Returns `None` on undecodable data.
 pub fn decode_image(bytes: &[u8]) -> Option<DecodedImage> {
+    // SVG is markup, not a raster format, so it is drawn rather than decoded.
+    //
+    // ponytail: rasterized once at its intrinsic size and scaled from there, so
+    // an icon shown much larger than it declares goes soft. Re-rasterizing at
+    // the laid-out size means decoding after layout rather than before it.
+    if crate::svg::looks_like_svg(bytes) {
+        let source = String::from_utf8_lossy(bytes);
+        let (w, h) = crate::svg::intrinsic_size(&source);
+        return crate::svg::rasterize(&source, w, h);
+    }
     let img = image::load_from_memory(bytes).ok()?.to_rgba8();
     let (w, h) = img.dimensions();
     let pixels = img

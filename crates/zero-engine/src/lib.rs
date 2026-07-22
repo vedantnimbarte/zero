@@ -25,6 +25,7 @@ pub mod layout;
 pub mod paint;
 pub mod resource;
 pub mod style;
+pub mod svg;
 pub mod text;
 
 pub use css::Color;
@@ -550,6 +551,14 @@ const USER_AGENT_CSS: &str = "
     button { background: #e6e8ec; color: #111111; padding: 8px; border-radius: 4px;
         width: 160px; }
     head, script, style, meta, link, title, noscript, base { display: none; }
+    /* An <svg> is a picture, not a box of markup: it sits in a line like an
+       image, and the shapes inside it are drawn by the rasterizer rather than
+       laid out. Without this the source of every icon reads as text. */
+    svg { display: inline-block; }
+    path, circle, ellipse, rect, line, polygon, polyline, g, defs, use, symbol,
+    marker, stop, lineargradient, radialgradient, clippath, mask, pattern,
+    text, tspan, textpath, desc, filter, feoffset, fegaussianblur, femerge,
+    femergenode, fecolormatrix, animate, animatetransform { display: none; }
 ";
 
 /// One loaded font: the rasterizer plus the raw bytes a shaping face is built from.
@@ -674,6 +683,7 @@ impl Engine {
         // Fetch + decode every <img> up front so layout knows their sizes.
         let mut images = ImageMap::new();
         collect_and_load_images(root, loader, &mut images);
+        rasterize_inline_svg(root, &mut images);
 
         let mut viewport: layout::Dimensions = Default::default();
         viewport.content.width = width;
@@ -857,6 +867,61 @@ fn collect_image_srcs(node: &Node, out: &mut Vec<String>) {
     }
     for child in &node.children {
         collect_image_srcs(child, out);
+    }
+}
+
+/// Rasterize every inline `<svg>`, keyed the same way a fetched image is.
+///
+/// An inline SVG is a picture written in the page rather than fetched, so it
+/// needs no loader — but from layout and paint's point of view it is an image
+/// like any other, and giving it a key in the same map is what lets it be one.
+fn rasterize_inline_svg(node: &Node, out: &mut ImageMap) {
+    if let NodeType::Element(ref e) = node.node_type {
+        if e.tag_name == "svg" {
+            let source = svg_source(node);
+            let (w, h) = svg::intrinsic_size(&source);
+            if let Some(image) = svg::rasterize(&source, w, h) {
+                out.insert(inline_svg_key(node), image);
+            }
+            return; // its children are its own markup, not more images
+        }
+    }
+    for child in &node.children {
+        rasterize_inline_svg(child, out);
+    }
+}
+
+/// The map key for an inline `<svg>`: its own identity, so two different icons
+/// on one page never collide.
+fn inline_svg_key(node: &Node) -> String {
+    match node.node_type {
+        NodeType::Element(ref e) => inline_svg_key_of(e.node_id),
+        NodeType::Text(_) => inline_svg_key_of(0),
+    }
+}
+
+/// The same key from an element id alone. Layout and paint each need it, and a
+/// key spelled out twice is a key that will differ once.
+pub fn inline_svg_key_of(node_id: usize) -> String {
+    // The prefix is a control character, which no URL can contain, so an inline
+    // picture can never collide with a fetched one.
+    format!("\u{1}inline-svg/{node_id}")
+}
+
+/// Serialize an `<svg>` element back to markup for the rasterizer, which reads
+/// source rather than a tree.
+fn svg_source(node: &Node) -> String {
+    match node.node_type {
+        NodeType::Text(ref text) => text.clone(),
+        NodeType::Element(ref e) => {
+            let attrs: String = e
+                .attributes
+                .iter()
+                .map(|(name, value)| format!(" {name}=\"{}\"", value.replace('"', "&quot;")))
+                .collect();
+            let inner: String = node.children.iter().map(svg_source).collect();
+            format!("<{tag}{attrs}>{inner}</{tag}>", tag = e.tag_name)
+        }
     }
 }
 
@@ -1144,6 +1209,24 @@ mod tests {
         assert_eq!(rgb(at(5, 50)), WHITE);
         // A hidden box leaves no colour where it sits (y 10..20).
         assert_eq!(rgb(at(5, 15)), WHITE);
+    }
+
+    #[test]
+    fn an_auto_height_box_does_not_clip_what_it_holds() {
+        let engine = super::Engine::shapes_only();
+        let canvas = engine.render(
+            "<body><div id=\"wrap\"><div id=\"tall\"></div></div></body>",
+            // No height of its own: the page never said how tall this is, so a
+            // clip here could only hide something the engine mis-measured. Real
+            // pages wrap their whole content in exactly this.
+            "#wrap { overflow: hidden; }
+             #tall { position: absolute; top: 0; left: 0;
+                     width: 20px; height: 40px; background: #ff0000; }",
+            40.0,
+            60.0,
+        );
+        let red = |y: usize| canvas.pixels[y * canvas.width + 5].r == 255;
+        assert!(red(5) && red(35), "content must survive an auto-height wrapper");
     }
 
     #[test]
