@@ -35,6 +35,8 @@ const HINDI: &[(&str, &str)] = &[
     ("Find on page", "पृष्ठ में खोजें"),
     ("Save page", "पृष्ठ सहेजें"),
     ("View source", "स्रोत देखें"),
+    ("Split view", "दो पृष्ठ साथ-साथ"),
+    ("Close split view", "साथ-साथ दृश्य बंद करें"),
     ("History", "इतिहास"),
     ("Downloads", "डाउनलोड"),
     ("Settings", "सेटिंग्स"),

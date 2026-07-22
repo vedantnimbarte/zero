@@ -129,6 +129,7 @@ const MENU_ITEMS: &[(&str, &str, &str)] = &[
     ("", "", ""), // a rule
     ("menu:zoom", "Zoom", ""),
     ("", "", ""),
+    ("menu:split", "Split view", ""),
     ("menu:find", "Find on page", "Ctrl+F"),
     ("menu:save", "Save page", "Ctrl+S"),
     ("menu:source", "View source", "Ctrl+U"),
@@ -197,6 +198,13 @@ struct Regions {
     content_y: u32,
     content_w: u32,
     content_h: u32,
+    /// The other pane in a split, as `(x, width)`. Zero-width when not split.
+    ///
+    /// `content_*` always describes the *focused* pane, so everything that
+    /// works on the page — clicks, hover, scrolling, the scrollbar — keeps
+    /// addressing the tab whose address is in the bar, split or not.
+    other_x: u32,
+    other_w: u32,
     width: u32,
     height: u32,
 }
@@ -212,6 +220,9 @@ fn rail_target(settings: Settings) -> u32 {
         },
     }
 }
+
+/// The grabbable gap between two split panes.
+const DIVIDER_W: u32 = 6;
 
 /// Below this width the rail shows initials instead of titles.
 ///
@@ -243,6 +254,20 @@ impl Regions {
     /// animates: mid-collapse the rail sits between two states, and every other
     /// region has to be laid out against where it actually is right now.
     fn of(width: u32, height: u32, settings: Settings, ai_open: bool, rail_w: u32) -> Regions {
+        Regions::split(width, height, settings, ai_open, rail_w, None, 0.5)
+    }
+
+    /// `split` is which side the focused pane is on (`0` left, `1` right), or
+    /// `None` for a single pane. `ratio` is where the divider sits.
+    fn split(
+        width: u32,
+        height: u32,
+        settings: Settings,
+        ai_open: bool,
+        rail_w: u32,
+        split: Option<usize>,
+        ratio: f32,
+    ) -> Regions {
         let rail_w = rail_w.min(width / 2);
         let strip_h = match settings.layout {
             TabLayout::Horizontal => TABSTRIP_H.min(height / 4),
@@ -253,14 +278,27 @@ impl Regions {
             false => 0,
         };
         let content_y = (strip_h + TOOLBAR_H).min(height);
+        let full_w = width.saturating_sub(rail_w + ai_w).max(1);
+        // The divider is drawn in the gap, so each pane keeps its own edges.
+        let (left_w, right_x, right_w) = match full_w.checked_sub(DIVIDER_W) {
+            Some(usable) if split.is_some() && usable > 2 => {
+                let left = ((usable as f32 * ratio) as u32).clamp(1, usable - 1);
+                (left, rail_w + left + DIVIDER_W, usable - left)
+            }
+            _ => (full_w, 0, 0),
+        };
+        // Pane 1 focused: the bar and every page interaction follow the right.
+        let focused_right = split == Some(1);
         Regions {
             rail_w,
             strip_h,
             ai_w,
-            content_x: rail_w,
+            content_x: if focused_right { right_x } else { rail_w },
             content_y,
-            content_w: width.saturating_sub(rail_w + ai_w).max(1),
+            content_w: if focused_right { right_w } else { left_w },
             content_h: height.saturating_sub(content_y).max(1),
+            other_x: if focused_right { rail_w } else { right_x },
+            other_w: if focused_right { left_w } else { right_w },
             width,
             height,
         }
@@ -270,6 +308,18 @@ impl Regions {
     #[cfg(test)]
     fn settled(width: u32, height: u32, settings: Settings, ai_open: bool) -> Regions {
         Regions::of(width, height, settings, ai_open, rail_target(settings))
+    }
+
+    /// Where the divider between two panes starts, or `None` when not split.
+    fn divider_x(&self) -> Option<u32> {
+        if self.other_w == 0 {
+            return None;
+        }
+        let left_w = match self.content_x < self.other_x {
+            true => self.content_w,
+            false => self.other_w,
+        };
+        Some(self.content_x.min(self.other_x) + left_w)
     }
 
     /// The toolbar spans everything right of the rail, below any tab strip.
@@ -533,6 +583,7 @@ pub fn screenshot(
             ("hover", id) => app.hovered = Some(id.to_string()),
             ("railpx", _) => {} // applied after the loop, once settings are known
             ("search", query) => app.focus = Focus::TabSearch(query.to_string()),
+            ("split", _) => app.toggle_split(),
             ("tabs", n) => {
                 // Extra tabs, so the rail and the strip can be seen carrying more
                 // than one thing.
@@ -632,6 +683,13 @@ struct App {
     /// Whether the last frame left something mid-animation and so owes another.
     animating: bool,
     dragging_scrollbar: bool,
+    /// The tab sharing the window, if the view is split. Always a different tab
+    /// from the active one; the pair is drawn in tab order, so which side each
+    /// sits on does not change when focus moves between them.
+    split: Option<usize>,
+    /// Where the divider sits, as a fraction of the content area.
+    split_ratio: f32,
+    dragging_divider: bool,
     window: Option<Rc<Window>>,
     surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
 }
@@ -657,6 +715,9 @@ impl App {
             hits: Vec::new(),
             hovered: None,
             dragging_scrollbar: false,
+            split: None,
+            split_ratio: 0.5,
+            dragging_divider: false,
             window: None,
             surface: None,
         }
@@ -710,14 +771,24 @@ impl ApplicationHandler for App {
                 if self.modifiers.control_key() {
                     self.zoom_by(if dy > 0.0 { 1 } else { -1 });
                 } else {
-                    let tab = self.tab_mut();
+                    // The wheel scrolls whichever pane the cursor is over, which
+                    // is the whole point of having two of them side by side.
+                    let index = self.pane_under_cursor();
+                    let tab = &mut self.tabs[index];
                     tab.scroll_y = (tab.scroll_y - dy).max(0.0); // clamped to content in redraw
                 }
                 self.request_redraw();
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x as f32, position.y as f32);
-                if self.dragging_scrollbar {
+                if self.dragging_divider {
+                    let regions = self.regions();
+                    let span = regions.content_w + regions.other_w + DIVIDER_W;
+                    let left = regions.content_x.min(regions.other_x) as f32;
+                    self.split_ratio = ((self.cursor.0 - left) / span as f32).clamp(0.15, 0.85);
+                    self.invalidate_panes();
+                    self.request_redraw();
+                } else if self.dragging_scrollbar {
                     let regions = self.regions();
                     self.scroll_to_cursor(self.cursor.1, &regions);
                     self.request_redraw();
@@ -727,6 +798,7 @@ impl ApplicationHandler for App {
             }
             WindowEvent::MouseInput { state: ElementState::Released, .. } => {
                 self.dragging_scrollbar = false;
+                self.dragging_divider = false;
             }
             WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
             WindowEvent::MouseInput { state: ElementState::Pressed, button, .. } => {
@@ -772,7 +844,49 @@ impl App {
     /// so a click during a collapse hits what is actually on screen.
     fn regions(&self) -> Regions {
         let (w, h) = self.window_size();
-        Regions::of(w, h, self.settings, self.ai_open, self.rail_px.round() as u32)
+        Regions::split(
+            w,
+            h,
+            self.settings,
+            self.ai_open,
+            self.rail_px.round() as u32,
+            self.focused_pane(),
+            self.split_ratio,
+        )
+    }
+
+    /// Which side the focused pane is on, or `None` when the view is not split.
+    fn focused_pane(&self) -> Option<usize> {
+        let other = self.split?;
+        match other < self.tabs.len() && other != self.active {
+            // Drawn in tab order, so focusing the other pane does not move it.
+            true => Some((self.active > other) as usize),
+            false => None,
+        }
+    }
+
+    /// Show `index` beside the active tab, or close the split if it is already
+    /// showing. Splitting with nothing else open opens a new tab to fill it.
+    fn toggle_split(&mut self) {
+        if self.split.is_some() {
+            self.split = None;
+        } else {
+            if self.tabs.len() < 2 {
+                self.new_tab(); // which makes the new tab active
+            }
+            let other = (0..self.tabs.len()).find(|i| *i != self.active);
+            self.split = other;
+            self.split_ratio = 0.5;
+        }
+        self.invalidate_panes();
+        self.request_redraw();
+    }
+
+    /// Both panes have to lay out again when the space they share changes.
+    fn invalidate_panes(&mut self) {
+        for tab in &mut self.tabs {
+            tab.page_canvas = None;
+        }
     }
 
     /// Step the rail toward its target. Returns whether it is still moving.
@@ -832,6 +946,12 @@ impl App {
         if index < self.active {
             self.active -= 1;
         }
+        // The split points at a tab by index, and indices shift underneath it.
+        self.split = match self.split {
+            Some(i) if i == index => None, // the pane's own tab is gone
+            Some(i) if i > index => Some(i - 1),
+            other => other,
+        };
         if self.tabs.is_empty() {
             self.tabs.push(Tab::blank()); // always keep one tab open
         }
@@ -1080,6 +1200,23 @@ impl App {
             self.request_redraw();
             return;
         }
+        // The other pane takes focus on a click, without either pane moving.
+        if regions.other_w > 0
+            && cx >= regions.other_x as f32
+            && cx < (regions.other_x + regions.other_w) as f32
+        {
+            if let Some(other) = self.split {
+                self.split = Some(self.active);
+                self.active = other;
+                self.request_redraw();
+            }
+            return;
+        }
+        // The divider between two panes drags to resize them.
+        if regions.other_w > 0 && self.on_divider(cx, &regions) {
+            self.dragging_divider = true;
+            return;
+        }
         if cx >= page_right {
             return; // the assistant panel is not the page
         }
@@ -1174,6 +1311,7 @@ impl App {
             "menu:find" => self.open_find(),
             "menu:save" => self.save_page(),
             "menu:source" => self.view_source(),
+            "menu:split" => self.toggle_split(),
             _ => return false,
         }
         true
@@ -1899,6 +2037,7 @@ impl App {
                     );
                 }
                 let label = match *id {
+                    "menu:split" if self.focused_pane().is_some() => "Close split view",
                     "menu:pin" if self.tab().pinned => "Unpin this tab",
                     "menu:reopen" if self.closed.is_empty() => return String::new(),
                     _ => label,
@@ -1974,6 +2113,51 @@ impl App {
 
     // --- compositing ---
 
+    /// Lay out and paint one tab at the given size, reusing its cached canvas
+    /// when nothing about the page or the space it has changed.
+    fn render_pane(&mut self, index: usize, w: f32, h: f32) {
+        let engine = &self.engine;
+        let tab = &mut self.tabs[index];
+        if tab.page_canvas.is_some() && tab.cache_w == w as u32 && tab.cache_h == h as u32 {
+            return;
+        }
+        let loader = tab.loader.clone();
+        let page = engine.render_document(&mut tab.doc, w, h, loader.as_ref());
+        tab.blocked_count = loader.blocked.get();
+        for line in &page.console {
+            eprintln!("[js] {line}");
+        }
+        tab.page_canvas = Some(page.canvas);
+        tab.links = page.links;
+        tab.matches = page.find_matches;
+        tab.uses_hover = page.uses_hover;
+        tab.element_rects = page.element_rects;
+        tab.cache_w = w as u32;
+        tab.cache_h = h as u32;
+    }
+
+    /// Which tab the cursor is over: the other pane if it is in it, else the
+    /// focused one. Used by the wheel, which should not need a click first.
+    fn pane_under_cursor(&self) -> usize {
+        let regions = self.regions();
+        let cx = self.cursor.0;
+        let in_other = regions.other_w > 0
+            && cx >= regions.other_x as f32
+            && cx < (regions.other_x + regions.other_w) as f32;
+        match (in_other, self.split) {
+            (true, Some(other)) => other,
+            _ => self.active,
+        }
+    }
+
+    /// Is the cursor in the gap between two panes?
+    fn on_divider(&self, cx: f32, regions: &Regions) -> bool {
+        match regions.divider_x() {
+            Some(x) => cx >= x as f32 && cx < (x + DIVIDER_W) as f32,
+            None => false,
+        }
+    }
+
     /// Render a chrome document and record where it painted each of its controls,
     /// in window coordinates. `interactive` documents contribute to hit-testing;
     /// tooltips do not, because you cannot click a tooltip.
@@ -2006,13 +2190,36 @@ impl App {
     /// the same path the user sees rather than a second, drifting copy.
     fn frame(&mut self, w: u32, h: u32) -> Vec<u32> {
         self.animating = self.advance_rail();
-        let regions = Regions::of(w, h, self.settings, self.ai_open, self.rail_px.round() as u32);
+        let regions = Regions::split(
+            w,
+            h,
+            self.settings,
+            self.ai_open,
+            self.rail_px.round() as u32,
+            self.focused_pane(),
+            self.split_ratio,
+        );
         let zoom = self.tab().zoom_factor();
 
         // Re-render the active tab only when its page or layout size changed;
         // scrolling and tab switching just re-blit cached canvases. The page is
         // laid out at the zoomed-down width, so zooming reflows rather than crops.
         let (layout_w, layout_h) = layout_size(regions.content_w, regions.content_h, zoom);
+        // The other half of a split lays out at its own width and scrolls on its
+        // own; only the focused pane's tab drives the toolbar.
+        if regions.other_w > 0 {
+            if let Some(other) = self.split {
+                let (ow, oh) = layout_size(regions.other_w, regions.content_h, zoom);
+                self.render_pane(other, ow, oh);
+                let content = self.tabs[other]
+                    .page_canvas
+                    .as_ref()
+                    .map_or(0.0, |c| c.height as f32)
+                    * zoom;
+                let max_scroll = (content - regions.content_h as f32).max(0.0);
+                self.tabs[other].scroll_y = self.tabs[other].scroll_y.clamp(0.0, max_scroll);
+            }
+        }
         {
             let engine = &self.engine;
             let animating = self.animating;
@@ -2129,19 +2336,40 @@ impl App {
         // the page can be narrower than the area it is being slid into.
         let mut buffer = vec![CANVAS_RGB; (w * h) as usize];
         let page = self.tabs[self.active].page_canvas.as_ref().expect("rendered above");
-        let inv_zoom = 1.0 / zoom;
-        for y in regions.content_y..h {
-            let sy = ((y - regions.content_y) as f32 + scroll) * inv_zoom;
-            let sy = (sy as usize).min(page.height.saturating_sub(1));
-            let row = sy * page.width;
-            for x in regions.content_x..(regions.content_x + regions.content_w).min(w) {
-                let sx = ((x - regions.content_x) as f32 * inv_zoom) as usize;
-                if sx >= page.width {
-                    break; // a stale layout narrower than the area it is sliding into
+        blit_page(
+            &mut buffer,
+            w,
+            h,
+            page,
+            (regions.content_x, regions.content_y, regions.content_w),
+            scroll,
+            zoom,
+        );
+        // The other pane, drawn the same way the focused one just was.
+        if regions.other_w > 0 {
+            if let Some(other) = self.split {
+                let tab = &self.tabs[other];
+                let zoom = tab.zoom_factor();
+                let scroll = tab.scroll_y;
+                if let Some(canvas) = tab.page_canvas.as_ref() {
+                    blit_page(
+                        &mut buffer,
+                        w,
+                        h,
+                        canvas,
+                        (regions.other_x, regions.content_y, regions.other_w),
+                        scroll,
+                        zoom,
+                    );
                 }
-                let px = page.pixels[row + sx];
-                buffer[(y * w + x) as usize] =
-                    (px.r as u32) << 16 | (px.g as u32) << 8 | px.b as u32;
+            }
+            // The divider: a hairline in the gap, so the two pages read as two.
+            let start = regions.divider_x().unwrap_or(0);
+            for y in regions.content_y..h {
+                for x in start..(start + DIVIDER_W).min(w) {
+                    let edge = x == start + DIVIDER_W / 2;
+                    buffer[(y * w + x) as usize] = if edge { 0x3a3d45 } else { CANVAS_RGB };
+                }
             }
         }
         for (canvas, x, y) in &surfaces {
@@ -2263,6 +2491,33 @@ impl App {
 }
 
 /// Copy a rendered surface into the window buffer, clipped at its edges.
+/// Blit a page canvas into one pane: `(x, y, width)` in the window, scrolled and
+/// zoomed. Two panes differ only in where they land and how far each is scrolled.
+fn blit_page(
+    buffer: &mut [u32],
+    w: u32,
+    h: u32,
+    page: &Canvas,
+    (x0, y0, pane_w): (u32, u32, u32),
+    scroll: f32,
+    zoom: f32,
+) {
+    let inv_zoom = 1.0 / zoom;
+    for y in y0..h {
+        let sy = ((y - y0) as f32 + scroll) * inv_zoom;
+        let sy = (sy as usize).min(page.height.saturating_sub(1));
+        let row = sy * page.width;
+        for x in x0..(x0 + pane_w).min(w) {
+            let sx = ((x - x0) as f32 * inv_zoom) as usize;
+            if sx >= page.width {
+                break; // a stale layout narrower than the area it is sliding into
+            }
+            let px = page.pixels[row + sx];
+            buffer[(y * w + x) as usize] = (px.r as u32) << 16 | (px.g as u32) << 8 | px.b as u32;
+        }
+    }
+}
+
 fn blit(buffer: &mut [u32], w: u32, h: u32, canvas: &Canvas, x0: u32, y0: u32) {
     for y in 0..canvas.height.min(h.saturating_sub(y0) as usize) {
         for x in 0..canvas.width.min(w.saturating_sub(x0) as usize) {
@@ -2279,6 +2534,35 @@ mod tests {
 
     fn settings_with(layout: TabLayout, rail: Rail) -> Settings {
         Settings { layout, rail, ..Settings::default() }
+    }
+
+    #[test]
+    fn a_split_divides_the_content_area_between_two_panes() {
+        let settings = settings_with(TabLayout::Vertical, Rail::Hidden);
+        let whole = Regions::settled(1000, 700, settings, false);
+        let left = Regions::split(1000, 700, settings, false, 0, Some(0), 0.5);
+        let right = Regions::split(1000, 700, settings, false, 0, Some(1), 0.5);
+
+        // Every pixel of the content area is one pane, the other, or the divider.
+        assert_eq!(left.content_w + left.other_w + DIVIDER_W, whole.content_w);
+        // The focused side is the one `content_*` describes, and the two views
+        // of the same split agree about where each pane sits.
+        assert_eq!(left.content_x, right.other_x);
+        assert_eq!(left.other_x, right.content_x);
+        assert_eq!(left.divider_x(), right.divider_x());
+        assert!(left.content_x < left.other_x, "pane 0 is the left one");
+
+        // The divider sits exactly between them, touching neither.
+        let gap = left.divider_x().expect("split");
+        assert_eq!(gap, left.content_x + left.content_w);
+        assert_eq!(gap + DIVIDER_W, left.other_x);
+
+        // A dragged divider moves the boundary without changing the total.
+        let dragged = Regions::split(1000, 700, settings, false, 0, Some(0), 0.25);
+        assert!(dragged.content_w < left.content_w);
+        assert_eq!(dragged.content_w + dragged.other_w + DIVIDER_W, whole.content_w);
+        // An unsplit window has no second pane at all.
+        assert_eq!((whole.other_x, whole.other_w), (0, 0));
     }
 
     #[test]

@@ -57,6 +57,7 @@ saved settings.
 | `hover:star` | a control lit, with its tooltip |
 | `search:wiki` | tab search, filtering |
 | `tabs:5` | extra tabs, one of them pinned |
+| `split` | two pages side by side |
 | `railpx:150` | the tab rail caught mid-slide |
 | `layout=horizontal`, `rail=icons`, `zoom=150`, … | any setting |
 
@@ -104,7 +105,7 @@ forms.
 - **JavaScript**: own lexer, parser and interpreter — closures, classes with
   `super`, `try/catch/finally`, regex literals, `setTimeout`, `JSON`, `fetch`
   with promises and `await`, DOM query and mutation, events
-- **Browser**: vertical tabs, session restore, history, bookmarks, find-in-page,
+- **Browser**: vertical tabs, split view, session restore, history, bookmarks, find-in-page,
   form submission and search, an on-device page assistant, an English/Hindi
   interface, and input-method text so Indic scripts can be typed
 - **Privacy**: tracker/ad filtering (Adblock syntax), HTTPS-first, cookies and
