@@ -45,26 +45,22 @@ impl DomView {
     /// Reuses the stylesheet parser, so whatever the cascade understands the
     /// query API understands too.
     ///
-    /// ponytail: simple selectors only (`tag`, `#id`, `.class`, and compounds).
-    /// A combinator like `div p` is dropped by the parser and matches nothing.
+    /// ponytail: no `:hover` (a query has no cursor), and matching is a linear
+    /// scan — `querySelectorAll` on a large document walks every element.
     pub fn query(&self, selector: &str) -> Vec<usize> {
         let sheet = crate::css::parse(format!("{selector} {{}}"));
         let Some(rule) = sheet.rules.first() else {
             return Vec::new();
         };
-        self.elements
-            .iter()
-            .enumerate()
-            .filter(|(i, element)| {
+        (0..self.elements.len())
+            .filter(|i| {
+                let cursor = self.cursor_at(*i);
                 let ancestors = self.ancestors_of(*i);
-                rule.selectors
-                    .iter()
-                    .any(|selector| {
-                        // A script's query has no cursor; `:hover` matches nothing.
-                        crate::style::matches(*element, &ancestors, selector, &Default::default())
-                    })
+                rule.selectors.iter().any(|selector| {
+                    // A script's query has no cursor; `:hover` matches nothing.
+                    crate::style::matches(&cursor, &ancestors, selector, &Default::default())
+                })
             })
-            .map(|(i, _)| i)
             .collect()
     }
 
@@ -72,12 +68,34 @@ impl DomView {
     ///
     /// The snapshot is flat, but each element carries its path from the root, so
     /// an ancestor is exactly an element whose path is a prefix of this one's.
-    fn ancestors_of(&self, index: usize) -> Vec<&ElementInfo> {
-        let path = &self.elements[index].path;
+    fn ancestors_of(&self, index: usize) -> Vec<crate::style::Cursor<'_, ElementInfo>> {
+        let path = self.elements[index].path.clone();
         self.elements
             .iter()
-            .filter(|other| other.path.len() < path.len() && path.starts_with(&other.path))
+            .enumerate()
+            .filter(|(_, other)| other.path.len() < path.len() && path.starts_with(&other.path))
+            .map(|(i, _)| self.cursor_at(i))
             .collect()
+    }
+
+    /// An element together with the siblings a `+` or `~` selector looks back
+    /// through: those sharing its parent path.
+    fn cursor_at(&self, index: usize) -> crate::style::Cursor<'_, ElementInfo> {
+        let path = &self.elements[index].path;
+        let parent = &path[..path.len().saturating_sub(1)];
+        let siblings: Vec<&ElementInfo> = self
+            .elements
+            .iter()
+            .filter(|other| other.path.len() == path.len() && other.path.starts_with(parent))
+            .collect();
+        let at = siblings
+            .iter()
+            .position(|other| other.path == *path)
+            .unwrap_or(0);
+        crate::style::Cursor {
+            siblings: std::rc::Rc::new(siblings),
+            index: at,
+        }
     }
 
     pub fn find_by_tag(&self, tag: &str) -> Vec<usize> {

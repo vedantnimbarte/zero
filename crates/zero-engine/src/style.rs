@@ -139,6 +139,45 @@ impl Matchable for ElementData {
     }
 }
 
+/// An element as the matcher sees it: itself, plus the siblings it sits among,
+/// which is what `+` and `~` look back through.
+///
+/// The sibling list is shared by every child of one parent, so building the
+/// context for a whole tree costs one allocation per parent, not per element.
+pub struct Cursor<'a, E> {
+    pub siblings: std::rc::Rc<Vec<&'a E>>,
+    pub index: usize,
+}
+
+// Cloning shares the sibling list; the elements themselves need not be Clone,
+// which `derive` would insist on.
+impl<'a, E> Clone for Cursor<'a, E> {
+    fn clone(&self) -> Cursor<'a, E> {
+        self.at(self.index)
+    }
+}
+
+impl<'a, E> Cursor<'a, E> {
+    /// A lone element with no siblings — what an unattached subtree looks like.
+    pub fn only(elem: &'a E) -> Cursor<'a, E> {
+        Cursor {
+            siblings: std::rc::Rc::new(vec![elem]),
+            index: 0,
+        }
+    }
+
+    pub fn elem(&self) -> &'a E {
+        self.siblings[self.index]
+    }
+
+    fn at(&self, index: usize) -> Cursor<'a, E> {
+        Cursor {
+            siblings: std::rc::Rc::clone(&self.siblings),
+            index,
+        }
+    }
+}
+
 /// Match a selector chain against an element, given its ancestors (root first).
 ///
 /// Matching runs right to left: check the subject, then walk up looking for the
@@ -149,8 +188,8 @@ impl Matchable for ElementData {
 /// pathological selector is quadratic in depth. Real sheets are two or three
 /// compounds deep; an ancestor bloom filter is the fix if it ever bites.
 pub fn matches<E: Matchable>(
-    elem: &E,
-    ancestors: &[&E],
+    elem: &Cursor<E>,
+    ancestors: &[Cursor<E>],
     selector: &Selector,
     hovered: &HoverChain,
 ) -> bool {
@@ -162,13 +201,13 @@ pub fn matches<E: Matchable>(
 pub type HoverChain = std::collections::HashSet<usize>;
 
 fn matches_chain<E: Matchable>(
-    elem: &E,
-    ancestors: &[&E],
+    cursor: &Cursor<E>,
+    ancestors: &[Cursor<E>],
     parts: &[SelectorPart],
     hovered: &HoverChain,
 ) -> bool {
     let Some((subject, rest)) = parts.split_last() else { return true };
-    if !matches_simple_selector(elem, &subject.simple, hovered) {
+    if !matches_simple_selector(cursor.elem(), &subject.simple, hovered) {
         return false;
     }
     if rest.is_empty() {
@@ -176,13 +215,21 @@ fn matches_chain<E: Matchable>(
     }
     match subject.combinator {
         Combinator::Child => match ancestors.split_last() {
-            Some((parent, above)) => matches_chain(*parent, above, rest, hovered),
+            Some((parent, above)) => matches_chain(parent, above, rest, hovered),
             None => false,
         },
         // Any ancestor may satisfy the rest of the chain; try the nearest first.
         Combinator::Descendant => (0..ancestors.len())
             .rev()
-            .any(|i| matches_chain(ancestors[i], &ancestors[..i], rest, hovered)),
+            .any(|i| matches_chain(&ancestors[i], &ancestors[..i], rest, hovered)),
+        // Siblings share this element's ancestors, so the chain above is unchanged.
+        Combinator::NextSibling => match cursor.index {
+            0 => false,
+            i => matches_chain(&cursor.at(i - 1), ancestors, rest, hovered),
+        },
+        Combinator::LaterSibling => (0..cursor.index)
+            .rev()
+            .any(|i| matches_chain(&cursor.at(i), ancestors, rest, hovered)),
     }
 }
 
@@ -306,42 +353,43 @@ impl RuleIndex {
 type MatchedRule<'a> = (Specificity, usize, &'a Rule);
 
 fn match_rule<'a>(
-    elem: &ElementData,
-    ancestors: &[&ElementData],
+    cursor: &Cursor<ElementData>,
+    ancestors: &[Cursor<ElementData>],
     rule: &'a Rule,
     order: usize,
     hovered: &HoverChain,
 ) -> Option<MatchedRule<'a>> {
     rule.selectors
         .iter()
-        .find(|selector| matches(elem, ancestors, selector, hovered))
+        .find(|selector| matches(cursor, ancestors, selector, hovered))
         .map(|selector| (selector.specificity(), order, rule))
 }
 
 fn matching_rules<'a>(
-    elem: &ElementData,
-    ancestors: &[&ElementData],
+    cursor: &Cursor<ElementData>,
+    ancestors: &[Cursor<ElementData>],
     stylesheet: &'a Stylesheet,
     index: &RuleIndex,
     hovered: &HoverChain,
 ) -> Vec<MatchedRule<'a>> {
+    let elem = cursor.elem();
     let classes: Vec<&str> = elem.classes().into_iter().collect();
     index
         .candidates(elem, &classes)
         .into_iter()
-        .filter_map(|i| match_rule(elem, ancestors, &stylesheet.rules[i], i, hovered))
+        .filter_map(|i| match_rule(cursor, ancestors, &stylesheet.rules[i], i, hovered))
         .collect()
 }
 
 fn specified_values(
-    elem: &ElementData,
-    ancestors: &[&ElementData],
+    cursor: &Cursor<ElementData>,
+    ancestors: &[Cursor<ElementData>],
     stylesheet: &Stylesheet,
     index: &RuleIndex,
     hovered: &HoverChain,
 ) -> PropertyMap {
-    let mut values = presentation_hints(elem);
-    let mut rules = matching_rules(elem, ancestors, stylesheet, index, hovered);
+    let mut values = presentation_hints(cursor.elem());
+    let mut rules = matching_rules(cursor, ancestors, stylesheet, index, hovered);
     // Apply low specificity first so high specificity overrides it, and let
     // document order settle ties.
     rules.sort_by(|&(a, ai, _), &(b, bi, _)| a.cmp(&b).then(ai.cmp(&bi)));
@@ -477,7 +525,8 @@ fn resolve_vars(values: &mut PropertyMap, vars: &PropertyMap) {
 
 /// Properties that flow from parent to child when the child doesn't set them.
 /// Text nodes have no rules of their own, so this is how they get color/size.
-const INHERITED_PROPERTIES: [&str; 4] = ["color", "font-size", "text-align", "white-space"];
+const INHERITED_PROPERTIES: [&str; 5] =
+    ["color", "font-size", "text-align", "white-space", "visibility"];
 
 pub fn style_tree<'a>(root: &'a Node, stylesheet: &'a Stylesheet) -> StyledNode<'a> {
     style_tree_with_hover(root, stylesheet, &HoverChain::new())
@@ -501,8 +550,13 @@ pub fn style_tree_indexed<'a>(
     index: &RuleIndex,
     hovered: &HoverChain,
 ) -> StyledNode<'a> {
+    let cursor = match root.node_type {
+        NodeType::Element(ref elem) => Some(Cursor::only(elem)),
+        NodeType::Text(_) => None,
+    };
     style_tree_inner(
         root,
+        cursor,
         stylesheet,
         index,
         &HashMap::new(),
@@ -514,18 +568,17 @@ pub fn style_tree_indexed<'a>(
 
 fn style_tree_inner<'a>(
     root: &'a Node,
+    cursor: Option<Cursor<'a, ElementData>>,
     stylesheet: &'a Stylesheet,
     index: &RuleIndex,
     inherited: &PropertyMap,
     inherited_vars: &std::rc::Rc<PropertyMap>,
-    ancestors: &mut Vec<&'a ElementData>,
+    ancestors: &mut Vec<Cursor<'a, ElementData>>,
     hovered: &HoverChain,
 ) -> StyledNode<'a> {
-    let mut specified = match root.node_type {
-        NodeType::Element(ref elem) => {
-            specified_values(elem, ancestors, stylesheet, index, hovered)
-        }
-        NodeType::Text(_) => HashMap::new(),
+    let mut specified = match cursor {
+        Some(ref cursor) => specified_values(cursor, ancestors, stylesheet, index, hovered),
+        None => HashMap::new(),
     };
     for prop in INHERITED_PROPERTIES {
         if !specified.contains_key(prop) {
@@ -567,17 +620,41 @@ fn style_tree_inner<'a>(
     };
     specified.insert("font-size".to_string(), Value::Length(font_px, Unit::Px));
     // Children see this element as their nearest ancestor.
-    if let NodeType::Element(ref elem) = root.node_type {
-        ancestors.push(elem);
+    if let Some(ref cursor) = cursor {
+        ancestors.push(cursor.clone());
     }
+    // One sibling list, shared by every child, so `+` and `~` can look back
+    // without the walk allocating per element.
+    let siblings = std::rc::Rc::new(
+        root.children
+            .iter()
+            .filter_map(|child| match child.node_type {
+                NodeType::Element(ref elem) => Some(elem),
+                NodeType::Text(_) => None,
+            })
+            .collect::<Vec<&ElementData>>(),
+    );
+    let mut nth = 0;
     let children: Vec<StyledNode> = root
         .children
         .iter()
         .map(|child| {
-            style_tree_inner(child, stylesheet, index, &specified, &vars, ancestors, hovered)
+            let cursor = match child.node_type {
+                NodeType::Element(_) => {
+                    nth += 1;
+                    Some(Cursor {
+                        siblings: std::rc::Rc::clone(&siblings),
+                        index: nth - 1,
+                    })
+                }
+                NodeType::Text(_) => None,
+            };
+            style_tree_inner(
+                child, cursor, stylesheet, index, &specified, &vars, ancestors, hovered,
+            )
         })
         .collect();
-    if matches!(root.node_type, NodeType::Element(_)) {
+    if cursor.is_some() {
         ancestors.pop();
     }
     StyledNode {
@@ -727,6 +804,31 @@ mod tests {
         assert_eq!(cards[1].value("color"), Some(green));
         // With no fallback the declaration is dropped, not left as raw text.
         assert_eq!(cards[2].value("color"), None);
+    }
+
+    #[test]
+    fn sibling_combinators_look_back_along_the_row() {
+        let html = "<div><h2>a</h2><p>b</p><p>c</p><span>d</span></div>";
+        let colored = |css: &str| {
+            let dom = crate::html::parse(html.to_string());
+            let sheet = crate::css::parse(css.to_string());
+            let styled = style_tree(&dom, &sheet);
+            elements(&styled)
+                .iter()
+                .map(|c| c.value("color").is_some())
+                .collect::<Vec<bool>>()
+        };
+
+        // `+` is the element immediately after; `~` is any element after.
+        assert_eq!(colored("h2 + p { color: red; }"), [false, true, false, false]);
+        assert_eq!(colored("h2 ~ p { color: red; }"), [false, true, true, false]);
+        // The chain above the sibling still has to hold.
+        assert_eq!(
+            colored("main h2 + p { color: red; }"),
+            [false, false, false, false]
+        );
+        // Nothing precedes the first child.
+        assert_eq!(colored("p + h2 { color: red; }"), [false, false, false, false]);
     }
 
     #[test]

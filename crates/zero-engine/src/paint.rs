@@ -415,11 +415,111 @@ fn highlight_rects(list: &DisplayList, query: &str) -> Vec<Rect> {
 
 fn build_display_list(layout_root: &LayoutBox) -> DisplayList {
     let mut list = Vec::new();
-    render_layout_box(&mut list, layout_root);
+    render_layout_box(&mut list, layout_root, UNCLIPPED);
     list
 }
 
-fn render_layout_box(list: &mut DisplayList, layout_box: &LayoutBox) {
+/// A clip large enough to hold any page, so the root needs no special case.
+const UNCLIPPED: Rect = Rect {
+    x: -1.0e7,
+    y: -1.0e7,
+    width: 2.0e7,
+    height: 2.0e7,
+};
+
+/// The overlap of two rects, or `None` when they miss each other.
+fn intersect(a: Rect, b: Rect) -> Option<Rect> {
+    let x = a.x.max(b.x);
+    let y = a.y.max(b.y);
+    let right = (a.x + a.width).min(b.x + b.width);
+    let bottom = (a.y + a.height).min(b.y + b.height);
+    match right > x && bottom > y {
+        true => Some(Rect {
+            x,
+            y,
+            width: right - x,
+            height: bottom - y,
+        }),
+        false => None,
+    }
+}
+
+/// Trim one command to a clip rect, dropping it if nothing is left.
+///
+/// ponytail: text is kept or dropped whole. A word straddling the clip edge is
+/// drawn in full, which needs a per-glyph clip in the rasterizer to fix — and
+/// the common case, a box collapsed to `height: 0`, drops everything cleanly.
+fn clip_command(item: DisplayCommand, clip: Rect) -> Option<DisplayCommand> {
+    Some(match item {
+        DisplayCommand::SolidColor(color, rect) => {
+            DisplayCommand::SolidColor(color, intersect(rect, clip)?)
+        }
+        // Trimming a rounded box would square off the corner that survives, so
+        // it is kept whole unless the clip removes it entirely.
+        DisplayCommand::RoundedColor(color, rect, radius) => {
+            intersect(rect, clip)?;
+            DisplayCommand::RoundedColor(color, rect, radius)
+        }
+        DisplayCommand::Image(src, rect) => DisplayCommand::Image(src, intersect(rect, clip)?),
+        DisplayCommand::Text(frag) => {
+            let rect = Rect {
+                x: frag.x,
+                y: frag.y,
+                width: frag.width,
+                height: frag.size * 1.25,
+            };
+            intersect(rect, clip)?;
+            DisplayCommand::Text(frag)
+        }
+        other => other,
+    })
+}
+
+/// The clip a box imposes on its descendants: its padding box, when `overflow`
+/// says content may not escape it.
+fn child_clip(layout_box: &LayoutBox, clip: Rect) -> Option<Rect> {
+    let style = match layout_box.box_type {
+        BoxType::BlockNode(s) | BoxType::InlineNode(s) => s,
+        BoxType::AnonymousBlock => return Some(clip),
+    };
+    let overflow = match style.value("overflow") {
+        Some(Value::Keyword(k)) => k,
+        Some(Value::Raw(raw)) => raw.split_whitespace().next()?.to_string(),
+        _ => return Some(clip),
+    };
+    match overflow.as_str() {
+        // No scrollbars: a scrollable box shows its first screenful, which is
+        // what a collapsed menu or a clipped banner needs.
+        "hidden" | "clip" | "auto" | "scroll" => intersect(layout_box.dimensions.padding_box(), clip),
+        _ => Some(clip),
+    }
+}
+
+/// `visibility: hidden` — the box and its text are not painted, though a
+/// descendant that sets `visibility: visible` still is.
+fn is_invisible(layout_box: &LayoutBox) -> bool {
+    let style = match layout_box.box_type {
+        BoxType::BlockNode(s) | BoxType::InlineNode(s) => s,
+        BoxType::AnonymousBlock => return false,
+    };
+    matches!(style.value("visibility"), Some(Value::Keyword(ref k)) if k == "hidden" || k == "collapse")
+}
+
+fn render_layout_box(list: &mut DisplayList, layout_box: &LayoutBox, clip: Rect) {
+    if !is_invisible(layout_box) {
+        let mut own = Vec::new();
+        render_own(&mut own, layout_box);
+        list.extend(own.into_iter().filter_map(|item| clip_command(item, clip)));
+    }
+    // An empty clip still has to be handed down: a child of a hidden box is
+    // hidden too, however visible it declares itself.
+    let inner = child_clip(layout_box, clip).unwrap_or(Rect::default());
+    for child in &layout_box.children {
+        render_layout_box(list, child, inner);
+    }
+}
+
+fn render_own(list: &mut DisplayList, layout_box: &LayoutBox) {
     render_shadow(list, layout_box);
     render_background(list, layout_box);
     render_borders(list, layout_box);
@@ -467,9 +567,6 @@ fn render_layout_box(list: &mut DisplayList, layout_box: &LayoutBox) {
     // Text sits above this box's background/borders.
     for frag in &layout_box.text_fragments {
         list.push(DisplayCommand::Text(frag.clone()));
-    }
-    for child in &layout_box.children {
-        render_layout_box(list, child);
     }
 }
 
@@ -680,7 +777,16 @@ fn render_borders(list: &mut DisplayList, layout_box: &LayoutBox) {
 fn canvas_background(root: &LayoutBox) -> Option<Color> {
     let of =
         |b: &LayoutBox| get_color(b, "background").or_else(|| get_color(b, "background-color"));
-    of(root).or_else(|| root.children.iter().find_map(of))
+    // Only `<body>` inherits this privilege. Taking it from whichever child
+    // happened to have a background flooded the page with, say, a hidden
+    // dropdown's colour.
+    let body = root
+        .children
+        .iter()
+        .find(|child| matches!(child.box_type,
+            BoxType::BlockNode(s) | BoxType::InlineNode(s)
+                if matches!(&s.node.node_type, NodeType::Element(e) if e.tag_name == "body")));
+    of(root).or_else(|| body.and_then(of))
 }
 
 fn get_color(layout_box: &LayoutBox, name: &str) -> Option<Color> {

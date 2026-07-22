@@ -84,14 +84,16 @@ directly for anyone who wants the change to be instant.
 
 ## What works today
 
-The engine renders real sites — Hacker News and DuckDuckGo results render close to
-correctly, including their own stylesheets, tables and forms.
+The engine renders real sites — Hacker News, DuckDuckGo results and Wikipedia
+articles render close to correctly, including their own stylesheets, tables and
+forms.
 
 - **HTML**: tolerant parser, character references, raw-text and void elements
-- **CSS**: external `<link>` sheets and `@import`, `@media` (type + width), descendant/child
-  selectors, attribute selectors (`[type=text]`, `~=`, `^=`, `$=`, `*=`),
+- **CSS**: external `<link>` sheets and `@import`, `@media` (type + width),
+  descendant/child/sibling selectors (`div p`, `>`, `+`, `~`),
+  attribute selectors (`[type=text]`, `~=`, `^=`, `$=`, `*=`),
   pseudo-classes (`:hover`, `:nth-child()`, `:first-child`, `:not()`, `:checked`),
-  custom properties (`var()`, defined on `:root`), the cascade with specificity, HTML presentation attributes (`bgcolor`, `width`, `align`),
+  `visibility`, `overflow` clipping, custom properties (`var()`, defined on `:root`), the cascade with specificity, HTML presentation attributes (`bgcolor`, `width`, `align`),
   named colours, `rgb()`/`hsl()`, alpha
 - **Layout**: block, inline, inline-block, flex (wrap/grow/justify/align), grid
   (`repeat()`, `fr`, `minmax()`, spans, named areas), tables (colspan/rowspan),

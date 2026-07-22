@@ -43,6 +43,10 @@ pub enum Combinator {
     Descendant,
     /// `>`: the immediate parent.
     Child,
+    /// `+`: the element immediately before it.
+    NextSibling,
+    /// `~`: any element before it, under the same parent.
+    LaterSibling,
 }
 
 #[derive(Debug, PartialEq)]
@@ -286,6 +290,8 @@ const RAW_VALUE_PROPERTIES: &[&str] = &[
     "grid-template",
     "box-shadow",
     "background-image",
+    // `overflow: hidden auto` sets the two axes at once.
+    "overflow",
 ];
 
 /// The named colours worth carrying, plus `transparent`.
@@ -650,10 +656,14 @@ impl Parser {
                 self.consume_whitespace();
                 let spaced = self.pos > start;
                 let combinator = match self.next_char_or('\0') {
-                    '>' => {
+                    c @ ('>' | '+' | '~') => {
                         self.consume_char();
                         self.consume_whitespace();
-                        Combinator::Child
+                        match c {
+                            '>' => Combinator::Child,
+                            '+' => Combinator::NextSibling,
+                            _ => Combinator::LaterSibling,
+                        }
                     }
                     ',' | '{' | '\0' => break,
                     // A space then another compound is a descendant selector.

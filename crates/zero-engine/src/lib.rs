@@ -1120,6 +1120,32 @@ mod tests {
         assert_eq!(canvas.pixels.len(), 40 * 30);
     }
 
+    #[test]
+    fn overflow_clips_and_visibility_hides() {
+        let engine = super::Engine::shapes_only();
+        let canvas = engine.render(
+            "<body><div id=\"clip\"><div id=\"big\"></div></div>\
+             <div id=\"ghost\"></div></body>",
+            "#clip { width: 40px; height: 10px; overflow: hidden; }
+             #big { width: 40px; height: 100px; background: #ff0000; }
+             #ghost { width: 40px; height: 10px; background: #00ff00;
+                      visibility: hidden; }",
+            60.0,
+            60.0,
+        );
+        let at = |x: usize, y: usize| canvas.pixels[y * canvas.width + x];
+        let rgb = |c: crate::css::Color| (c.r, c.g, c.b);
+        const WHITE: (u8, u8, u8) = (255, 255, 255);
+
+        // The tall child paints inside its clipping parent...
+        assert_eq!(rgb(at(5, 5)), (255, 0, 0));
+        // ...and nowhere below it, though the box itself is 100px tall.
+        assert_eq!(rgb(at(5, 12)), WHITE);
+        assert_eq!(rgb(at(5, 50)), WHITE);
+        // A hidden box leaves no colour where it sits (y 10..20).
+        assert_eq!(rgb(at(5, 15)), WHITE);
+    }
+
     /// A search box: type into a field nested inside the form, press Enter.
     #[test]
     fn submitting_a_field_builds_a_get_query() {
