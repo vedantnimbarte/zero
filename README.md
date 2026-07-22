@@ -43,6 +43,8 @@ cargo run -- --png examples/x.html out.png # render just the page
 cargo run -- --png page.html out.png rust  # …and highlight a find-in-page query
 cargo run -- --ai https://…                # print the on-device page summary
 cargo run -- --history                     # dump stored history
+cargo run -- --export bundle.zero          # seal this space, print the code
+cargo run -- --import bundle.zero <code>   # restore it on another machine
 ```
 
 `--shot` takes an optional `WxH` and then any number of **poses**, which put the
@@ -71,6 +73,12 @@ saved settings.
 
 **Built-in pages:** `zero://newtab`, `zero://history`, `zero://bookmarks`,
 `zero://downloads`, `zero://settings`.
+
+**Sync** is a file, not a service. `--export` seals the current space with a
+fresh 32-byte code and prints it once; `--import` opens it on another machine.
+Put the bundle in any folder your existing sync tool watches — the code never
+leaves your hands, so where it lives is nobody's business. Importing replaces
+the space's files rather than merging them.
 
 **Spaces** are separate profiles in one browser — their own tabs, history,
 cookies, `localStorage`, downloads, settings and encryption key, because a space

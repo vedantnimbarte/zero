@@ -36,6 +36,23 @@ pub fn key_origin() -> &'static str {
     backend::ORIGIN
 }
 
+/// Seal data under a key the caller holds, rather than one the OS holds.
+///
+/// At-rest encryption ties data to this machine on purpose; a sync bundle must
+/// travel, so its key travels with the person instead. Same cipher either way.
+pub fn seal_with(key: &[u8; 32], data: &[u8]) -> Option<Vec<u8>> {
+    cipher::seal(key, data)
+}
+
+pub fn open_with(key: &[u8; 32], data: &[u8]) -> Option<Vec<u8>> {
+    cipher::open(key, data)
+}
+
+/// 32 fresh random bytes, for a key that is written down rather than stored.
+pub fn fresh_key() -> Option<[u8; 32]> {
+    cipher::random()
+}
+
 /// Encrypt `data` for storage. Falls back to the input unchanged where the
 /// platform has no backend, so callers never have to branch.
 pub fn protect(data: &[u8]) -> Vec<u8> {
@@ -282,7 +299,6 @@ mod backend {
 /// Compiled on every platform even though Windows seals with DPAPI instead: a
 /// cipher only exercised on machines the author cannot test on is a cipher
 /// nobody has tested.
-#[cfg_attr(windows, allow(dead_code))] // DPAPI seals there; only the tests seal here
 mod cipher {
     use aes_gcm::aead::{Aead, KeyInit};
     use aes_gcm::{Aes256Gcm, Nonce};
@@ -308,10 +324,17 @@ mod cipher {
             .ok()
     }
 
-    #[cfg(unix)]
     fn nonce() -> Option<[u8; NONCE_LEN]> {
+        let key = random()?;
+        key[..NONCE_LEN].try_into().ok()
+    }
+
+    /// 32 bytes from the OS. Used for nonces and for sync keys, which is the
+    /// whole reason this is not a dependency: both callers want the same thing.
+    #[cfg(unix)]
+    pub fn random() -> Option<[u8; 32]> {
         use std::io::Read;
-        let mut bytes = [0u8; NONCE_LEN];
+        let mut bytes = [0u8; 32];
         std::fs::File::open("/dev/urandom")
             .ok()?
             .read_exact(&mut bytes)
@@ -319,14 +342,12 @@ mod cipher {
             .map(|_| bytes)
     }
 
-    /// Windows never seals with this cipher, but its tests do, and they need a
-    /// nonce like any other caller.
     #[cfg(windows)]
-    fn nonce() -> Option<[u8; NONCE_LEN]> {
+    pub fn random() -> Option<[u8; 32]> {
         use windows_sys::Win32::Security::Cryptography::{
             BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
         };
-        let mut bytes = [0u8; NONCE_LEN];
+        let mut bytes = [0u8; 32];
         // SAFETY: the buffer is exactly the length passed, and the call only
         // writes into it.
         let status = unsafe {

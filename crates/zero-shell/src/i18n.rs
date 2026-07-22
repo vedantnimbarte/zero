@@ -95,6 +95,11 @@ const HINDI: &[(&str, &str)] = &[
     ("Not available on this system", "इस प्रणाली पर उपलब्ध नहीं"),
     ("Profile folder", "प्रोफ़ाइल फ़ोल्डर"),
     ("Where history, bookmarks and this file live", "इतिहास, सहेजे पृष्ठ और यह फ़ाइल यहाँ रहते हैं"),
+    ("Sync", "समन्वय"),
+    (
+        "One sealed file and a code that opens it. Put the file wherever you like — there is no server",
+        "एक बंद फ़ाइल और उसे खोलने वाला कोड। फ़ाइल जहाँ चाहें रखें — कोई सर्वर नहीं है",
+    ),
     ("Source", "स्रोत"),
     ("Zero is open source, Apache-2.0", "ज़ीरो मुक्त स्रोत है, Apache-2.0"),
     // Option labels

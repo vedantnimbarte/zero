@@ -26,6 +26,7 @@ mod net;
 mod settings;
 mod spaces;
 mod storage;
+mod sync;
 
 use ai::Assistant;
 use net::{is_url, load_target, ShellLoader};
@@ -44,6 +45,45 @@ fn main() {
             println!("{}	{}	{}", visit.when, visit.url, visit.title);
         }
         return;
+    }
+    // Sync is a file, not a service: one sealed bundle, and a code to open it.
+    match args.first().map(String::as_str) {
+        Some("--export") => {
+            let path = args
+                .get(1)
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(sync::default_path);
+            match sync::export(&path) {
+                Ok(code) => println!(
+                    "Exported this space to {}\n\nCode: {code}\n\n\
+                     Keep it: the bundle cannot be read without it, and it is not \
+                     stored anywhere.",
+                    path.display()
+                ),
+                Err(why) => eprintln!("export failed: {why}"),
+            }
+            return;
+        }
+        Some("--import") => {
+            let path = args
+                .get(1)
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(sync::default_path);
+            let code = match args.get(2) {
+                Some(code) => code.clone(),
+                None => {
+                    eprintln!("usage: zero --import <file> <code>");
+                    return;
+                }
+            };
+            match sync::import(&path, &code) {
+                Ok(1) => println!("Restored 1 file into this space."),
+                Ok(count) => println!("Restored {count} files into this space."),
+                Err(why) => eprintln!("import failed: {why}"),
+            }
+            return;
+        }
+        _ => {}
     }
     let png_mode = args.first().map(|a| a == "--png").unwrap_or(false);
     // Like --png, but captures the whole browser window instead of just the page.
