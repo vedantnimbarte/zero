@@ -18,4 +18,4 @@ fontdue = "0.9"
 rustybuzz = "0.20"
 # Decoding content images (<img>) is core rendering too — like fonts. The embedder
 # still fetches the bytes; the engine decodes them. (Output PNG encoding stays in the shell.)
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "ico"] }
