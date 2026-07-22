@@ -353,7 +353,7 @@ fn settings_page() -> String {
          <div class=\"sec\">{appearance}</div>{}{}{}{}{}{}\
          <div class=\"sec\">{search}</div>{}\
          <div class=\"sec\">{privacy}</div>{}{}\
-         <div class=\"sec\">{about}</div>{}{}{}",
+         <div class=\"sec\">{about}</div>{}{}{}{}",
         setting_t("Tab layout", "A rail down the side, or a strip across the top", &layout),
         setting_t("Tab rail", "How much of the vertical rail stays open", &rail),
         setting_t("Page zoom", "The size new tabs open at. Ctrl+= and Ctrl+- change one tab", &zoom),
@@ -377,6 +377,17 @@ fn settings_page() -> String {
         ),
         setting_t("Engine", "HTML, CSS and JavaScript, written from scratch in Rust",
             "<span class=\"fact\">Zero 0.1.0</span>"),
+        setting_t(
+            "Encryption at rest",
+            "Where the key that protects this profile is kept",
+            &format!(
+                "<span class=\"fact\">{}</span>",
+                escape(&match crate::crypto::is_available() {
+                    true => crate::crypto::key_origin().to_string(),
+                    false => t("Not available on this system").to_string(),
+                })
+            ),
+        ),
         setting_t("Profile folder", "Where history, bookmarks and this file live",
             &format!("<span class=\"fact\">{}</span>", escape(&profile))),
         setting_t("Source", "Zero is open source, Apache-2.0",

@@ -17,6 +17,7 @@ softbuffer = "0.4"
 image = { version = "0.25", default-features = false, features = ["png"] }
 # HTTP(S) fetching. ureq wraps rustls (TLS) + HTTP — infra, like fontdue for fonts.
 ureq = "2"
+aes-gcm = { version = "0.11.0", default-features = false, features = ["aes", "alloc"] }
 
 # Encryption at rest uses the OS data-protection API rather than a key we manage.
 [target.'cfg(windows)'.dependencies]

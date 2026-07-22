@@ -110,8 +110,9 @@ forms.
   form submission and search, an on-device page assistant, an English/Hindi
   interface, and input-method text so Indic scripts can be typed
 - **Privacy**: tracker/ad filtering (Adblock syntax), HTTPS-first, cookies and
-  `localStorage` partitioned per site, profile data encrypted at rest (DPAPI on
-  Windows; macOS and Linux backends are still to come)
+  `localStorage` partitioned per site, profile data encrypted at rest on all
+  three platforms — DPAPI on Windows, AES-256-GCM under a Keychain or Secret
+  Service key elsewhere
 
 **Known limits.** A pseudo-class the engine cannot honour exactly (`::before`,
 `:has()`) still takes its rule with it, rather than being misapplied. Text does
