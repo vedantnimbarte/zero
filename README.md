@@ -39,7 +39,7 @@ cargo run -- examples/flex.html            # open a local file
 
 cargo run -- --shot https://… out.png      # screenshot the whole window, headless
 cargo run -- --shot page.html out.png 1280x800 menu tabs:4   # …posed (see below)
-cargo run -- --png examples/x.html out.png # render just the page
+cargo run -- --png examples/x.html out.png # render the page in a renderer process
 cargo run -- --png page.html out.png rust  # …and highlight a find-in-page query
 cargo run -- --ai https://…                # print the on-device page summary
 cargo run -- --history                     # dump stored history
@@ -127,6 +127,11 @@ forms.
 - **Browser**: vertical tabs, split view, spaces (separate profiles), session restore, history, bookmarks, find-in-page,
   form submission and search, an on-device page assistant, an English/Hindi
   interface, and input-method text so Indic scripts can be typed
+- **Process model**: startup mitigations (no dynamic code, no injected
+  extensions, strict handles); `--png` renders page content in a separate,
+  privilege-dropped process with no network of its own — it asks the parent to
+  fetch, which keeps cookies on the trusted side. Interactive tabs still render
+  in-process
 - **Privacy**: tracker/ad filtering (Adblock syntax), HTTPS-first, cookies and
   `localStorage` partitioned per site, profile data encrypted at rest on all
   three platforms — DPAPI on Windows, AES-256-GCM under a Keychain or Secret

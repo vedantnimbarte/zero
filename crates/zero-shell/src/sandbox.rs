@@ -23,6 +23,20 @@ pub fn harden() {
     backend::harden();
 }
 
+/// Give up every privilege on this process's token.
+///
+/// The renderer calls this before it reads anything a website sent. A token
+/// with no privileges cannot debug another process, load a driver, or take
+/// ownership of a file it was not given — none of which a page renderer has
+/// any use for.
+///
+/// ponytail: privileges are not the whole token. Closing the *filesystem* to
+/// the child needs a restricted token or an AppContainer SID, which is the
+/// next increment; this removes what can be removed in one call.
+pub fn drop_privileges() {
+    backend::drop_privileges();
+}
+
 /// A one-line description for the settings page, so the limits are visible
 /// rather than implied.
 pub fn describe() -> &'static str {
@@ -54,6 +68,33 @@ mod backend {
         }
     }
 
+    pub fn drop_privileges() {
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows_sys::Win32::Security::{
+            AdjustTokenPrivileges, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES,
+        };
+        use windows_sys::Win32::System::Threading::OpenProcessToken;
+
+        let mut token: HANDLE = std::ptr::null_mut();
+        // SAFETY: `token` is written only on success, and closed exactly once.
+        unsafe {
+            if OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &mut token) == 0 {
+                return;
+            }
+            // An empty privilege set with DISABLE_MAX_PRIVILEGE drops them all.
+            let mut empty: TOKEN_PRIVILEGES = std::mem::zeroed();
+            AdjustTokenPrivileges(
+                token,
+                1, // DisableAllPrivileges
+                &mut empty,
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            CloseHandle(token);
+        }
+    }
+
     pub fn harden() {
         let _ = GetCurrentProcess; // documents the target: this process, always
 
@@ -76,4 +117,6 @@ mod backend {
     pub const DESCRIPTION: &str = "No process mitigations on this platform yet";
 
     pub fn harden() {}
+
+    pub fn drop_privileges() {}
 }

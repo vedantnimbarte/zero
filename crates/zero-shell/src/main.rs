@@ -23,16 +23,17 @@ mod i18n;
 mod internal;
 mod localstore;
 mod net;
+mod renderer;
 mod sandbox;
 mod settings;
 mod spaces;
 mod storage;
 mod sync;
+mod wire;
 
 use ai::Assistant;
 use net::{is_url, load_target, ShellLoader};
 use std::fs;
-use zero_engine::Engine;
 
 fn main() {
     // Before a byte of anything a website sent is parsed: narrow what this
@@ -45,6 +46,12 @@ fn main() {
         eprintln!("note: no data-protection backend on this platform; profile data is stored in the clear");
     }
     let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // Started as a renderer: answer one request from the pipe and exit. This is
+    // never reached in the browser process.
+    if args.first().map(|a| a == "--render-worker").unwrap_or(false) {
+        renderer::serve();
+        return;
+    }
     if args.first().map(|a| a == "--history").unwrap_or(false) {
         for visit in storage::load_history() {
             println!("{}	{}	{}", visit.when, visit.url, visit.title);
@@ -172,7 +179,7 @@ fn main() {
         let out_path = args.next().unwrap_or_else(|| "output.png".into());
         // A trailing argument is a find-in-page query, so highlighting can be
         // eyeballed headlessly.
-        render_to_png(&engine, &html, &css, &out_path, &address, args.next());
+        render_to_png(&html, &css, &out_path, &address, args.next());
     } else if restore_session {
         // No target given: pick up where the last session left off.
         if !app::run_window_restoring_session(engine) {
@@ -184,29 +191,28 @@ fn main() {
     }
 }
 
-fn render_to_png(
-    engine: &Engine,
-    html: &str,
-    css: &str,
-    out_path: &str,
-    base: &str,
-    find: Option<String>,
-) {
+/// Render a page to a PNG — in a **renderer process**, not this one.
+///
+/// This is the path where a page is opened, drawn once and finished with, so
+/// nothing has to survive the exchange and the content never touches the
+/// process holding the profile. The window still renders in-process; that
+/// protocol is the next increment (see `renderer`'s note).
+fn render_to_png(html: &str, css: &str, out_path: &str, base: &str, find: Option<String>) {
     let loader = ShellLoader::new(base.to_string());
-    let mut doc = zero_engine::Document::load_with(html, css, std::rc::Rc::new(loader));
-    doc.set_find(find);
-    let loader = ShellLoader::new(base.to_string());
-    let page = engine.render_document(&mut doc, 800.0, 600.0, &loader);
-    if !page.find_matches.is_empty() {
-        println!("{} matches highlighted", page.find_matches.len());
-    }
-    for line in &page.console {
-        eprintln!("[js] {line}");
-    }
-    let canvas = page.canvas;
-    let buffer: Vec<u8> = canvas.pixels.iter().flat_map(|c| [c.r, c.g, c.b, c.a]).collect();
-    let img = image::RgbaImage::from_raw(canvas.width as u32, canvas.height as u32, buffer)
-        .expect("pixel buffer size mismatch");
+    let Some(frame) = renderer::render_in_child(
+        html,
+        css,
+        800.0,
+        600.0,
+        find.as_deref(),
+        &loader,
+    ) else {
+        eprintln!("the renderer process did not answer");
+        return;
+    };
+    let img =
+        image::RgbaImage::from_raw(frame.width as u32, frame.height as u32, frame.pixels)
+            .expect("pixel buffer size mismatch");
     img.save(out_path).expect("could not write PNG");
-    println!("Rendered -> {out_path} ({}x{})", canvas.width, canvas.height);
+    println!("Rendered -> {out_path} ({}x{})", frame.width, frame.height);
 }
