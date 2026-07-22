@@ -3,19 +3,34 @@
 **Version:** 0.2
 **Last updated:** 2026-07-22
 
-> **Where it stands.** Phase 0 and Phase 1 are done on the engine and product
-> side, minus the multi-process shell (see below), and several Phase 2–3 engine
-> items landed early because real sites needed them: flexbox, grid, floats,
-> `overflow` clipping, `opacity`/`z-index`, sibling and structural selectors,
-> WebP, and promises/`await`/`JSON` in the script engine. Split view (Phase 2)
-> and the English/Hindi interface with IME input (Phase 1) are in.
+> **Where it stands.** Phases 0 and 1 are done except for the multi-process
+> shell, and most of Phase 2 landed with them: flexbox, grid, floats, `overflow`
+> clipping, `opacity`/`z-index`, `transform` (translate/scale), sibling and
+> structural selectors, CSS comments, WebP, an SVG rasterizer, and
+> promises/`await`/`JSON` in the script engine. On the product side: split view,
+> spaces (separate profiles), sync as a sealed file, an English/Hindi interface
+> with IME input, and encryption at rest on all three platforms.
 >
-> **Still outstanding, and honestly so:** the browser runs in **one process with
-> no sandbox** — every risk in R5 is unmitigated today; there is no GPU
-> compositor (`softbuffer` blits on the CPU); no compat bridge; no sync,
-> profiles or spaces; the JS engine is still a tree-walking interpreter; and
-> encryption at rest has a Windows backend only. Those are the next real
-> milestones, not polish.
+> **What is genuinely not built, and why it is not a matter of polish:**
+>
+> * **Multi-process + sandbox (R5).** The browser runs in one process. Page
+>   state — the DOM, the JS heap, form contents — lives where the UI can reach
+>   it, and moving it behind IPC is the change, not spawning a process. A
+>   half-done sandbox is worse than none, because it implies a boundary that is
+>   not there.
+> * **GPU compositing.** Pixels are rastered on the CPU and blitted through
+>   `softbuffer`. Uploading that same CPU-rastered frame to the GPU would buy
+>   nothing; the win is in layerizing and rastering on the GPU, which is the
+>   real work.
+> * **`zero-js` bytecode VM and JIT.** Still a tree-walking interpreter. This is
+>   a rewrite of the evaluator, and everything that currently runs is the thing
+>   it would put at risk.
+> * **The compat bridge.** Embedding another engine behind a flag remains
+>   specified and unbuilt.
+> * **CSS transitions.** Deliberately not animated: the engine renders the
+>   settled state, which is the state that matters for reading a page. Animating
+>   needs a clock and per-element previous values — state the renderer does not
+>   otherwise keep.
 
 > This roadmap is deliberately honest about the biggest fact of the project: a
 > from-scratch browser engine is a multi-year effort. The plan front-loads
