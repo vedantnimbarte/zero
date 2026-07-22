@@ -550,6 +550,18 @@ pub fn style_tree_indexed<'a>(
     index: &RuleIndex,
     hovered: &HoverChain,
 ) -> StyledNode<'a> {
+    style_tree_animated(root, stylesheet, index, hovered, &mut Default::default())
+}
+
+/// Style a tree, letting `anim` hold back any property still crossing over to a
+/// new value. Without one, every value is simply where the cascade put it.
+pub fn style_tree_animated<'a>(
+    root: &'a Node,
+    stylesheet: &'a Stylesheet,
+    index: &RuleIndex,
+    hovered: &HoverChain,
+    anim: &mut crate::anim::Animator,
+) -> StyledNode<'a> {
     let cursor = match root.node_type {
         NodeType::Element(ref elem) => Some(Cursor::only(elem)),
         NodeType::Text(_) => None,
@@ -563,6 +575,7 @@ pub fn style_tree_indexed<'a>(
         &std::rc::Rc::new(PropertyMap::new()),
         &mut Vec::new(),
         hovered,
+        anim,
     )
 }
 
@@ -575,11 +588,18 @@ fn style_tree_inner<'a>(
     inherited_vars: &std::rc::Rc<PropertyMap>,
     ancestors: &mut Vec<Cursor<'a, ElementData>>,
     hovered: &HoverChain,
+    anim: &mut crate::anim::Animator,
 ) -> StyledNode<'a> {
     let mut specified = match cursor {
         Some(ref cursor) => specified_values(cursor, ancestors, stylesheet, index, hovered),
         None => HashMap::new(),
     };
+    // Before anything else reads these values: a transitioned property is held
+    // back at where it has actually got to, so layout and paint see one
+    // consistent frame rather than the destination.
+    if let Some(ref cursor) = cursor {
+        anim.apply(cursor.elem().node_id, &mut specified);
+    }
     for prop in INHERITED_PROPERTIES {
         if !specified.contains_key(prop) {
             if let Some(value) = inherited.get(prop) {
@@ -650,7 +670,7 @@ fn style_tree_inner<'a>(
                 NodeType::Text(_) => None,
             };
             style_tree_inner(
-                child, cursor, stylesheet, index, &specified, &vars, ancestors, hovered,
+                child, cursor, stylesheet, index, &specified, &vars, ancestors, hovered, anim,
             )
         })
         .collect();

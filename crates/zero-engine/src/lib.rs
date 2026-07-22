@@ -17,6 +17,7 @@
 //! but the intended entry point is [`Engine::render`]. Pipeline: HTML+CSS -> DOM ->
 //! styled tree -> layout boxes -> pixels.
 
+pub mod anim;
 pub mod css;
 pub mod dom;
 pub mod html;
@@ -52,6 +53,9 @@ pub struct Page {
     /// Whether any rule used `:hover`. Without this the embedder would repaint
     /// on every mouse move for pages that do not react to the cursor at all.
     pub uses_hover: bool,
+    /// Whether a transition is still running, and so whether another frame is
+    /// worth drawing. An idle page answers `false` and the embedder can rest.
+    pub animating: bool,
 }
 
 /// A loaded document with a **persistent** JavaScript runtime.
@@ -80,6 +84,8 @@ pub struct Document {
     /// The element under the cursor, plus its ancestors — `:hover` applies to
     /// the whole chain, not just the innermost element.
     hovered: style::HoverChain,
+    /// Properties mid-transition, and the clock they are moving against.
+    anim: anim::Animator,
     pub console: Vec<String>,
 }
 
@@ -132,6 +138,7 @@ impl Document {
             find: None,
             sheet: None,
             hovered: Default::default(),
+            anim: Default::default(),
             console: Vec::new(),
         };
         doc.assign_node_ids();
@@ -273,6 +280,15 @@ impl Document {
     /// Put the cursor over an element, so `:hover` rules apply to it and to
     /// everything it sits inside. Returns whether anything changed, so the
     /// embedder only re-renders when it must.
+    /// Advance the transition clock to `now` milliseconds.
+    ///
+    /// The engine has no clock: an embedder that draws frames supplies one, and
+    /// one that takes a single screenshot never calls this and gets the settled
+    /// state — which is what a screenshot should show.
+    pub fn set_time(&mut self, now: f32) {
+        self.anim.set_time(now);
+    }
+
     pub fn set_hover(&mut self, node_id: Option<usize>) -> bool {
         let chain = match node_id {
             Some(id) => ancestor_chain(&self.root, id),
@@ -678,7 +694,8 @@ impl Engine {
                         .any(|p| p.simple.pseudos.contains(&css::Pseudo::Hover))
                 })
             });
-        let style_root = style::style_tree_indexed(root, stylesheet, rule_index, &doc.hovered);
+        let style_root =
+            style::style_tree_animated(root, stylesheet, rule_index, &doc.hovered, &mut doc.anim);
 
         // Fetch + decode every <img> up front so layout knows their sizes.
         let mut images = ImageMap::new();
@@ -741,6 +758,7 @@ impl Engine {
             element_rects,
             find_matches,
             uses_hover,
+            animating: doc.anim.is_active(),
         }
     }
 }
@@ -1291,6 +1309,45 @@ mod tests {
         assert!(red(50, 50), "the centre stays put");
         assert!(red(32, 32) && red(67, 67), "the box grew to twice its size");
         assert!(!red(25, 25), "and no further");
+    }
+
+    #[test]
+    fn a_hover_transition_crosses_over_frame_by_frame() {
+        let engine = super::Engine::shapes_only();
+        let mut doc = super::Document::load(
+            "<body><div id=\"box\"></div></body>",
+            "#box { width: 20px; height: 20px; background: #ff0000;
+                    transition: background 400ms; }
+             #box:hover { background: #0000ff; }",
+        );
+        let mut ids = Vec::new();
+        ids_of(&doc.root, "div", &mut ids);
+        let box_id = ids[0];
+
+        let mut draw = |doc: &mut super::Document| {
+            let page =
+                engine.render_document(doc, 40.0, 40.0, &crate::resource::NullLoader);
+            let px = page.canvas.pixels[5 * page.canvas.width + 5];
+            ((px.r, px.g, px.b), page.animating)
+        };
+
+        // Settled: red, and nothing wants another frame.
+        assert_eq!(draw(&mut doc), ((255, 0, 0), false));
+
+        // The cursor arrives. The first frame still shows where it was.
+        doc.set_time(0.0);
+        doc.set_hover(Some(box_id));
+        assert_eq!(draw(&mut doc), ((255, 0, 0), true));
+
+        // Halfway through, halfway between the two colours.
+        doc.set_time(200.0);
+        let (mid, animating) = draw(&mut doc);
+        assert!(animating, "still crossing over");
+        assert!(mid.0 > 100 && mid.0 < 160 && mid.2 > 100 && mid.2 < 160, "got {mid:?}");
+
+        // Past the end: the new colour, and the window may rest.
+        doc.set_time(400.0);
+        assert_eq!(draw(&mut doc), ((0, 0, 255), false));
     }
 
     /// A search box: type into a field nested inside the form, press Enter.

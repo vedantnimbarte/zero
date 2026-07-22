@@ -310,6 +310,10 @@ const RAW_VALUE_PROPERTIES: &[&str] = &[
     "overflow",
     // `translate(-50%, -50%)`, read at paint time.
     "transform",
+    // `color 300ms, opacity 1s` — a list, read when styling.
+    "transition",
+    "transition-property",
+    "transition-duration",
 ];
 
 /// The named colours worth carrying, plus `transparent`.

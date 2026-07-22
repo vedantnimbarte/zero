@@ -697,6 +697,11 @@ struct App {
     /// `None` when nothing is moving, so the first frame of an animation starts
     /// from rest instead of jumping by however long the window sat idle.
     last_frame: Option<std::time::Instant>,
+    /// When this window opened. Page transitions run against the time since,
+    /// which is monotonic and shared by every tab.
+    started: std::time::Instant,
+    /// Whether a page transition is still running and wants another frame.
+    page_animating: bool,
     /// Whether the last frame left something mid-animation and so owes another.
     animating: bool,
     dragging_scrollbar: bool,
@@ -721,6 +726,8 @@ impl App {
             settings,
             rail_px: rail_target(settings) as f32,
             last_frame: None,
+            started: std::time::Instant::now(),
+            page_animating: false,
             animating: false,
             modifiers: ModifiersState::default(),
             cursor: (0.0, 0.0),
@@ -2159,17 +2166,25 @@ impl App {
     /// Lay out and paint one tab at the given size, reusing its cached canvas
     /// when nothing about the page or the space it has changed.
     fn render_pane(&mut self, index: usize, w: f32, h: f32) {
+        let now = self.started.elapsed().as_secs_f32() * 1000.0;
+        let animating = self.page_animating;
         let engine = &self.engine;
         let tab = &mut self.tabs[index];
-        if tab.page_canvas.is_some() && tab.cache_w == w as u32 && tab.cache_h == h as u32 {
+        let settled = tab.page_canvas.is_some()
+            && tab.cache_w == w as u32
+            && tab.cache_h == h as u32
+            && !animating;
+        if settled {
             return;
         }
+        tab.doc.set_time(now);
         let loader = tab.loader.clone();
         let page = engine.render_document(&mut tab.doc, w, h, loader.as_ref());
         tab.blocked_count = loader.blocked.get();
         for line in &page.console {
             eprintln!("[js] {line}");
         }
+        let page_animating = page.animating;
         tab.page_canvas = Some(page.canvas);
         tab.links = page.links;
         tab.matches = page.find_matches;
@@ -2177,6 +2192,7 @@ impl App {
         tab.element_rects = page.element_rects;
         tab.cache_w = w as u32;
         tab.cache_h = h as u32;
+        self.page_animating = page_animating;
     }
 
     /// Which tab the cursor is over: the other pane if it is in it, else the
@@ -2233,6 +2249,8 @@ impl App {
     /// the same path the user sees rather than a second, drifting copy.
     fn frame(&mut self, w: u32, h: u32) -> Vec<u32> {
         self.animating = self.advance_rail();
+        // A page mid-transition wants frames for the same reason the rail does.
+        self.page_animating = false;
         let regions = Regions::split(
             w,
             h,
@@ -2264,30 +2282,16 @@ impl App {
             }
         }
         {
-            let engine = &self.engine;
-            let animating = self.animating;
-            let tab = &mut self.tabs[self.active];
-            // Mid-animation the content area changes width every frame, and
-            // re-laying out a real page at 60fps would make the slide stutter.
+            // Mid-slide the content area changes width every frame, and
+            // re-laying out a real page at 60fps would make the rail stutter.
             // The last layout is slid instead, and reflows once the rail lands —
             // which is what every other browser does with an animating panel.
+            let tab = &self.tabs[self.active];
             let stale = tab.cache_w != layout_w as u32 || tab.cache_h != layout_h as u32;
-            if tab.page_canvas.is_none() || (stale && !animating) {
-                let loader = tab.loader.clone();
-                let page =
-                    engine.render_document(&mut tab.doc, layout_w, layout_h, loader.as_ref());
-                tab.blocked_count = loader.blocked.get();
-                for line in &page.console {
-                    eprintln!("[js] {line}");
-                }
-                tab.page_canvas = Some(page.canvas);
-                tab.links = page.links;
-                tab.matches = page.find_matches;
-                tab.uses_hover = page.uses_hover;
-                tab.element_rects = page.element_rects;
-                tab.cache_w = layout_w as u32;
-                tab.cache_h = layout_h as u32;
+            if tab.page_canvas.is_none() || self.page_animating || (stale && !self.animating) {
+                self.render_pane(self.active, layout_w, layout_h);
             }
+            let tab = &mut self.tabs[self.active];
             // Clamp scroll to available overflow, in screen pixels.
             let content = tab.page_canvas.as_ref().expect("just rendered").height as f32 * zoom;
             let max_scroll = (content - regions.content_h as f32).max(0.0);
@@ -2525,9 +2529,10 @@ impl App {
         let mut buffer = surface.buffer_mut().expect("surface buffer");
         buffer.copy_from_slice(&frame);
         buffer.present().expect("buffer present");
-        // An unfinished animation asks for the next frame itself. Nothing else
-        // drives a clock, so the window goes back to sleep the moment it lands.
-        if self.animating {
+        // An unfinished animation asks for the next frame itself — the rail
+        // sliding, or a page mid-transition. Nothing else drives a clock, so the
+        // window goes back to sleep the moment they land.
+        if self.animating || self.page_animating {
             self.request_redraw();
         }
     }
