@@ -50,6 +50,12 @@ pub const ENGINES: &[(&str, &str, &str)] = &[
     ("google", "Google", "https://www.google.com/search?q="),
 ];
 
+/// The languages the interface is offered in: `(key, name in that language)`.
+///
+/// A language is named in its own script, because someone looking for it cannot
+/// necessarily read the current one.
+pub const LANGUAGES: &[(&str, &str)] = &[("en", "English"), ("hi", "हिन्दी")];
+
 /// The zoom steps the menu and Ctrl +/- move between.
 pub const ZOOM_STEPS: &[u32] = &[67, 80, 90, 100, 110, 125, 150, 175, 200];
 
@@ -68,6 +74,8 @@ pub struct Settings {
     /// setting: there is no OS-level signal to read here, so it is offered
     /// directly rather than assumed.
     pub motion: bool,
+    /// Index into [`LANGUAGES`] — which language the chrome speaks.
+    pub language: usize,
 }
 
 impl Default for Settings {
@@ -80,6 +88,7 @@ impl Default for Settings {
             blocking: true,
             restore: true,
             motion: true,
+            language: 0,
         }
     }
 }
@@ -105,6 +114,10 @@ impl Settings {
                 Some(i) => self.engine = i,
                 None => return false,
             },
+            ("lang", v) => match LANGUAGES.iter().position(|(key, _)| *key == v) {
+                Some(i) => self.language = i,
+                None => return false,
+            },
             _ => return false,
         }
         true
@@ -120,7 +133,7 @@ impl Settings {
 
     fn serialize(&self) -> String {
         format!(
-            "layout={}\nrail={}\nengine={}\nzoom={}\nblocking={}\nrestore={}\nmotion={}\n",
+            "layout={}\nrail={}\nengine={}\nzoom={}\nblocking={}\nrestore={}\nmotion={}\nlang={}\n",
             match self.layout {
                 TabLayout::Vertical => "vertical",
                 TabLayout::Horizontal => "horizontal",
@@ -135,6 +148,7 @@ impl Settings {
             if self.blocking { "on" } else { "off" },
             if self.restore { "on" } else { "off" },
             if self.motion { "on" } else { "off" },
+            LANGUAGES[self.language.min(LANGUAGES.len() - 1)].0,
         )
     }
 
@@ -158,6 +172,11 @@ impl Settings {
         if let Some(dir) = crate::storage::profile_dir() {
             crate::crypto::write_file(&dir.join("settings.tsv"), &self.serialize());
         }
+    }
+
+    /// The chosen language's key, e.g. `hi`.
+    pub fn language(&self) -> &'static str {
+        LANGUAGES[self.language.min(LANGUAGES.len() - 1)].0
     }
 
     /// The chosen engine's `(key, label, query prefix)`.
@@ -246,6 +265,7 @@ mod tests {
             blocking: false,
             restore: false,
             motion: false,
+            language: 1,
         };
         let mut read_back = Settings::default();
         for line in saved.serialize().lines() {

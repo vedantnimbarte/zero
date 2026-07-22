@@ -3,6 +3,7 @@
 //! Dogfooding the engine for browser UI keeps these pages honest: if history
 //! renders badly, the engine has a bug worth fixing.
 
+use crate::i18n::t;
 use crate::storage::{self, Visit};
 
 use crate::app::theme;
@@ -78,8 +79,8 @@ pub fn page(target: &str) -> String {
         "zero://downloads" => downloads_page(),
         "zero://settings" => settings_page(),
         other => wrap(
-            "Unknown page",
-            &format!("<div class=\"empty\">No built-in page at {}.</div>", escape(other)),
+            &t("Unknown page"),
+            &format!("<div class=\"empty\">{} {}.</div>", t("No built-in page at"), escape(other)),
         ),
     }
 }
@@ -259,14 +260,16 @@ fn control_width(labels: &[&str]) -> u32 {
 /// path any link on the web takes through this browser. The chosen option is
 /// marked with an accent edge, the same way the active tab is.
 fn segmented(key: &str, options: &[(&str, &str)], chosen: &str) -> String {
-    let labels: Vec<&str> = options.iter().map(|(_, label)| *label).collect();
+    // Widths are measured on the translated text, since that is what is drawn.
+    let translated: Vec<String> = options.iter().map(|(_, label)| t(label)).collect();
+    let labels: Vec<&str> = translated.iter().map(String::as_str).collect();
     let opts: String = options
         .iter()
         .map(|(value, label)| {
             let class = if *value == chosen { "opton" } else { "opt" };
             format!(
                 "<a class=\"{class}\" href=\"zero://settings?{key}={value}\">{}</a>",
-                escape(label)
+                escape(&t(label))
             )
         })
         .collect();
@@ -287,11 +290,16 @@ fn wrap_control(labels: &[&str], inner: &str) -> String {
 /// An option that exists in the design but not yet in the build. Shown rather
 /// than hidden, so the page is honest about what is coming.
 fn unavailable(label: &str) -> String {
-    format!("<span class=\"optoff\">{}</span>", escape(label))
+    format!("<span class=\"optoff\">{}</span>", escape(&t(label)))
 }
 
 fn on_off(key: &str, on: bool) -> String {
     segmented(key, &[("on", "On"), ("off", "Off")], if on { "on" } else { "off" })
+}
+
+/// A settings row whose name and hint are translated.
+fn setting_t(name: &str, hint: &str, control: &str) -> String {
+    setting(&escape(&t(name)), &escape(&t(hint)), control)
 }
 
 fn settings_page() -> String {
@@ -325,48 +333,61 @@ fn settings_page() -> String {
     let engines: Vec<(&str, &str)> =
         crate::settings::ENGINES.iter().map(|(key, label, _)| (*key, *label)).collect();
     let engine = segmented("engine", &engines, now.engine().0);
+    let theme_labels = [t("Dark"), t("Light")];
     let theme_control = wrap_control(
-        &["Dark", "Light"],
-        &format!("<span class=\"opton\">Dark</span>{}", unavailable("Light")),
+        &theme_labels.iter().map(String::as_str).collect::<Vec<_>>(),
+        &format!(
+            "<span class=\"opton\">{}</span>{}",
+            escape(&t("Dark")),
+            unavailable("Light")
+        ),
     );
+    // Each language is named in its own script, so these labels are not translated.
+    let language = segmented("lang", crate::settings::LANGUAGES, now.language());
     let profile = crate::storage::profile_dir()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| "unavailable".to_string());
 
     let body = format!(
-        "<div class=\"lede\">Every preference is stored on this device, as text you can read.</div>\
-         <div class=\"sec\">APPEARANCE</div>{}{}{}{}{}\
-         <div class=\"sec\">SEARCH</div>{}\
-         <div class=\"sec\">PRIVACY</div>{}{}\
-         <div class=\"sec\">ABOUT</div>{}{}{}",
-        setting("Tab layout", "A rail down the side, or a strip across the top", &layout),
-        setting("Tab rail", "How much of the vertical rail stays open", &rail),
-        setting("Page zoom", "The size new tabs open at. Ctrl+= and Ctrl+- change one tab", &zoom),
-        setting("Theme", "Light is designed but not built yet", &theme_control),
-        setting(
+        "<div class=\"lede\">{lede}</div>\
+         <div class=\"sec\">{appearance}</div>{}{}{}{}{}{}\
+         <div class=\"sec\">{search}</div>{}\
+         <div class=\"sec\">{privacy}</div>{}{}\
+         <div class=\"sec\">{about}</div>{}{}{}",
+        setting_t("Tab layout", "A rail down the side, or a strip across the top", &layout),
+        setting_t("Tab rail", "How much of the vertical rail stays open", &rail),
+        setting_t("Page zoom", "The size new tabs open at. Ctrl+= and Ctrl+- change one tab", &zoom),
+        setting_t("Language", "What the browser's own screens are written in", &language),
+        setting_t("Theme", "Light is designed but not built yet", &theme_control),
+        setting_t(
             "Animation",
             "Slides the tab rail open and closed. Turn off to change it instantly",
             &on_off("motion", now.motion),
         ),
-        setting("Search engine", "Where the address bar sends anything that isn't a URL", &engine),
-        setting(
+        setting_t("Search engine", "Where the address bar sends anything that isn't a URL", &engine),
+        setting_t(
             "Block trackers",
             "Drops requests to known tracking and ad hosts before they are made",
             &on_off("blocking", now.blocking),
         ),
-        setting(
+        setting_t(
             "Reopen tabs at launch",
             "Restores the last session instead of starting on a new tab",
             &on_off("restore", now.restore),
         ),
-        setting("Engine", "HTML, CSS and JavaScript, written from scratch in Rust",
+        setting_t("Engine", "HTML, CSS and JavaScript, written from scratch in Rust",
             "<span class=\"fact\">Zero 0.1.0</span>"),
-        setting("Profile folder", "Where history, bookmarks and this file live",
+        setting_t("Profile folder", "Where history, bookmarks and this file live",
             &format!("<span class=\"fact\">{}</span>", escape(&profile))),
-        setting("Source", "Zero is open source, Apache-2.0",
+        setting_t("Source", "Zero is open source, Apache-2.0",
             "<span class=\"fact\">github.com/zero-browser</span>"),
+        lede = escape(&t("Every preference is stored on this device, as text you can read.")),
+        appearance = escape(&t("APPEARANCE")),
+        search = escape(&t("SEARCH")),
+        privacy = escape(&t("PRIVACY")),
+        about = escape(&t("ABOUT")),
     );
-    console_wrap("Settings", &body)
+    console_wrap(&t("Settings"), &body)
 }
 
 fn downloads_page() -> String {
@@ -374,7 +395,7 @@ fn downloads_page() -> String {
     saved.reverse(); // newest first, like history
     if saved.is_empty() {
         return console_wrap(
-            "Downloads",
+            &t("Downloads"),
             "<div class=\"empty\">Nothing saved yet. Press Ctrl+S to keep a copy of the \
              page you are reading.</div>",
         );
@@ -390,8 +411,8 @@ fn downloads_page() -> String {
         })
         .collect();
     console_wrap(
-        "Downloads",
-        &format!("<div class=\"lede\">Saved pages, newest first.</div>{rows}"),
+        &t("Downloads"),
+        &format!("<div class=\"lede\">{}</div>{rows}", t("Saved pages, newest first.")),
     )
 }
 
@@ -416,9 +437,15 @@ fn history_page() -> String {
         .collect();
 
     if rows.is_empty() {
-        return wrap("History", "<div class=\"empty\">Nothing visited yet.</div>");
+        return wrap(
+            &t("History"),
+            &format!("<div class=\"empty\">{}</div>", t("Nothing visited yet.")),
+        );
     }
-    wrap("History", &format!("<div class=\"sub\">Most recent first</div>{rows}"))
+    wrap(
+        &t("History"),
+        &format!("<div class=\"sub\">{}</div>{rows}", t("Most recent first")),
+    )
 }
 
 fn bookmarks_page() -> String {
@@ -431,11 +458,14 @@ fn bookmarks_page() -> String {
 
     if rows.is_empty() {
         return wrap(
-            "Bookmarks",
-            "<div class=\"empty\">No bookmarks yet. Press Ctrl+D on a page to add one.</div>",
+            &t("Bookmarks"),
+            &format!(
+                "<div class=\"empty\">{}</div>",
+                t("No bookmarks yet. Press Ctrl+D on a page to add one.")
+            ),
         );
     }
-    wrap("Bookmarks", &rows)
+    wrap(&t("Bookmarks"), &rows)
 }
 
 /// A clickable entry. Alternating backgrounds make long lists readable.

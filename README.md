@@ -71,8 +71,8 @@ saved settings.
 `zero://downloads`, `zero://settings`.
 
 **Settings** live at `zero://settings` — tab layout (vertical rail or a horizontal
-strip), how far the rail collapses, page zoom, search engine, tracker blocking,
-session restore and animation. Each control is an ordinary link carrying its new
+strip), how far the rail collapses, page zoom, interface language (English or
+हिन्दी), search engine, tracker blocking, session restore and animation. Each control is an ordinary link carrying its new
 value (`zero://settings?rail=icons`), so changing a preference goes through the
 same navigation path as clicking any link on the web.
 
@@ -105,7 +105,8 @@ forms.
   `super`, `try/catch/finally`, regex literals, `setTimeout`, `JSON`, `fetch`
   with promises and `await`, DOM query and mutation, events
 - **Browser**: vertical tabs, session restore, history, bookmarks, find-in-page,
-  form submission and search, an on-device page assistant
+  form submission and search, an on-device page assistant, an English/Hindi
+  interface, and input-method text so Indic scripts can be typed
 - **Privacy**: tracker/ad filtering (Adblock syntax), HTTPS-first, cookies and
   `localStorage` partitioned per site, profile data encrypted at rest (DPAPI on
   Windows; macOS and Linux backends are still to come)

@@ -20,13 +20,14 @@
 
 use crate::ai::{Assistant, LocalAssistant, PageContext};
 use crate::net::{load_target, normalize_target, resolve_url, ShellLoader};
+use crate::i18n::{t, t_tip};
 use crate::settings::{self, Rail, Settings, TabLayout, ZOOM_STEPS};
 use crate::storage;
 use std::num::NonZeroU32;
 use std::rc::Rc;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
@@ -103,7 +104,7 @@ pub mod icon {
 /// What each control says when the cursor rests on it: the action, then the key
 /// that does the same thing. Named by the verb the control performs, so the
 /// tooltip and the menu entry can never drift apart.
-const TIPS: &[(&str, &str)] = &[
+pub const TIPS: &[(&str, &str)] = &[
     ("rail", "Tab rail  ·  Ctrl+\\"),
     ("back", "Back  ·  Alt+←"),
     ("fwd", "Forward  ·  Alt+→"),
@@ -558,6 +559,13 @@ pub fn screenshot(
             }
         }
     }
+    // A built-in page is drawn from the settings, so it has to be rebuilt after
+    // a pose changes them — otherwise `--shot zero://settings lang=hi` would
+    // pose the chrome in Hindi around a page still written in English.
+    if crate::internal::is_internal(&app.tabs[0].address) {
+        let address = app.tabs[0].address.clone();
+        app.tabs[0] = Tab::new(address.clone(), crate::internal::page(&address), String::new());
+    }
     // A still image has no time to animate in, so the rail starts where it
     // lands — unless a pose asked for a particular point mid-slide.
     if let Some(px) = poses.iter().find_map(|p| p.strip_prefix("railpx:")) {
@@ -666,6 +674,9 @@ impl ApplicationHandler for App {
             .with_title("Zero Browser")
             .with_inner_size(LogicalSize::new(1180.0, 760.0));
         let window = Rc::new(event_loop.create_window(attrs).expect("failed to create window"));
+        // Devanagari, Tamil and CJK are typed through an input method, which
+        // sends composed text as its own event and never as a key press.
+        window.set_ime_allowed(true);
         let context = softbuffer::Context::new(window.clone()).expect("softbuffer context");
         let surface =
             softbuffer::Surface::new(&context, window.clone()).expect("softbuffer surface");
@@ -681,6 +692,13 @@ impl ApplicationHandler for App {
             WindowEvent::RedrawRequested => self.render(),
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 self.handle_key(event);
+                self.request_redraw();
+            }
+            // A finished composition is exactly typing, however many keys it
+            // took to produce. The preedit (what the IME is still deciding) is
+            // ignored: showing it needs a caret the fields do not have yet.
+            WindowEvent::Ime(Ime::Commit(text)) => {
+                self.type_text(&text);
                 self.request_redraw();
             }
             WindowEvent::MouseWheel { delta, .. } => {
@@ -899,6 +917,27 @@ impl App {
 
     // --- input ---
 
+    /// Put typed text wherever focus is: an open chrome field, a focused page
+    /// field, or the address bar. Key presses and input-method commits are the
+    /// same act and must land in the same place.
+    fn type_text(&mut self, text: &str) -> bool {
+        let typed: String = text.chars().filter(|c| !c.is_control()).collect();
+        if typed.is_empty() {
+            return false;
+        }
+        if self.focus.query().is_some() {
+            self.focus.push(&typed);
+            self.apply_chrome_field();
+            return true;
+        }
+        if self.tab().doc.is_focused() && self.tab_mut().doc.insert_text(&typed) {
+            self.tab_mut().page_canvas = None; // field text changed
+            return true;
+        }
+        self.tab_mut().address.push_str(&typed);
+        true
+    }
+
     fn handle_key(&mut self, event: KeyEvent) {
         let ctrl = self.modifiers.control_key();
         let shift = self.modifiers.shift_key();
@@ -913,12 +952,9 @@ impl App {
                 Key::Named(NamedKey::Enter) => self.accept_chrome_field(),
                 _ => match &event.text {
                     Some(text) => {
-                        let typed: String = text.chars().filter(|c| !c.is_control()).collect();
-                        if typed.is_empty() {
+                        if !self.type_text(&text.to_string()) {
                             return;
                         }
-                        self.focus.push(&typed);
-                        self.apply_chrome_field();
                     }
                     None => return,
                 },
@@ -939,10 +975,7 @@ impl App {
                     true
                 }
                 _ => match &event.text {
-                    Some(text) => {
-                        let typed: String = text.chars().filter(|c| !c.is_control()).collect();
-                        !typed.is_empty() && self.tab_mut().doc.insert_text(&typed)
-                    }
+                    Some(text) => self.type_text(&text.to_string()),
                     None => false,
                 },
             };
@@ -1852,7 +1885,7 @@ impl App {
                     // Laid out in normal flow rather than as a flex row: the
                     // engine will not hold three small boxes on one flex line.
                     return format!(
-                        "<div class=\"zoom\"><span class=\"zlabel\">Zoom</span>\
+                        "<div class=\"zoom\"><span class=\"zlabel\">{zoom_label}</span>\
                          <span id=\"zoom:out\" class=\"{}\">{}</span>\
                          <span id=\"zoom:reset\" class=\"{}\">{}%</span>\
                          <span id=\"zoom:in\" class=\"{}\">{}</span></div>",
@@ -1862,6 +1895,7 @@ impl App {
                         self.tab().zoom,
                         self.lit("zoom:in", "step"),
                         icon::ADD,
+                        zoom_label = escape(&t("Zoom")),
                     );
                 }
                 let label = match *id {
@@ -1869,6 +1903,7 @@ impl App {
                     "menu:reopen" if self.closed.is_empty() => return String::new(),
                     _ => label,
                 };
+                let label = escape(&t(label));
                 format!(
                     "<div id=\"{id}\" class=\"{}\"><span class=\"label\">{label}</span>\
                      <span class=\"key\">{key}</span></div>",
@@ -1932,9 +1967,9 @@ impl App {
             return self.tabs.get(index).map(|tab| tab.label());
         }
         if id.starts_with("close:") {
-            return Some("Close tab  ·  Ctrl+W".to_string());
+            return Some(t_tip("Close tab  ·  Ctrl+W"));
         }
-        TIPS.iter().find(|(key, _)| *key == id).map(|(_, tip)| tip.to_string())
+        TIPS.iter().find(|(key, _)| *key == id).map(|(_, tip)| t_tip(tip))
     }
 
     // --- compositing ---

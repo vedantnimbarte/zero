@@ -19,6 +19,7 @@ mod blocker;
 mod cookies;
 mod crypto;
 mod fonts;
+mod i18n;
 mod internal;
 mod localstore;
 mod net;
