@@ -38,18 +38,49 @@ cargo run -- https://news.ycombinator.com  # open a URL
 cargo run -- examples/flex.html            # open a local file
 
 cargo run -- --shot https://… out.png      # screenshot the whole window, headless
+cargo run -- --shot page.html out.png 1280x800 menu tabs:4   # …posed (see below)
 cargo run -- --png examples/x.html out.png # render just the page
 cargo run -- --png page.html out.png rust  # …and highlight a find-in-page query
 cargo run -- --ai https://…                # print the on-device page summary
 cargo run -- --history                     # dump stored history
 ```
 
-**Keys:** `Ctrl+T` new tab · `Ctrl+W` close · `Ctrl+Tab` next · `Ctrl+L` clear address ·
-`Ctrl+F` find · `Ctrl+D` bookmark · `Ctrl+H` history · `Ctrl+B` bookmarks ·
-`Ctrl+U` view source ·
-`Ctrl+I` AI panel · `Alt+←/→` back and forward.
+`--shot` takes an optional `WxH` and then any number of **poses**, which put the
+chrome into a state a still image cannot otherwise reach — so every surface stays
+reviewable without holding the mouse in the right place. Poses never change your
+saved settings.
 
-**Built-in pages:** `zero://newtab`, `zero://history`, `zero://bookmarks`.
+| Pose | Effect |
+|------|--------|
+| `menu` | the overflow menu, open |
+| `ai` | the assistant panel, open |
+| `hover:star` | a control lit, with its tooltip |
+| `search:wiki` | tab search, filtering |
+| `tabs:5` | extra tabs, one of them pinned |
+| `railpx:150` | the tab rail caught mid-slide |
+| `layout=horizontal`, `rail=icons`, `zoom=150`, … | any setting |
+
+**Keys:** `Ctrl+T` new tab · `Ctrl+Shift+T` reopen closed · `Ctrl+W` close ·
+`Ctrl+Tab` next · `Ctrl+Shift+A` search tabs · `Ctrl+\` collapse the tab rail ·
+`Ctrl+L` clear address · `Ctrl+F` find · `Ctrl+D` bookmark · `Ctrl+S` save page ·
+`Ctrl+H` history · `Ctrl+B` bookmarks · `Ctrl+J` downloads · `Ctrl+,` settings ·
+`Ctrl+U` view source · `Ctrl+R` reload · `Ctrl+I` AI panel ·
+`Ctrl+=`/`Ctrl+-`/`Ctrl+0` zoom (also `Ctrl`+wheel) · `Alt+←/→` back and forward.
+
+**Built-in pages:** `zero://newtab`, `zero://history`, `zero://bookmarks`,
+`zero://downloads`, `zero://settings`.
+
+**Settings** live at `zero://settings` — tab layout (vertical rail or a horizontal
+strip), how far the rail collapses, page zoom, search engine, tracker blocking,
+session restore and animation. Each control is an ordinary link carrying its new
+value (`zero://settings?rail=icons`), so changing a preference goes through the
+same navigation path as clicking any link on the web.
+
+The rail slides open and closed rather than snapping. The engine has no CSS
+transitions, so the shell animates the width itself and asks for the next frame
+only while something is moving — an idle window draws nothing. There is no OS
+reduced-motion signal available here, so **Animation: Off** in settings is offered
+directly for anyone who wants the change to be instant.
 
 ## What works today
 

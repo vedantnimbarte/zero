@@ -15,7 +15,15 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Where profile data lives, creating it on first use.
+///
+/// `None` under `cfg(test)`: the tests drive the same code paths the UI does —
+/// opening tabs, saving pages, changing settings — and none of that may touch
+/// the real profile. Functions that take a directory explicitly are tested
+/// against a scratch one instead.
 pub fn profile_dir() -> Option<PathBuf> {
+    if cfg!(test) {
+        return None;
+    }
     // APPDATA on Windows, XDG_CONFIG_HOME/HOME elsewhere.
     let base = std::env::var_os("APPDATA")
         .map(PathBuf::from)
@@ -136,37 +144,145 @@ fn write_bookmarks(dir: &Path, marks: &[Bookmark]) {
     crate::crypto::write_file(&dir.join("bookmarks.tsv"), &text);
 }
 
-/// Persist the open tabs so the next launch can restore them.
-pub fn save_session(urls: &[String], active: usize) {
+/// A saved page, listed by `zero://downloads`.
+#[derive(Debug, PartialEq)]
+pub struct Download {
+    pub when: u64,
+    /// The file name on disk, which is what the user will look for.
+    pub name: String,
+    pub url: String,
+    pub path: String,
+}
+
+/// Where saved pages go: the OS Downloads folder, or the profile if there
+/// isn't one. Zero never writes outside a directory the user already expects —
+/// and, per [`profile_dir`], never writes there at all from a test.
+fn downloads_dir() -> Option<PathBuf> {
+    if cfg!(test) {
+        return None;
+    }
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"));
+    let dir = match home {
+        Some(home) => PathBuf::from(home).join("Downloads"),
+        None => profile_dir()?,
+    };
+    fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
+/// Write a page to the Downloads folder and record it. Returns the file name.
+pub fn save_page(url: &str, title: &str, body: &str) -> Option<String> {
+    let dir = downloads_dir()?;
+    let name = unique_name(&dir, &file_stem(title, url));
+    fs::write(dir.join(&name), body).ok()?;
+    let line = format!(
+        "{}\t{}\t{}\t{}\n",
+        now_secs(),
+        sanitize(&name),
+        sanitize(url),
+        sanitize(&dir.join(&name).to_string_lossy())
+    );
+    let file = profile_dir()?.join("downloads.tsv");
+    let existing = crate::crypto::read_file(&file).unwrap_or_default();
+    crate::crypto::write_file(&file, &(existing + &line));
+    Some(name)
+}
+
+/// A file name from a page's title, falling back to its host. Anything the
+/// filesystem might object to becomes a dash — which includes both separators,
+/// so a title can never steer the write out of the Downloads folder.
+fn file_stem(title: &str, url: &str) -> String {
+    let source = match title.trim() {
+        "" => url.split("://").nth(1).unwrap_or(url).split('/').next().unwrap_or("page"),
+        title => title,
+    };
+    let stem: String = source
+        .chars()
+        .map(|c| match c {
+            c if c.is_alphanumeric() => c,
+            // Dots survive so a host reads as a host, not as dashes.
+            '-' | ' ' | '.' | '_' => c,
+            _ => '-',
+        })
+        .collect();
+    let stem = stem.trim().trim_matches(['-', '.']).trim();
+    let stem = if stem.is_empty() { "page" } else { stem };
+    format!("{}.html", stem.chars().take(60).collect::<String>())
+}
+
+/// Saving the same page twice should not silently overwrite the first copy.
+fn unique_name(dir: &Path, name: &str) -> String {
+    if !dir.join(name).exists() {
+        return name.to_string();
+    }
+    let (stem, ext) = name.rsplit_once('.').unwrap_or((name, "html"));
+    (2..)
+        .map(|n| format!("{stem} ({n}).{ext}"))
+        .find(|candidate| !dir.join(candidate).exists())
+        .expect("an unused name exists")
+}
+
+pub fn load_downloads() -> Vec<Download> {
+    let Some(dir) = profile_dir() else { return Vec::new() };
+    let text = crate::crypto::read_file(&dir.join("downloads.tsv")).unwrap_or_default();
+    text.lines().filter_map(parse_download).collect()
+}
+
+fn parse_download(line: &str) -> Option<Download> {
+    let mut parts = line.splitn(4, '\t');
+    let when = parts.next()?.parse().ok()?;
+    let name = parts.next()?.to_string();
+    if name.is_empty() {
+        return None;
+    }
+    Some(Download {
+        when,
+        name,
+        url: parts.next().unwrap_or("").to_string(),
+        path: parts.next().unwrap_or("").to_string(),
+    })
+}
+
+/// Persist the open tabs so the next launch can restore them, remembering
+/// which were pinned.
+pub fn save_session(tabs: &[(String, bool)], active: usize) {
     if let Some(dir) = profile_dir() {
-        write_session(&dir, urls, active);
+        write_session(&dir, tabs, active);
     }
 }
 
-/// The previous session's tabs and which one was in front.
-pub fn load_session() -> Option<(Vec<String>, usize)> {
+/// The previous session's tabs (URL and whether pinned) and which was in front.
+pub fn load_session() -> Option<(Vec<(String, bool)>, usize)> {
     read_session(&profile_dir()?)
 }
 
-fn write_session(dir: &Path, urls: &[String], active: usize) {
+fn write_session(dir: &Path, tabs: &[(String, bool)], active: usize) {
     let mut out = format!("{active}\n");
-    for url in urls {
+    for (url, pinned) in tabs {
+        out.push_str(if *pinned { "pin\t" } else { "tab\t" });
         out.push_str(&sanitize(url));
         out.push('\n');
     }
     crate::crypto::write_file(&dir.join("session.tsv"), &out);
 }
 
-fn read_session(dir: &Path) -> Option<(Vec<String>, usize)> {
+fn read_session(dir: &Path) -> Option<(Vec<(String, bool)>, usize)> {
     let text = crate::crypto::read_file(&dir.join("session.tsv"))?;
     let mut lines = text.lines();
     let active: usize = lines.next()?.trim().parse().unwrap_or(0);
-    let urls: Vec<String> = lines.map(str::to_string).filter(|u| !u.is_empty()).collect();
-    if urls.is_empty() {
+    let tabs: Vec<(String, bool)> = lines
+        .filter_map(|line| match line.split_once('\t') {
+            Some((kind, url)) => Some((url.to_string(), kind == "pin")),
+            // A session written before pinning existed is one URL per line.
+            None => Some((line.to_string(), false)),
+        })
+        .filter(|(url, _)| !url.is_empty())
+        .collect();
+    if tabs.is_empty() {
         return None;
     }
-    let active = active.min(urls.len() - 1);
-    Some((urls, active))
+    let active = active.min(tabs.len() - 1);
+    Some((tabs, active))
 }
 
 #[cfg(test)]
@@ -214,17 +330,66 @@ mod tests {
     }
 
     #[test]
-    fn session_round_trips_and_clamps_the_active_index() {
+    fn session_round_trips_pinning_and_clamps_the_active_index() {
         let dir = scratch("session");
         assert!(read_session(&dir).is_none()); // nothing saved yet
 
-        let urls = vec!["https://a.com".to_string(), "https://b.com".to_string()];
-        write_session(&dir, &urls, 1);
-        assert_eq!(read_session(&dir), Some((urls.clone(), 1)));
+        let tabs = vec![("https://a.com".to_string(), true), ("https://b.com".to_string(), false)];
+        write_session(&dir, &tabs, 1);
+        assert_eq!(read_session(&dir), Some((tabs.clone(), 1)));
 
         // An out-of-range active index is clamped rather than panicking later.
-        write_session(&dir, &urls, 99);
+        write_session(&dir, &tabs, 99);
         assert_eq!(read_session(&dir).unwrap().1, 1);
+    }
+
+    #[test]
+    fn a_session_written_before_pinning_still_opens() {
+        let dir = scratch("legacy-session");
+        crate::crypto::write_file(&dir.join("session.tsv"), "1\nhttps://a.com\nhttps://b.com\n");
+        let (tabs, active) = read_session(&dir).expect("legacy session");
+        assert_eq!(active, 1);
+        assert_eq!(tabs, vec![("https://a.com".into(), false), ("https://b.com".into(), false)]);
+    }
+
+    #[test]
+    fn saved_pages_are_named_after_the_page_and_never_collide() {
+        let dir = scratch("downloads");
+        // A title becomes the file name; path-hostile characters do not survive.
+        assert_eq!(file_stem("Rust: a language/guide", "https://a.com"), "Rust- a language-guide.html");
+        // No usable title falls back to the host.
+        assert_eq!(file_stem("  ", "https://news.ycombinator.com/x"), "news.ycombinator.com.html");
+        assert_eq!(file_stem("///", "https://a.com"), "page.html");
+
+        // Saving twice keeps both copies.
+        assert_eq!(unique_name(&dir, "page.html"), "page.html");
+        fs::write(dir.join("page.html"), "x").expect("write");
+        assert_eq!(unique_name(&dir, "page.html"), "page (2).html");
+    }
+
+    #[test]
+    fn tests_never_reach_the_real_profile_or_downloads_folder() {
+        // The suite exercises saving pages, opening tabs and changing settings.
+        // If either of these ever returns a real path again, `cargo test` starts
+        // rewriting the user's session and dropping files in their Downloads.
+        assert!(profile_dir().is_none());
+        assert!(downloads_dir().is_none());
+        assert!(save_page("https://a.com", "A", "<html></html>").is_none());
+    }
+
+    #[test]
+    fn download_lines_parse_and_junk_is_skipped() {
+        assert_eq!(
+            parse_download("42\tpage.html\thttps://a.com\tC:/Downloads/page.html"),
+            Some(Download {
+                when: 42,
+                name: "page.html".into(),
+                url: "https://a.com".into(),
+                path: "C:/Downloads/page.html".into(),
+            })
+        );
+        assert!(parse_download("42\t").is_none());
+        assert!(parse_download("nope\tpage.html").is_none());
     }
 
     #[test]

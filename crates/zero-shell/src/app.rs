@@ -1,20 +1,26 @@
 //! The windowed browser app: window, input, tabs, navigation, and compositing.
 //!
-//! The chrome (vertical tab sidebar + toolbar) is itself rendered *by the engine*
-//! as tiny HTML documents and composited around the page, so the shell needs no
-//! text-drawing or widget code of its own.
+//! The chrome (tab rail, toolbar, menu, tooltips) is itself rendered *by the
+//! engine* as small HTML documents and composited around the page, so the shell
+//! needs no text-drawing or widget code of its own. Each of those documents gives
+//! its controls an `id`, and the engine hands back the box it painted them in —
+//! so hit-testing is one lookup shared by every surface rather than per-surface
+//! arithmetic that has to be kept in step with the markup by hand.
 //!
-//! Window regions:
+//! Window regions, vertical layout (the default):
 //! ```text
 //!   +----------+---------------------------+
-//!   | sidebar  |         toolbar           |
+//!   | rail     |         toolbar           |
 //!   | (tabs)   +---------------------------+
 //!   |          |          page             |
+//!   | foot     |                           |
 //!   +----------+---------------------------+
 //! ```
+//! Horizontal layout puts a tab strip across the top instead, and the rail goes away.
 
 use crate::ai::{Assistant, LocalAssistant, PageContext};
 use crate::net::{load_target, normalize_target, resolve_url, ShellLoader};
+use crate::settings::{self, Rail, Settings, TabLayout, ZOOM_STEPS};
 use crate::storage;
 use std::num::NonZeroU32;
 use std::rc::Rc;
@@ -24,39 +30,54 @@ use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, Window
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
-use zero_engine::Engine;
+use zero_engine::{Canvas, ElementRect, Engine};
 
-const SIDEBAR_W: u32 = 220;
-const SIDEBAR_HEAD_H: u32 = 44; // header row height, so tab hit-testing is exact
-const TAB_ROW_H: u32 = 40; // padding(10*2) + height(20)
+const RAIL_W: u32 = 236;
+/// Wide enough for one initial plus breathing room, per docs/02-UI-UX-SPEC.md §3.4.
+const RAIL_ICON_W: u32 = 52;
+/// The rail's footer is its own surface so it can sit at the bottom of the window
+/// without the tab list having to know how tall the window is.
+const RAIL_FOOT_H: u32 = 44;
+const TABSTRIP_H: u32 = 38;
 const TOOLBAR_H: u32 = 48;
 const AI_PANEL_W: u32 = 320;
 const SCROLLBAR_W: u32 = 12;
-/// The right-hand strip of a tab row that closes it.
-const CLOSE_W: u32 = 32;
+const MENU_W: u32 = 252;
 /// How much horizontal room one toolbar button takes: glyph box plus padding.
 const BUTTON_SPAN: u32 = 40;
+/// One tab in the horizontal strip, including its close affordance.
+const STRIP_TAB_W: u32 = 176;
 
 /// One palette for the whole browser, so the chrome and the built-in pages are
 /// recognisably the same product. Named rather than repeated hex, so a change
-/// lands everywhere at once.
+/// lands everywhere at once. Values follow docs/02-UI-UX-SPEC.md §3.1.
 pub mod theme {
     pub const CANVAS: &str = "#0e0f12"; // the deepest layer, behind pages
-    pub const CHROME: &str = "#121317"; // sidebar
-    pub const BAR: &str = "#16181d"; // toolbar
+    pub const CHROME: &str = "#121317"; // the tab rail
+    pub const BAR: &str = "#16181d"; // toolbar, menus
     pub const SURFACE: &str = "#1e2027"; // buttons, cards, the address pill
     pub const HOVER: &str = "#282b34";
+    /// Hairline rules. The engine has one font weight, so structure has to come
+    /// from ruled lines and spacing rather than from bolder type.
+    pub const LINE: &str = "#262931";
     pub const TEXT: &str = "#e8eaed";
     pub const MUTED: &str = "#8b919b";
     pub const FAINT: &str = "#5f646e";
     pub const ACCENT: &str = "#e5484d"; // the mark, and the active tab
+    /// The accent at roughly 12% over CHROME — the active tab's wash.
+    pub const ACCENT_SOFT: &str = "#2b171b";
     pub const SAVED: &str = "#f5a524"; // a bookmarked page
+    pub const OK: &str = "#30a46c"; // a secure connection
     pub const LINK: &str = "#66ccff";
 }
 
+/// [`theme::CANVAS`] as a packed pixel, for the parts of the frame that are
+/// filled directly rather than through the engine. A test keeps the two equal.
+const CANVAS_RGB: u32 = 0x0e_0f_12;
+
 /// The glyphs the chrome draws with. Kept in one place because each one has to
 /// exist somewhere in the font chain — see `fonts::load_system_fonts`.
-mod icon {
+pub mod icon {
     pub const BACK: &str = "\u{2190}"; // ←
     pub const FORWARD: &str = "\u{2192}"; // →
     pub const RELOAD: &str = "\u{21bb}"; // ↻
@@ -66,60 +87,199 @@ mod icon {
     pub const FIND: &str = "\u{2315}"; // ⌕
     pub const CLOSE: &str = "\u{00d7}"; // ×
     pub const ADD: &str = "\u{ff0b}"; // ＋
+    pub const MINUS: &str = "\u{2212}"; // −
     pub const SECURE: &str = "\u{1f512}"; // 🔒
     pub const INSECURE: &str = "\u{26a0}"; // ⚠
     pub const SHIELD: &str = "\u{25c6}"; // ◆
+    pub const MENU: &str = "\u{22ee}"; // ⋮
+    pub const COLLAPSE: &str = "\u{00ab}"; // «
+    pub const EXPAND: &str = "\u{00bb}"; // »
+    pub const SETTINGS: &str = "\u{2699}"; // ⚙
+    pub const DOWNLOAD: &str = "\u{2193}"; // ↓
+    pub const PINNED: &str = "\u{25cf}"; // ●
+    pub const ASSISTANT: &str = "\u{25c7}"; // ◇
 }
 
-/// Toolbar styling. Buttons are a fixed square so their glyphs sit centred
-/// rather than lopsided, and the address pill is given the width left over —
-/// without it the pill cannot share a line with the buttons and wraps out of
-/// the bar entirely.
-fn toolbar_css(width: u32) -> String {
-    // Five buttons, the bar's own padding, and the pill's padding. `width` here
-    // is a content width, so anything not subtracted pushes the pill onto a
-    // second line that the 48px-tall bar then clips away.
-    let addr_width = width.saturating_sub(BUTTON_SPAN * 5 + 44).max(80);
-    {
-        format!(
-            "body{{background:{bar};color:{text};font-size:15px;}} \
-             #bar{{padding:8px;height:28px;}} \
-             .btn{{display:inline-block;background:{surface};color:{text};width:24px;\
-                  padding:6px;border-radius:8px;text-align:center;}} \
-             .off{{display:inline-block;background:{bar};color:{faint};width:24px;\
-                  padding:6px;border-radius:8px;text-align:center;}} \
-             .on{{display:inline-block;background:{surface};color:{saved};width:24px;\
-                 padding:6px;border-radius:8px;text-align:center;}} \
-             .hot{{background:{hover};}} \
-             .addr{{display:inline-block;background:{surface};color:{text};padding:7px;\
-                   border-radius:9px;width:{addr_width}px;}} \
-             .lock{{color:{muted};}} .warn{{color:{saved};}} .hint{{color:{faint};}}",
-            bar = theme::BAR,
-            text = theme::TEXT,
-            surface = theme::SURFACE,
-            hover = theme::HOVER,
-            faint = theme::FAINT,
-            saved = theme::SAVED,
-            muted = theme::MUTED,
-        )
+/// What each control says when the cursor rests on it: the action, then the key
+/// that does the same thing. Named by the verb the control performs, so the
+/// tooltip and the menu entry can never drift apart.
+const TIPS: &[(&str, &str)] = &[
+    ("rail", "Tab rail  ·  Ctrl+\\"),
+    ("back", "Back  ·  Alt+←"),
+    ("fwd", "Forward  ·  Alt+→"),
+    ("reload", "Reload  ·  Ctrl+R"),
+    ("star", "Bookmark this page  ·  Ctrl+D"),
+    ("marks", "Bookmarks  ·  Ctrl+B"),
+    ("ai", "Ask about this page  ·  Ctrl+I"),
+    ("overflow", "More"),
+    ("new", "New tab  ·  Ctrl+T"),
+    ("search", "Search your tabs  ·  Ctrl+Shift+A"),
+    ("shield", "Trackers blocked here"),
+    ("zoom", "Page zoom  ·  Ctrl+0 to reset"),
+    ("go:settings", "Settings  ·  Ctrl+,"),
+    ("go:downloads", "Downloads  ·  Ctrl+J"),
+];
+
+/// The overflow menu, in the order it is drawn. `(id, label, shortcut)`.
+const MENU_ITEMS: &[(&str, &str, &str)] = &[
+    ("menu:new", "New tab", "Ctrl+T"),
+    ("menu:reopen", "Reopen closed tab", "Ctrl+Shift+T"),
+    ("menu:pin", "Pin this tab", ""),
+    ("", "", ""), // a rule
+    ("menu:zoom", "Zoom", ""),
+    ("", "", ""),
+    ("menu:find", "Find on page", "Ctrl+F"),
+    ("menu:save", "Save page", "Ctrl+S"),
+    ("menu:source", "View source", "Ctrl+U"),
+    ("", "", ""),
+    ("go:history", "History", "Ctrl+H"),
+    ("go:bookmarks", "Bookmarks", "Ctrl+B"),
+    ("go:downloads", "Downloads", "Ctrl+J"),
+    ("", "", ""),
+    ("go:settings", "Settings", "Ctrl+,"),
+];
+
+/// What owns typed characters. Only one thing can at a time, and the address bar
+/// is what typing falls back to.
+enum Focus {
+    Address,
+    /// Find-in-page, holding the live query.
+    Find(String),
+    /// Filtering the tab rail, holding the live query.
+    TabSearch(String),
+}
+
+impl Focus {
+    fn query(&self) -> Option<&str> {
+        match self {
+            Focus::Find(q) | Focus::TabSearch(q) => Some(q),
+            Focus::Address => None,
+        }
+    }
+
+    fn push(&mut self, text: &str) {
+        if let Focus::Find(q) | Focus::TabSearch(q) = self {
+            q.push_str(text);
+        }
+    }
+
+    fn pop(&mut self) {
+        if let Focus::Find(q) | Focus::TabSearch(q) = self {
+            q.pop();
+        }
     }
 }
 
-fn ai_css() -> &'static str {
-    static CSS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    CSS.get_or_init(|| {
-        format!(
-            "body{{background:{chrome};color:{muted};font-size:14px;}} \
-             #head{{background:{surface};color:{text};padding:12px;height:20px;}} \
-             .line{{padding:3px;color:{text};}} \
-             .src{{color:{faint};padding:12px;font-size:13px;}}",
-            chrome = theme::CHROME,
-            surface = theme::SURFACE,
-            text = theme::TEXT,
-            muted = theme::MUTED,
-            faint = theme::FAINT,
-        )
-    })
+/// A chrome control's painted box, in window coordinates, and what it does.
+struct Hit {
+    id: String,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+}
+
+impl Hit {
+    fn contains(&self, x: f32, y: f32) -> bool {
+        x >= self.x && x <= self.x + self.width && y >= self.y && y <= self.y + self.height
+    }
+}
+
+/// Where every region of the window sits, given its size and the user's layout
+/// preference. Computed once per frame so compositing, hit-testing and
+/// page-coordinate maths cannot disagree about the geometry.
+struct Regions {
+    rail_w: u32,
+    strip_h: u32,
+    ai_w: u32,
+    content_x: u32,
+    content_y: u32,
+    content_w: u32,
+    content_h: u32,
+    width: u32,
+    height: u32,
+}
+
+/// The rail's settled width for these settings — where an animation is heading.
+fn rail_target(settings: Settings) -> u32 {
+    match settings.layout {
+        TabLayout::Horizontal => 0,
+        TabLayout::Vertical => match settings.rail {
+            Rail::Expanded => RAIL_W,
+            Rail::Icons => RAIL_ICON_W,
+            Rail::Hidden => 0,
+        },
+    }
+}
+
+/// Below this width the rail shows initials instead of titles.
+///
+/// Decided from the width the rail actually has rather than from the setting, so
+/// a rail caught mid-collapse switches over on the way past instead of holding a
+/// layout that no longer fits.
+const RAIL_ICON_MAX: u32 = 150;
+
+/// Move an animated value toward its target, independently of frame rate.
+///
+/// Exponential smoothing: quick to start and easing out, which is the calm
+/// motion docs/02-UI-UX-SPEC.md §3.5 asks for. It also retargets mid-flight with
+/// no special case, so collapsing the rail while it is still opening just works.
+fn ease_toward(current: f32, target: f32, dt: f32) -> f32 {
+    // Chosen so a full-width collapse lands in about 260ms — the spec asks for
+    // roughly 300ms, and smoothing has a long tail, so the constant is well
+    // under the figure it is aiming at. The test pins the resulting duration.
+    const TAU: f32 = 0.045;
+    // Snap once the remaining distance is under a pixel, so the animation ends
+    // rather than approaching forever and redrawing every frame.
+    if (target - current).abs() <= 0.5 {
+        return target;
+    }
+    current + (target - current) * (1.0 - (-dt / TAU).exp())
+}
+
+impl Regions {
+    /// `rail_w` is passed in rather than derived from `settings`, because it
+    /// animates: mid-collapse the rail sits between two states, and every other
+    /// region has to be laid out against where it actually is right now.
+    fn of(width: u32, height: u32, settings: Settings, ai_open: bool, rail_w: u32) -> Regions {
+        let rail_w = rail_w.min(width / 2);
+        let strip_h = match settings.layout {
+            TabLayout::Horizontal => TABSTRIP_H.min(height / 4),
+            TabLayout::Vertical => 0,
+        };
+        let ai_w = match ai_open {
+            true => AI_PANEL_W.min(width.saturating_sub(rail_w) / 2),
+            false => 0,
+        };
+        let content_y = (strip_h + TOOLBAR_H).min(height);
+        Regions {
+            rail_w,
+            strip_h,
+            ai_w,
+            content_x: rail_w,
+            content_y,
+            content_w: width.saturating_sub(rail_w + ai_w).max(1),
+            content_h: height.saturating_sub(content_y).max(1),
+            width,
+            height,
+        }
+    }
+
+    /// The regions once any rail animation has finished.
+    #[cfg(test)]
+    fn settled(width: u32, height: u32, settings: Settings, ai_open: bool) -> Regions {
+        Regions::of(width, height, settings, ai_open, rail_target(settings))
+    }
+
+    /// The toolbar spans everything right of the rail, below any tab strip.
+    fn toolbar_w(&self) -> u32 {
+        self.width.saturating_sub(self.rail_w).max(1)
+    }
+
+    /// How tall the rail's tab list is, above its footer.
+    fn rail_list_h(&self) -> u32 {
+        self.height.saturating_sub(RAIL_FOOT_H).max(1)
+    }
 }
 
 /// Where the scrollbar thumb sits within the page area, as (offset, height).
@@ -143,6 +303,30 @@ fn scroll_for_cursor(content: f32, viewport: f32, y: f32) -> f32 {
     ratio * (content - viewport)
 }
 
+/// The size a page is laid out at: the content area divided by the tab's zoom.
+///
+/// Dividing rather than scaling afterwards is what makes zoom *reflow* — a
+/// zoomed page gets a narrower viewport, so its media queries and wrapping
+/// behave as they would in a smaller window, instead of the page being cropped.
+fn layout_size(content_w: u32, content_h: u32, zoom: f32) -> (f32, f32) {
+    ((content_w as f32 / zoom).max(1.0), (content_h as f32 / zoom).max(1.0))
+}
+
+/// The next zoom step in `direction`, clamped at the ends of the scale.
+fn zoom_step(current: u32, direction: i32) -> u32 {
+    let at = ZOOM_STEPS.iter().position(|z| *z == current).unwrap_or_else(|| {
+        // An unlisted value (an old settings file) snaps to the nearest step.
+        ZOOM_STEPS
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, z)| z.abs_diff(current))
+            .map(|(i, _)| i)
+            .expect("the scale is not empty")
+    });
+    let next = (at as i32 + direction).clamp(0, ZOOM_STEPS.len() as i32 - 1);
+    ZOOM_STEPS[next as usize]
+}
+
 /// Where a submitted form navigates to, given the page it was submitted from.
 fn submission_url(address: &str, sent: &zero_engine::Submission) -> String {
     // An empty action means "this page", whose own query the new one replaces.
@@ -162,6 +346,12 @@ fn escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
+/// Ctrl+Shift+T and Ctrl+T arrive as different characters, so chords are matched
+/// on the lowercased key with Shift read separately.
+fn lower(key: &str) -> String {
+    key.to_lowercase()
+}
+
 /// The storage partition for a target: its site for URLs, the file name for local
 /// pages, so two local examples don't share one bucket.
 fn storage_site(address: &str) -> String {
@@ -174,16 +364,18 @@ fn storage_site(address: &str) -> String {
 }
 
 /// The label for a tab: the page's own title when it has one, else its address.
-/// Truncated, because a real title is often longer than the sidebar is wide.
-fn label_for(title: &str, address: &str) -> String {
+///
+/// Truncated to `max` characters, because a real title is longer than any tab is
+/// wide and the engine has no `text-overflow` — so a title that does not fit
+/// wraps onto a second line and is clipped, rather than trailing off politely.
+fn label_for(title: &str, address: &str, max: usize) -> String {
     let text = match title.trim() {
         "" => address_label(address),
         title => title.to_string(),
     };
-    if text.chars().count() > 22 {
-        text.chars().take(21).collect::<String>() + "..."
-    } else {
-        text
+    match text.chars().count() > max {
+        true => text.chars().take(max - 1).chain(['\u{2026}']).collect(),
+        false => text,
     }
 }
 
@@ -192,40 +384,37 @@ fn address_label(address: &str) -> String {
     if address.is_empty() {
         return "New Tab".to_string();
     }
-    let title = match address.split("://").nth(1) {
+    match address.split("://").nth(1) {
         Some(rest) => rest.split('/').next().unwrap_or(rest).to_string(),
         None => std::path::Path::new(address)
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| address.to_string()),
-    };
-    title
+    }
 }
 
-/// What a click in the sidebar landed on.
-#[derive(Debug, PartialEq)]
-enum SidebarHit {
-    Select(usize),
-    Close(usize),
-    NewTab,
-    None,
+/// How wide a tab's title may be in a rail of this width: the rail less the
+/// body's padding, the row's accent edge and inset, and the close affordance.
+fn rail_name_width(rail_w: u32) -> u32 {
+    rail_w.saturating_sub(16 + 3 + 12 + 8 + 32)
 }
 
-/// Resolve a sidebar click. The rows are laid out by the engine, so this
-/// arithmetic has to agree with [`App::sidebar_html`]: a header, then one row
-/// per tab, then the new-tab row.
-fn sidebar_hit(x: f32, y: f32, tabs: usize) -> SidebarHit {
-    if y < SIDEBAR_HEAD_H as f32 {
-        return SidebarHit::None; // the header is decoration
-    }
-    let row = ((y - SIDEBAR_HEAD_H as f32) / TAB_ROW_H as f32) as usize;
-    match row {
-        r if r == tabs => SidebarHit::NewTab,
-        r if r > tabs => SidebarHit::None, // empty space below the list
-        // The close affordance is the right margin of the row.
-        r if x >= (SIDEBAR_W - CLOSE_W) as f32 => SidebarHit::Close(r),
-        r => SidebarHit::Select(r),
-    }
+/// How many characters of a title fit in a rail of this width.
+///
+/// ponytail: characters, not pixels — the engine cannot measure a string, so
+/// this assumes a generous 8px average advance at 13px. Erring wide would wrap
+/// the row, so it errs narrow.
+fn rail_label_room(rail_w: u32) -> usize {
+    (rail_name_width(rail_w) / 8).max(3) as usize
+}
+
+/// The single character that stands for a tab in the icon rail.
+fn initial(label: &str) -> String {
+    label
+        .chars()
+        .find(|c| c.is_alphanumeric())
+        .map(|c| c.to_uppercase().to_string())
+        .unwrap_or_else(|| "\u{2022}".to_string())
 }
 
 /// Everything that belongs to one tab, including its own history and render cache.
@@ -233,19 +422,23 @@ struct Tab {
     address: String,
     /// Owns the parsed DOM and a live JS runtime, so handlers survive between frames.
     doc: zero_engine::Document,
-    element_rects: Vec<zero_engine::ElementRect>,
+    element_rects: Vec<ElementRect>,
     history: Vec<String>,
     history_index: usize,
     scroll_y: f32,
     secure: bool,
     blocked_count: usize,
-    page_canvas: Option<zero_engine::Canvas>,
+    /// Percent. Per tab, so zooming one page doesn't resize every other.
+    zoom: u32,
+    /// Pinned tabs lead the rail and survive "close others" reasoning.
+    pinned: bool,
+    page_canvas: Option<Canvas>,
     links: Vec<zero_engine::LinkArea>,
     /// Find-in-page match boxes from the last render, for jumping between them.
     matches: Vec<zero_engine::layout::Rect>,
     /// Whether the last render's stylesheet reacted to the cursor at all.
     uses_hover: bool,
-    /// The markup this page was built from, kept for view-source.
+    /// The markup this page was built from, kept for view-source and saving.
     source: String,
     /// Shared with this tab's document so its subresource cache outlives a
     /// single render — the engine re-asks for images and stylesheets each time.
@@ -274,6 +467,8 @@ impl Tab {
             scroll_y: 0.0,
             secure: true,
             blocked_count: 0,
+            zoom: settings::current().zoom,
+            pinned: false,
             page_canvas: None,
             links: Vec::new(),
             matches: Vec::new(),
@@ -290,6 +485,20 @@ impl Tab {
         tab.address = address; // shown in the bar, and reloadable like any page
         tab
     }
+
+    /// How the tab names itself in a space `max` characters wide.
+    fn label_capped(&self, max: usize) -> String {
+        label_for(&self.doc.title(), &self.address, max)
+    }
+
+    /// The rail's width, which is what most of the chrome is sized against.
+    fn label(&self) -> String {
+        self.label_capped(22)
+    }
+
+    fn zoom_factor(&self) -> f32 {
+        self.zoom as f32 / 100.0
+    }
 }
 
 /// Compose the browser window — chrome and all — without opening one.
@@ -297,6 +506,10 @@ impl Tab {
 /// The UI is worth looking at while developing it, and this goes through the
 /// same [`App::frame`] the window does, so a screenshot cannot drift from what
 /// the user actually sees.
+///
+/// `poses` put the chrome into a state a still image cannot otherwise reach —
+/// an open menu, a hovered control — so every surface stays reviewable without
+/// a person having to hold the mouse in the right place.
 pub fn screenshot(
     engine: Engine,
     html: String,
@@ -304,79 +517,82 @@ pub fn screenshot(
     address: String,
     width: u32,
     height: u32,
+    poses: &[String],
 ) -> (Vec<u32>, u32, u32) {
     let mut app = App::new(engine, vec![Tab::new(address, html, css)], 0);
+    for pose in poses {
+        // `menu`, `hover:star` and `layout=horizontal` are all poses, so both
+        // separators are accepted rather than making the caller remember which.
+        match pose.split_once([':', '=']).unwrap_or((pose.as_str(), "")) {
+            ("menu", _) => app.menu_open = true,
+            ("ai", _) => {
+                app.ai_open = true;
+                app.run_assistant();
+            }
+            ("hover", id) => app.hovered = Some(id.to_string()),
+            ("railpx", _) => {} // applied after the loop, once settings are known
+            ("search", query) => app.focus = Focus::TabSearch(query.to_string()),
+            ("tabs", n) => {
+                // Extra tabs, so the rail and the strip can be seen carrying more
+                // than one thing.
+                for i in 1..n.parse::<usize>().unwrap_or(3) {
+                    let mut tab = Tab::blank();
+                    tab.address = format!("https://example{i}.org");
+                    tab.pinned = i == 1;
+                    app.tabs.push(tab);
+                }
+            }
+            (key, value) => {
+                let mut settings = app.settings;
+                if settings.set(key, value) {
+                    app.settings = settings;
+                    settings::preview(settings);
+                    // Zoom is a per-tab value, and the tab was built before this
+                    // pose was read — so hand it down, or the shot ignores it.
+                    for tab in &mut app.tabs {
+                        tab.zoom = settings.zoom;
+                    }
+                } else {
+                    eprintln!("unknown pose: {pose}");
+                }
+            }
+        }
+    }
+    // A still image has no time to animate in, so the rail starts where it
+    // lands — unless a pose asked for a particular point mid-slide.
+    if let Some(px) = poses.iter().find_map(|p| p.strip_prefix("railpx:")) {
+        app.rail_px = px.parse().unwrap_or_else(|_| rail_target(app.settings) as f32);
+    } else {
+        app.rail_px = rail_target(app.settings) as f32;
+    }
     (app.frame(width, height), width, height)
 }
 
-impl App {
-    fn new(engine: Engine, tabs: Vec<Tab>, active: usize) -> App {
-        App {
-            engine,
-            tabs,
-            active,
-            modifiers: ModifiersState::default(),
-            cursor: (0.0, 0.0),
-            ai_open: false,
-            ai_text: String::new(),
-            toolbar_rects: Vec::new(),
-            find: None,
-            dragging_scrollbar: false,
-            window: None,
-            surface: None,
-        }
-    }
-}
-
 pub fn run_window(engine: Engine, html: String, css: String, address: String) {
-    let event_loop = EventLoop::new().expect("failed to create event loop");
-    let mut app = App {
-        engine,
-        tabs: vec![Tab::new(address, html, css)],
-        active: 0,
-        modifiers: ModifiersState::default(),
-        cursor: (0.0, 0.0),
-        ai_open: false,
-        ai_text: String::new(),
-        toolbar_rects: Vec::new(),
-        find: None,
-        dragging_scrollbar: false,
-        window: None,
-        surface: None,
-    };
-    event_loop.run_app(&mut app).expect("event loop error");
+    App::new(engine, vec![Tab::new(address, html, css)], 0).run();
 }
 
-/// Reopen the tabs from the previous session, if any were saved.
+/// Reopen the tabs from the previous session, if any were saved and the user
+/// asked for them back.
 pub fn run_window_restoring_session(engine: Engine) -> bool {
-    let Some((urls, active)) = storage::load_session() else { return false };
-    let event_loop = EventLoop::new().expect("failed to create event loop");
-    let tabs: Vec<Tab> = urls
+    if !settings::current().restore {
+        return false;
+    }
+    let Some((saved, active)) = storage::load_session() else { return false };
+    let tabs: Vec<Tab> = saved
         .iter()
-        .map(|url| {
+        .map(|(url, pinned)| {
             let fetched = load_target(url);
             let loader = Rc::new(ShellLoader::new(fetched.url.clone()));
             let mut tab = Tab::new(fetched.url.clone(), String::new(), String::new());
             tab.doc = zero_engine::Document::load_with(&fetched.body, "", loader);
             tab.secure = fetched.secure;
+            tab.pinned = *pinned;
             tab
         })
         .collect();
-    let mut app = App {
-        engine,
-        active: active.min(tabs.len() - 1),
-        tabs,
-        modifiers: ModifiersState::default(),
-        cursor: (0.0, 0.0),
-        ai_open: false,
-        ai_text: String::new(),
-        toolbar_rects: Vec::new(),
-        find: None,
-        dragging_scrollbar: false,
-        window: None,
-        surface: None,
-    };
-    event_loop.run_app(&mut app).expect("event loop error");
+    let active = active.min(tabs.len().saturating_sub(1));
+    App::new(engine, tabs, active).run();
     true
 }
 
@@ -384,25 +600,71 @@ struct App {
     engine: Engine,
     tabs: Vec<Tab>,
     active: usize,
+    settings: Settings,
     modifiers: ModifiersState,
     cursor: (f32, f32),
     ai_open: bool,
     ai_text: String,
-    /// Clickable regions of the toolbar, refreshed every frame.
-    toolbar_rects: Vec<zero_engine::ElementRect>,
-    /// The find-in-page query while the find bar is open. `None` when closed,
-    /// so typing goes back to the address bar.
-    find: Option<String>,
+    menu_open: bool,
+    /// Addresses of recently closed tabs, most recent last.
+    closed: Vec<String>,
+    /// What typed characters go to.
+    focus: Focus,
+    /// Every chrome control's box from the last frame, in paint order — so the
+    /// topmost surface wins a click. Rebuilt each frame.
+    hits: Vec<Hit>,
+    /// Which control the cursor is resting on, for highlighting and tooltips.
+    hovered: Option<String>,
+    /// The rail's width right now, which eases toward [`rail_target`].
+    rail_px: f32,
+    /// When the last animated frame was drawn, for a frame-rate-independent step.
+    /// `None` when nothing is moving, so the first frame of an animation starts
+    /// from rest instead of jumping by however long the window sat idle.
+    last_frame: Option<std::time::Instant>,
+    /// Whether the last frame left something mid-animation and so owes another.
+    animating: bool,
     dragging_scrollbar: bool,
     window: Option<Rc<Window>>,
     surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
+}
+
+impl App {
+    fn new(engine: Engine, tabs: Vec<Tab>, active: usize) -> App {
+        let settings = settings::current();
+        App {
+            engine,
+            tabs,
+            active,
+            settings,
+            rail_px: rail_target(settings) as f32,
+            last_frame: None,
+            animating: false,
+            modifiers: ModifiersState::default(),
+            cursor: (0.0, 0.0),
+            ai_open: false,
+            ai_text: String::new(),
+            menu_open: false,
+            closed: Vec::new(),
+            focus: Focus::Address,
+            hits: Vec::new(),
+            hovered: None,
+            dragging_scrollbar: false,
+            window: None,
+            surface: None,
+        }
+    }
+
+    fn run(mut self) {
+        let event_loop = EventLoop::new().expect("failed to create event loop");
+        event_loop.run_app(&mut self).expect("event loop error");
+    }
 }
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let attrs = Window::default_attributes()
             .with_title("Zero Browser")
-            .with_inner_size(LogicalSize::new(1100.0, 720.0));
+            .with_inner_size(LogicalSize::new(1180.0, 760.0));
         let window = Rc::new(event_loop.create_window(attrs).expect("failed to create window"));
         let context = softbuffer::Context::new(window.clone()).expect("softbuffer context");
         let surface =
@@ -426,17 +688,20 @@ impl ApplicationHandler for App {
                     MouseScrollDelta::LineDelta(_, y) => y * 48.0,
                     MouseScrollDelta::PixelDelta(pos) => pos.y as f32,
                 };
-                let tab = self.tab_mut();
-                tab.scroll_y = (tab.scroll_y - dy).max(0.0); // clamped to content in redraw
+                // Ctrl+wheel zooms, as it does everywhere else.
+                if self.modifiers.control_key() {
+                    self.zoom_by(if dy > 0.0 { 1 } else { -1 });
+                } else {
+                    let tab = self.tab_mut();
+                    tab.scroll_y = (tab.scroll_y - dy).max(0.0); // clamped to content in redraw
+                }
                 self.request_redraw();
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x as f32, position.y as f32);
                 if self.dragging_scrollbar {
-                    let (_, h) = self.window_size();
-                    let page_top = TOOLBAR_H.min(h) as f32;
-                    let page_height = (h as f32 - page_top).max(1.0);
-                    self.scroll_to_cursor(self.cursor.1, page_top, page_height);
+                    let regions = self.regions();
+                    self.scroll_to_cursor(self.cursor.1, &regions);
                     self.request_redraw();
                 } else {
                     self.update_hover();
@@ -475,31 +740,75 @@ impl App {
         }
     }
 
+    fn window_size(&self) -> (u32, u32) {
+        match &self.window {
+            Some(window) => {
+                let s = window.inner_size();
+                (s.width.max(1), s.height.max(1))
+            }
+            None => (1, 1),
+        }
+    }
+
+    /// The regions as last drawn. Uses the rail's animated width, not its target,
+    /// so a click during a collapse hits what is actually on screen.
+    fn regions(&self) -> Regions {
+        let (w, h) = self.window_size();
+        Regions::of(w, h, self.settings, self.ai_open, self.rail_px.round() as u32)
+    }
+
+    /// Step the rail toward its target. Returns whether it is still moving.
+    fn advance_rail(&mut self) -> bool {
+        let target = rail_target(self.settings) as f32;
+        if !self.settings.motion {
+            self.rail_px = target;
+            self.last_frame = None;
+            return false;
+        }
+        if self.rail_px == target {
+            self.last_frame = None;
+            return false;
+        }
+        let now = std::time::Instant::now();
+        // A long gap since the last frame means the window was idle, not that a
+        // huge step is owed — so the clock starts fresh rather than jumping.
+        let dt = match self.last_frame.replace(now) {
+            Some(then) => (now - then).as_secs_f32().min(0.05),
+            None => 0.0,
+        };
+        self.rail_px = ease_toward(self.rail_px, target, dt);
+        self.rail_px != target
+    }
+
     // --- tab management ---
 
     /// Write the open tabs to disk so the next launch can restore them.
     fn save_session(&self) {
-        let urls: Vec<String> =
-            self.tabs.iter().map(|t| t.address.clone()).filter(|a| !a.is_empty()).collect();
-        storage::save_session(&urls, self.active.min(urls.len().saturating_sub(1)));
+        let tabs: Vec<(String, bool)> = self
+            .tabs
+            .iter()
+            .filter(|t| !t.address.is_empty())
+            .map(|t| (t.address.clone(), t.pinned))
+            .collect();
+        storage::save_session(&tabs, self.active.min(tabs.len().saturating_sub(1)));
     }
 
     fn new_tab(&mut self) {
         self.tabs.push(Tab::blank());
         self.active = self.tabs.len() - 1;
+        self.focus = Focus::Address;
         self.save_session();
-    }
-
-    fn close_tab(&mut self) {
-        let active = self.active;
-        self.close_tab_at(active);
     }
 
     fn close_tab_at(&mut self, index: usize) {
         if index >= self.tabs.len() {
             return;
         }
-        self.tabs.remove(index);
+        let gone = self.tabs.remove(index);
+        // Closing is undoable, so remember where it pointed.
+        if !gone.address.is_empty() && gone.address != "zero://newtab" {
+            self.closed.push(gone.address);
+        }
         // Keep the same tab in front where possible: closing one before the
         // active tab would otherwise shift the selection sideways.
         if index < self.active {
@@ -512,31 +821,104 @@ impl App {
         self.save_session();
     }
 
+    /// Reopen the most recently closed tab, in front.
+    fn reopen_closed(&mut self) {
+        let Some(address) = self.closed.pop() else { return };
+        self.tabs.push(Tab::blank());
+        self.active = self.tabs.len() - 1;
+        self.go_to(address);
+    }
+
     fn next_tab(&mut self) {
         self.active = (self.active + 1) % self.tabs.len();
+    }
+
+    fn toggle_pin(&mut self) {
+        let tab = self.tab_mut();
+        tab.pinned = !tab.pinned;
+        self.save_session();
+    }
+
+    /// The tabs to show, in rail order: pinned first, then the rest, each with
+    /// its index into `self.tabs` so ids stay stable however the rail sorts them.
+    fn rail_order(&self) -> Vec<usize> {
+        let query = match &self.focus {
+            Focus::TabSearch(q) => q.to_lowercase(),
+            _ => String::new(),
+        };
+        let mut order: Vec<usize> = (0..self.tabs.len())
+            .filter(|i| {
+                query.is_empty() || {
+                    let tab = &self.tabs[*i];
+                    tab.label().to_lowercase().contains(&query)
+                        || tab.address.to_lowercase().contains(&query)
+                }
+            })
+            .collect();
+        order.sort_by_key(|i| !self.tabs[*i].pinned); // pinned first, order otherwise kept
+        order
+    }
+
+    // --- settings ---
+
+    /// Adopt a changed preference: persist it, and drop every cached page render
+    /// because the content area has almost certainly changed width.
+    fn store_settings(&mut self, settings: Settings) {
+        self.settings = settings;
+        settings::store(settings);
+        for tab in &mut self.tabs {
+            tab.page_canvas = None;
+        }
+    }
+
+    fn cycle_rail(&mut self) {
+        let mut settings = self.settings;
+        // In horizontal layout the rail is not on screen, so the control that
+        // would collapse it brings the rail layout back instead.
+        match settings.layout {
+            TabLayout::Horizontal => settings.layout = TabLayout::Vertical,
+            TabLayout::Vertical => settings.rail = settings.rail.next(),
+        }
+        self.store_settings(settings);
+    }
+
+    // --- zoom ---
+
+    fn zoom_by(&mut self, direction: i32) {
+        let tab = self.tab_mut();
+        tab.zoom = zoom_step(tab.zoom, direction);
+        tab.page_canvas = None;
+    }
+
+    fn zoom_reset(&mut self) {
+        let default = self.settings.zoom;
+        let tab = self.tab_mut();
+        tab.zoom = default;
+        tab.page_canvas = None;
     }
 
     // --- input ---
 
     fn handle_key(&mut self, event: KeyEvent) {
         let ctrl = self.modifiers.control_key();
-        // The find bar owns typing while it is open, like the page field does.
-        if !ctrl && self.find.is_some() {
+        let shift = self.modifiers.shift_key();
+        // A chrome field owns typing while it is open, like a page field does.
+        if !ctrl && self.focus.query().is_some() {
             match event.logical_key {
-                Key::Named(NamedKey::Escape) => self.close_find(),
+                Key::Named(NamedKey::Escape) => self.close_chrome_field(),
                 Key::Named(NamedKey::Backspace) => {
-                    self.find.as_mut().expect("open").pop();
-                    self.apply_find();
+                    self.focus.pop();
+                    self.apply_chrome_field();
                 }
-                Key::Named(NamedKey::Enter) => self.jump_to_match(),
+                Key::Named(NamedKey::Enter) => self.accept_chrome_field(),
                 _ => match &event.text {
                     Some(text) => {
                         let typed: String = text.chars().filter(|c| !c.is_control()).collect();
                         if typed.is_empty() {
                             return;
                         }
-                        self.find.as_mut().expect("open").push_str(&typed);
-                        self.apply_find();
+                        self.focus.push(&typed);
+                        self.apply_chrome_field();
                     }
                     None => return,
                 },
@@ -558,8 +940,7 @@ impl App {
                 }
                 _ => match &event.text {
                     Some(text) => {
-                        let typed: String =
-                            text.chars().filter(|c| !c.is_control()).collect();
+                        let typed: String = text.chars().filter(|c| !c.is_control()).collect();
                         !typed.is_empty() && self.tab_mut().doc.insert_text(&typed)
                     }
                     None => false,
@@ -571,19 +952,38 @@ impl App {
             }
         }
         match event.logical_key {
-            Key::Character(ref c) if ctrl => match c.as_str() {
-                "t" => self.new_tab(),
-                "w" => self.close_tab(),
-                "i" => self.toggle_assistant(),
-                "d" => self.toggle_bookmark(),
-                "f" => self.open_find(),
-                "u" => self.view_source(),
-                "l" => self.tab_mut().address.clear(), // ready for a new address
-                "h" => self.go_to("zero://history".into()),
-                "b" => self.go_to("zero://bookmarks".into()),
+            // Shift changes what a chord means, so match on the lowercased key
+            // and read Shift separately rather than on the character's case.
+            Key::Character(ref c) if ctrl => match (lower(c).as_str(), shift) {
+                ("t", false) => self.new_tab(),
+                ("t", true) => self.reopen_closed(),
+                ("a", true) => self.open_tab_search(),
+                ("w", _) => {
+                    let active = self.active;
+                    self.close_tab_at(active);
+                }
+                ("i", _) => self.toggle_assistant(),
+                ("d", _) => self.toggle_bookmark(),
+                ("f", _) => self.open_find(),
+                ("u", _) => self.view_source(),
+                ("r", _) => self.reload(),
+                ("s", _) => self.save_page(),
+                ("l", _) => {
+                    self.tab_mut().address.clear(); // ready for a new address
+                    self.focus = Focus::Address;
+                }
+                ("h", _) => self.go_to("zero://history".into()),
+                ("b", _) => self.go_to("zero://bookmarks".into()),
+                ("j", _) => self.go_to("zero://downloads".into()),
+                (",", _) => self.go_to("zero://settings".into()),
+                ("\\", _) => self.cycle_rail(),
+                ("=", _) | ("+", _) => self.zoom_by(1),
+                ("-", _) => self.zoom_by(-1),
+                ("0", _) => self.zoom_reset(),
                 _ => {}
             },
             Key::Named(NamedKey::Tab) if ctrl => self.next_tab(),
+            Key::Named(NamedKey::Escape) => self.menu_open = false,
             Key::Named(NamedKey::ArrowLeft) if self.modifiers.alt_key() => self.back(),
             Key::Named(NamedKey::ArrowRight) if self.modifiers.alt_key() => self.forward(),
             Key::Named(NamedKey::Enter) => self.navigate(),
@@ -610,54 +1010,48 @@ impl App {
         }
     }
 
-    fn window_size(&self) -> (u32, u32) {
-        match &self.window {
-            Some(window) => {
-                let s = window.inner_size();
-                (s.width.max(1), s.height.max(1))
-            }
-            None => (1, 1),
-        }
-    }
-
-    /// Route a click: sidebar switches tabs, toolbar buttons act, page follows links.
+    /// Route a click: chrome controls act, everything else goes to the page.
     fn handle_click(&mut self) {
         let (cx, cy) = self.cursor;
-        let (w, h) = self.window_size();
+        let regions = self.regions();
 
-        if cx < SIDEBAR_W as f32 {
-            self.handle_sidebar_click(cx, cy);
-            return;
-        }
-        if cy < TOOLBAR_H as f32 {
-            if self.handle_toolbar_click(cx, cy) {
+        // Topmost surface first, so a menu covering the page wins the click.
+        if let Some(id) = self.hit_at(cx, cy).map(str::to_string) {
+            if self.act_on_menu(&id) || self.act_on(&id) {
+                // Acting on a menu entry closes the menu, so the two can never
+                // disagree about whether it is still up. Zoom is the exception:
+                // it is a value you nudge, so the stepper stays under the cursor.
+                if id != "overflow" && !id.starts_with("zoom") {
+                    self.menu_open = false;
+                }
                 self.request_redraw();
             }
             return;
         }
-
-        // The scrollbar sits at the right edge of the page area.
-        let ai_width = if self.ai_open { AI_PANEL_W.min(w.saturating_sub(SIDEBAR_W)) } else { 0 };
-        let page_right = w.saturating_sub(ai_width) as f32;
-        if cx >= page_right - SCROLLBAR_W as f32 && cx < page_right {
-            let page_top = TOOLBAR_H.min(h) as f32;
-            self.dragging_scrollbar = true;
-            self.scroll_to_cursor(cy, page_top, (h as f32 - page_top).max(1.0));
+        // A click anywhere else dismisses the menu rather than reaching the page:
+        // the first click closes, the second acts, which is what a menu should do.
+        if self.menu_open {
+            self.menu_open = false;
             self.request_redraw();
             return;
         }
-        if self.ai_open {
-            let panel_x0 = self.window.as_ref().map(|w| w.inner_size().width).unwrap_or(0)
-                as f32
-                - AI_PANEL_W as f32;
-            if cx >= panel_x0 {
-                return; // clicks in the assistant panel aren't page clicks
-            }
+        if cx < regions.content_x as f32 || cy < regions.content_y as f32 {
+            return; // chrome, but not a control
         }
 
-        // Window coords -> page coords (undo chrome offsets, add scroll).
-        let px = cx - SIDEBAR_W as f32;
-        let py = cy - TOOLBAR_H as f32 + self.tab().scroll_y;
+        // The scrollbar sits at the right edge of the page area.
+        let page_right = (regions.content_x + regions.content_w) as f32;
+        if cx >= page_right - SCROLLBAR_W as f32 && cx < page_right {
+            self.dragging_scrollbar = true;
+            self.scroll_to_cursor(cy, &regions);
+            self.request_redraw();
+            return;
+        }
+        if cx >= page_right {
+            return; // the assistant panel is not the page
+        }
+
+        let Some((px, py)) = self.page_coords((cx, cy), &regions) else { return };
         self.tab_mut().doc.blur(); // clicking the page clears focus unless a field is hit
         // Innermost element wins, so a handler on a child beats one on its parent.
         let hit = self
@@ -696,6 +1090,62 @@ impl App {
         }
     }
 
+    /// The chrome control under a window position, topmost and innermost first.
+    fn hit_at(&self, x: f32, y: f32) -> Option<&str> {
+        self.hits.iter().rev().find(|hit| hit.contains(x, y)).map(|hit| hit.id.as_str())
+    }
+
+    /// Perform a chrome control's action. Returns whether anything happened.
+    fn act_on(&mut self, id: &str) -> bool {
+        let (verb, arg) = id.split_once(':').unwrap_or((id, ""));
+        match verb {
+            "tab" => {
+                if let Ok(index) = arg.parse::<usize>() {
+                    self.active = index.min(self.tabs.len() - 1);
+                }
+            }
+            "close" => {
+                if let Ok(index) = arg.parse::<usize>() {
+                    self.close_tab_at(index);
+                }
+            }
+            "go" => self.go_to(format!("zero://{arg}")),
+            "new" => self.new_tab(),
+            "rail" => self.cycle_rail(),
+            "back" => self.back(),
+            "fwd" => self.forward(),
+            "reload" => self.reload(),
+            "star" => self.toggle_bookmark(),
+            "marks" => self.go_to("zero://bookmarks".into()),
+            "ai" => self.toggle_assistant(),
+            "search" => self.open_tab_search(),
+            "overflow" => self.menu_open = !self.menu_open,
+            "zoom" => match arg {
+                "in" => self.zoom_by(1),
+                "out" => self.zoom_by(-1),
+                _ => self.zoom_reset(),
+            },
+            "shield" => self.go_to("zero://settings".into()),
+            _ => return false,
+        }
+        true
+    }
+
+    /// Menu entries that have no equivalent toolbar control. Everything else in
+    /// the menu shares an id — and therefore an action — with the toolbar.
+    fn act_on_menu(&mut self, id: &str) -> bool {
+        match id {
+            "menu:new" => self.new_tab(),
+            "menu:reopen" => self.reopen_closed(),
+            "menu:pin" => self.toggle_pin(),
+            "menu:find" => self.open_find(),
+            "menu:save" => self.save_page(),
+            "menu:source" => self.view_source(),
+            _ => return false,
+        }
+        true
+    }
+
     // --- navigation (per tab) ---
 
     fn navigate(&mut self) {
@@ -703,7 +1153,15 @@ impl App {
         self.go_to(target);
     }
 
+    fn reload(&mut self) {
+        let target = self.tab().address.clone();
+        self.load(target);
+    }
+
     fn go_to(&mut self, target: String) {
+        // A settings link carries its new value in the query; applying it here
+        // keeps the address that lands in history clean.
+        let target = self.apply_setting_link(target);
         {
             let tab = self.tab_mut();
             tab.history.truncate(tab.history_index + 1);
@@ -713,6 +1171,15 @@ impl App {
             }
         }
         self.load(target);
+    }
+
+    /// Apply `zero://settings?key=value`, returning the address to actually open.
+    fn apply_setting_link(&mut self, target: String) -> String {
+        let Some(query) = target.strip_prefix("zero://settings?") else { return target };
+        let mut settings = self.settings;
+        settings.apply_query(query);
+        self.store_settings(settings);
+        "zero://settings".to_string()
     }
 
     fn back(&mut self) {
@@ -763,7 +1230,11 @@ impl App {
         tab.page_canvas = None; // force re-render of the new page
         let address = tab.address.clone();
         let title = tab.doc.title();
-        storage::record_visit(&address, &label_for(&title, &address));
+        // Built-in pages are the browser's own furniture, not places you visited.
+        if !crate::internal::is_internal(&address) {
+            // History has room for a full title, unlike a tab.
+            storage::record_visit(&address, &label_for(&title, &address, 120));
+        }
         if let Some(window) = &self.window {
             let shown = if title.is_empty() { address } else { title };
             window.set_title(&format!("Zero Browser — {shown}"));
@@ -774,10 +1245,28 @@ impl App {
         }
     }
 
+    /// Keep a copy of the page in the Downloads folder.
+    fn save_page(&mut self) {
+        let (url, title, source) = {
+            let tab = self.tab();
+            (tab.address.clone(), tab.doc.title(), tab.source.clone())
+        };
+        if source.is_empty() {
+            return;
+        }
+        match storage::save_page(&url, &title, &source) {
+            Some(name) => eprintln!("saved {name}"),
+            None => eprintln!("could not save this page"),
+        }
+    }
+
     // --- assistant ---
 
     fn toggle_assistant(&mut self) {
         self.ai_open = !self.ai_open;
+        for tab in &mut self.tabs {
+            tab.page_canvas = None; // the content area changed width
+        }
         if self.ai_open {
             self.run_assistant();
         }
@@ -794,9 +1283,7 @@ impl App {
             secure: tab.secure,
         };
         let assistant = LocalAssistant;
-        self.ai_text = format!("{}
-
-[{}]", assistant.respond(&ctx), assistant.provenance());
+        self.ai_text = format!("{}\n\n[{}]", assistant.respond(&ctx), assistant.provenance());
     }
 
     fn ai_html(&self) -> String {
@@ -808,75 +1295,6 @@ impl App {
         format!("<html><body><div id=\"head\">Assistant</div>{body}</body></html>")
     }
 
-    // --- chrome, rendered by the engine ---
-
-    fn toolbar_html(&self) -> String {
-        let tab = self.tab();
-        // The padlock is the one claim the address bar makes, so it says plainly
-        // when a page arrived over cleartext.
-        // A built-in page made no connection at all, so it claims nothing.
-        let lock = match (crate::internal::is_internal(&tab.address), tab.secure) {
-            (true, _) => String::new(),
-            (false, true) => format!("<span class=\"lock\">{} </span>", icon::SECURE),
-            (false, false) => format!("<span class=\"warn\">{} not secure </span>", icon::INSECURE),
-        };
-        let shield = match tab.blocked_count {
-            0 => String::new(),
-            n => format!(" <span class=\"hint\">{} {n}</span>", icon::SHIELD),
-        };
-        // Disabled buttons get a dim class and the hovered one lights up, so the
-        // chrome reflects both what is possible and what the cursor is on.
-        let hovered = self.hovered_button();
-        let lit = |id: &str, base: &str| match hovered.as_deref() == Some(id) {
-            true => format!("{base} hot"),
-            false => base.to_string(),
-        };
-        let back = lit("back", if tab.history_index > 0 { "btn" } else { "off" });
-        let fwd = lit(
-            "fwd",
-            if tab.history_index + 1 < tab.history.len() { "btn" } else { "off" },
-        );
-        let reload = lit("reload", "btn");
-        let marks = lit("marks", "btn");
-        // A filled star means this page is already bookmarked.
-        let bookmarked = storage::is_bookmarked(&tab.address);
-        let star = lit("star", if bookmarked { "on" } else { "btn" });
-        // With the find bar open it replaces the address, since it owns typing.
-        if let Some(query) = &self.find {
-            let count = tab.matches.len();
-            let hits = match (query.is_empty(), count) {
-                (true, _) => "type to search this page".to_string(),
-                (false, 0) => "no matches".to_string(),
-                (false, n) => format!("{n} matches - Enter for next, Esc to close"),
-            };
-            return format!(
-                "<html><body><div id=\"bar\">\
-                 <span class=\"btn\">{}</span>\
-                 <span id=\"addr\" class=\"addr\">{}| <span class=\"hint\">{hits}</span></span>\
-                 </div></body></html>",
-                icon::FIND,
-                escape(query)
-            );
-        }
-        format!(
-            "<html><body><div id=\"bar\">\
-             <span id=\"back\" class=\"{back}\">{}</span>\
-             <span id=\"fwd\" class=\"{fwd}\">{}</span>\
-             <span id=\"reload\" class=\"{reload}\">{}</span>\
-             <span id=\"star\" class=\"{star}\">{}</span>\
-             <span id=\"marks\" class=\"{marks}\">{}</span>\
-             <span id=\"addr\" class=\"addr\">{lock}{}|{shield}</span>\
-             </div></body></html>",
-            icon::BACK,
-            icon::FORWARD,
-            icon::RELOAD,
-            if bookmarked { icon::STAR_FULL } else { icon::STAR_EMPTY },
-            icon::BOOKMARKS,
-            escape(&tab.address)
-        )
-    }
-
-    /// Act on a toolbar button, if the cursor is over one.
     /// Enter in a field submits its form, if it is in one; otherwise it just
     /// leaves the field, which is what a lone input does.
     fn submit_focused_form(&mut self) {
@@ -887,15 +1305,27 @@ impl App {
         self.go_to(target);
     }
 
-    /// Tell the page which element the cursor is over, for `:hover`.
-    ///
-    /// Only pages whose stylesheet actually uses `:hover` are re-rendered:
-    /// otherwise every mouse movement would repaint for no visible change.
+    /// Tell the page which element the cursor is over, for `:hover`, and track
+    /// which chrome control it is on, for highlighting and tooltips.
     fn update_hover(&mut self) {
+        let (cx, cy) = self.cursor;
+        let over = self.hit_at(cx, cy).map(str::to_string);
+        if over != self.hovered {
+            self.hovered = over;
+            self.request_redraw();
+        }
         if !self.tab().uses_hover {
             return;
         }
-        let hit = self.page_node_at(self.cursor);
+        let regions = self.regions();
+        let hit = self.page_coords((cx, cy), &regions).and_then(|(px, py)| {
+            self.tab()
+                .element_rects
+                .iter()
+                .filter(|r| px >= r.x && px <= r.x + r.width && py >= r.y && py <= r.y + r.height)
+                .map(|r| r.node_id)
+                .next_back()
+        });
         let tab = self.tab_mut();
         if tab.doc.set_hover(hit) {
             tab.page_canvas = None;
@@ -903,21 +1333,18 @@ impl App {
         }
     }
 
-    /// The innermost element under a window position, if it is over the page.
-    fn page_node_at(&self, (cx, cy): (f32, f32)) -> Option<usize> {
-        let (w, _) = self.window_size();
-        let ai_width = if self.ai_open { AI_PANEL_W.min(w.saturating_sub(SIDEBAR_W)) } else { 0 };
-        if cx < SIDEBAR_W as f32 || cy < TOOLBAR_H as f32 || cx >= (w - ai_width) as f32 {
-            return None; // over the chrome, not the page
+    /// Window coordinates to page coordinates, undoing the chrome offset, the
+    /// scroll position and the tab's zoom. `None` when the point is not on the page.
+    fn page_coords(&self, (cx, cy): (f32, f32), regions: &Regions) -> Option<(f32, f32)> {
+        let page_right = (regions.content_x + regions.content_w) as f32;
+        if cx < regions.content_x as f32 || cy < regions.content_y as f32 || cx >= page_right {
+            return None;
         }
-        let px = cx - SIDEBAR_W as f32;
-        let py = cy - TOOLBAR_H as f32 + self.tab().scroll_y;
-        self.tab()
-            .element_rects
-            .iter()
-            .filter(|r| px >= r.x && px <= r.x + r.width && py >= r.y && py <= r.y + r.height)
-            .map(|r| r.node_id)
-            .next_back()
+        let zoom = self.tab().zoom_factor();
+        Some((
+            (cx - regions.content_x as f32) / zoom,
+            (cy - regions.content_y as f32 + self.tab().scroll_y) / zoom,
+        ))
     }
 
     /// Open the current page's markup in a new tab.
@@ -938,42 +1365,77 @@ impl App {
         self.request_redraw();
     }
 
-    // --- find in page ---
+    // --- chrome fields (find in page, tab search) ---
 
     fn open_find(&mut self) {
-        self.find = Some(String::new());
+        self.focus = Focus::Find(String::new());
+        self.menu_open = false;
         self.tab_mut().doc.blur(); // typing belongs to the find bar now
         self.request_redraw();
     }
 
-    fn close_find(&mut self) {
-        self.find = None;
-        self.tab_mut().doc.set_find(None);
-        self.tab_mut().page_canvas = None; // drop the highlights
+    fn open_tab_search(&mut self) {
+        // Searching tabs you cannot see is no help, so open the rail with it.
+        if self.settings.rail != Rail::Expanded || self.settings.layout != TabLayout::Vertical {
+            let settings = Settings {
+                layout: TabLayout::Vertical,
+                rail: Rail::Expanded,
+                ..self.settings
+            };
+            self.store_settings(settings);
+        }
+        self.focus = Focus::TabSearch(String::new());
+        self.menu_open = false;
+        self.tab_mut().doc.blur();
+        self.request_redraw();
     }
 
-    fn apply_find(&mut self) {
-        let query = self.find.clone();
-        let tab = self.tab_mut();
-        tab.doc.set_find(query);
-        tab.page_canvas = None; // highlights are painted, so re-render
+    fn close_chrome_field(&mut self) {
+        if matches!(self.focus, Focus::Find(_)) {
+            self.tab_mut().doc.set_find(None);
+            self.tab_mut().page_canvas = None; // drop the highlights
+        }
+        self.focus = Focus::Address;
+    }
+
+    /// Push the field's live text at whatever it filters.
+    fn apply_chrome_field(&mut self) {
+        if let Focus::Find(query) = &self.focus {
+            let query = query.clone();
+            let tab = self.tab_mut();
+            tab.doc.set_find(Some(query));
+            tab.page_canvas = None; // highlights are painted, so re-render
+        }
+        // Tab search needs nothing: the rail is rebuilt from the query each frame.
+    }
+
+    /// Enter: the next match for find, the first matching tab for tab search.
+    fn accept_chrome_field(&mut self) {
+        match self.focus {
+            Focus::Find(_) => self.jump_to_match(),
+            Focus::TabSearch(_) => {
+                if let Some(index) = self.rail_order().first().copied() {
+                    self.active = index;
+                    self.focus = Focus::Address;
+                }
+            }
+            Focus::Address => {}
+        }
     }
 
     /// Scroll to the first match below the current position, wrapping at the end.
     fn jump_to_match(&mut self) {
-        let (_, h) = self.window_size();
-        let viewport = (h.saturating_sub(TOOLBAR_H)) as f32;
+        let regions = self.regions();
+        let viewport = regions.content_h as f32;
         let tab = self.tab_mut();
         // Matches are in document order, so "next" is the first one past the top
         // of the viewport; a small margin stops the current match re-matching.
-        let next = tab
-            .matches
-            .iter()
-            .find(|r| r.y > tab.scroll_y + 4.0)
-            .or_else(|| tab.matches.first());
+        let top = tab.scroll_y / tab.zoom_factor();
+        let next =
+            tab.matches.iter().find(|r| r.y > top + 4.0).or_else(|| tab.matches.first()).copied();
         if let Some(rect) = next {
             // Land the match a third of the way down rather than at the very top.
-            tab.scroll_y = (rect.y - viewport / 3.0).max(0.0);
+            tab.scroll_y = (rect.y * tab.zoom_factor() - viewport / 3.0).max(0.0);
         }
     }
 
@@ -984,132 +1446,271 @@ impl App {
             return; // nothing worth saving
         }
         if !storage::remove_bookmark(&url) {
-            let title = label_for(&self.tab().doc.title(), &url);
+            let title = self.tab().label();
             storage::add_bookmark(&url, &title);
         }
         self.request_redraw(); // the star changed
     }
 
-    fn handle_sidebar_click(&mut self, x: f32, y: f32) {
-        match sidebar_hit(x, y, self.tabs.len()) {
-            SidebarHit::Select(row) => self.active = row,
-            SidebarHit::Close(row) => self.close_tab_at(row),
-            SidebarHit::NewTab => self.new_tab(),
-            SidebarHit::None => return,
-        }
-        self.request_redraw();
-    }
-
-    /// Which toolbar button the cursor is over, so it can light up.
-    ///
-    /// The chrome is a separate document from the page and has no hover state of
-    /// its own, so the class is decided here from the boxes the last frame
-    /// reported and baked into the markup.
-    fn hovered_button(&self) -> Option<String> {
-        let (cx, cy) = self.cursor;
-        if cy >= TOOLBAR_H as f32 || cx < SIDEBAR_W as f32 {
-            return None;
-        }
-        let local_x = cx - SIDEBAR_W as f32;
-        self.toolbar_rects
-            .iter()
-            .filter(|r| {
-                !r.id.is_empty()
-                    && local_x >= r.x
-                    && local_x <= r.x + r.width
-                    && cy >= r.y
-                    && cy <= r.y + r.height
-            })
-            .map(|r| r.id.clone())
-            .next_back()
-    }
-
-    fn handle_toolbar_click(&mut self, x: f32, y: f32) -> bool {
-        let local_x = x - SIDEBAR_W as f32;
-        let hit = self
-            .toolbar_rects
-            .iter()
-            .filter(|r| {
-                !r.id.is_empty()
-                    && local_x >= r.x
-                    && local_x <= r.x + r.width
-                    && y >= r.y
-                    && y <= r.y + r.height
-            })
-            .map(|r| r.id.clone())
-            .next_back();
-        match hit.as_deref() {
-            Some("back") => self.back(),
-            Some("fwd") => self.forward(),
-            Some("reload") => {
-                let target = self.tab().address.clone();
-                self.load(target);
-            }
-            Some("star") => self.toggle_bookmark(),
-            Some("marks") => self.go_to("zero://bookmarks".into()),
-            _ => return false,
-        }
-        true
-    }
-
     /// Scroll from a click or drag on the scrollbar track.
-    fn scroll_to_cursor(&mut self, y: f32, page_top: f32, page_height: f32) {
+    fn scroll_to_cursor(&mut self, y: f32, regions: &Regions) {
+        let top = regions.content_y as f32;
+        let viewport = regions.content_h as f32;
         let tab = self.tab_mut();
-        let content = tab.page_canvas.as_ref().map_or(0, |c| c.height) as f32;
-        tab.scroll_y = scroll_for_cursor(content, page_height, y - page_top);
+        let content = tab.page_canvas.as_ref().map_or(0.0, |c| c.height as f32) * tab.zoom_factor();
+        tab.scroll_y = scroll_for_cursor(content, viewport, y - top);
     }
 
-    fn sidebar_html(&self) -> String {
-        // The row under the cursor lifts, so the rail responds like a real one.
-        let hovered = match sidebar_hit(self.cursor.0, self.cursor.1, self.tabs.len()) {
-            SidebarHit::Select(row) | SidebarHit::Close(row) => Some(row),
-            _ => None,
+    // --- chrome markup ---
+
+    /// `hot` when the cursor is on this control, so the chrome reflects what the
+    /// cursor is on. The chrome is a separate document from the page with no
+    /// hover state of its own, so the class is decided here and baked in.
+    fn lit(&self, id: &str, base: &str) -> String {
+        match self.hovered.as_deref() == Some(id) {
+            true => format!("{base} hot"),
+            false => base.to_string(),
+        }
+    }
+
+    fn toolbar_html(&self, regions: &Regions) -> String {
+        let tab = self.tab();
+        // With the find bar open it replaces the address, since it owns typing.
+        if let Focus::Find(query) = &self.focus {
+            let count = tab.matches.len();
+            let hits = match (query.is_empty(), count) {
+                (true, _) => "type to search this page".to_string(),
+                (false, 0) => "no matches".to_string(),
+                (false, n) => format!("{n} matches — Enter for next, Esc to close"),
+            };
+            return format!(
+                "<html><body><div id=\"bar\">\
+                 <span class=\"btn\">{}</span>\
+                 <span class=\"addr\">{}| <span class=\"hint\">{hits}</span></span>\
+                 </div></body></html>",
+                icon::FIND,
+                escape(query)
+            );
+        }
+        // The padlock is the one claim the address bar makes, so it says plainly
+        // when a page arrived over cleartext. A built-in page made no connection
+        // at all, so it claims nothing.
+        let lock = match (crate::internal::is_internal(&tab.address), tab.secure) {
+            (true, _) => String::new(),
+            (false, true) => format!("<span class=\"lock\">{} </span>", icon::SECURE),
+            (false, false) => format!("<span class=\"warn\">{} not secure </span>", icon::INSECURE),
         };
-        let new_tab_hot = matches!(
-            sidebar_hit(self.cursor.0, self.cursor.1, self.tabs.len()),
-            SidebarHit::NewTab
+        let shield = match tab.blocked_count {
+            0 => String::new(),
+            n => format!(" <span id=\"shield\" class=\"hint\">{} {n}</span>", icon::SHIELD),
+        };
+        // A zoom that is not 100% has to be visible, or a page just looks wrong.
+        let zoom = match tab.zoom {
+            100 => String::new(),
+            z => format!("<span id=\"zoom\" class=\"badge\">{z}%</span>"),
+        };
+        // Only the buttons that are actually drawn get counted, so the address
+        // pill fills exactly the width left over rather than wrapping out of the bar.
+        let mut left = String::new();
+        let mut buttons = 4; // back, forward, reload, menu
+        if self.settings.layout == TabLayout::Vertical {
+            let glyph = match self.settings.rail {
+                Rail::Hidden => icon::EXPAND,
+                _ => icon::COLLAPSE,
+            };
+            left.push_str(&format!(
+                "<span id=\"rail\" class=\"{}\">{glyph}</span>",
+                self.lit("rail", "btn")
+            ));
+            buttons += 1;
+        }
+        // With no rail on screen there is nowhere else to open a tab from.
+        let hidden_rail = self.settings.layout == TabLayout::Vertical
+            && self.settings.rail == Rail::Hidden;
+        if hidden_rail {
+            left.push_str(&format!(
+                "<span id=\"new\" class=\"{}\">{}</span>",
+                self.lit("new", "btn"),
+                icon::ADD
+            ));
+            buttons += 1;
+        }
+        let bookmarked = storage::is_bookmarked(&tab.address);
+        let mut right = format!(
+            "<span id=\"star\" class=\"{}\">{}</span>\
+             <span id=\"marks\" class=\"{}\">{}</span>\
+             <span id=\"ai\" class=\"{}\">{}</span>",
+            self.lit("star", if bookmarked { "on" } else { "btn" }),
+            if bookmarked { icon::STAR_FULL } else { icon::STAR_EMPTY },
+            self.lit("marks", "btn"),
+            icon::BOOKMARKS,
+            self.lit("ai", if self.ai_open { "on" } else { "btn" }),
+            icon::ASSISTANT,
         );
-        let rows: String = self
-            .tabs
+        buttons += 3;
+        right.push_str(&format!(
+            "<span id=\"overflow\" class=\"{}\">{}</span>",
+            self.lit("overflow", "btn"),
+            icon::MENU
+        ));
+        let addr_width = regions
+            .toolbar_w()
+            .saturating_sub(BUTTON_SPAN * buttons + 44 + if zoom.is_empty() { 0 } else { 52 })
+            .max(80);
+        let back = self.lit("back", if tab.history_index > 0 { "btn" } else { "off" });
+        let fwd =
+            self.lit("fwd", if tab.history_index + 1 < tab.history.len() { "btn" } else { "off" });
+        format!(
+            "<html><head><style>.addr{{width:{addr_width}px;}}</style></head>\
+             <body><div id=\"bar\">{left}\
+             <span id=\"back\" class=\"{back}\">{}</span>\
+             <span id=\"fwd\" class=\"{fwd}\">{}</span>\
+             <span id=\"reload\" class=\"{}\">{}</span>\
+             <span class=\"addr\">{lock}{}|{shield}</span>{zoom}{right}\
+             </div></body></html>",
+            icon::BACK,
+            icon::FORWARD,
+            self.lit("reload", "btn"),
+            icon::RELOAD,
+            escape(&tab.address),
+        )
+    }
+
+    /// Toolbar styling. Buttons are a fixed square so their glyphs sit centred
+    /// rather than lopsided; the pill's width is injected per frame because it
+    /// depends on how many buttons the current layout draws.
+    fn toolbar_css() -> String {
+        format!(
+            "body{{background:{bar};color:{text};font-size:14px;}} \
+             #bar{{padding:8px;height:28px;\
+                  border-bottom-width:1px;border-color:{line};}} \
+             .btn{{display:inline-block;background:{surface};color:{text};width:24px;\
+                  padding:6px;border-radius:8px;text-align:center;}} \
+             .off{{display:inline-block;background:{bar};color:{faint};width:24px;\
+                  padding:6px;border-radius:8px;text-align:center;}} \
+             .on{{display:inline-block;background:{surface};color:{saved};width:24px;\
+                 padding:6px;border-radius:8px;text-align:center;}} \
+             .hot{{background:{hover};}} \
+             .addr{{display:inline-block;background:{surface};color:{text};padding:7px;\
+                   border-radius:9px;}} \
+             .badge{{display:inline-block;background:{surface};color:{muted};font-size:12px;\
+                    padding:7px;border-radius:8px;}} \
+             .lock{{color:{ok};}} .warn{{color:{saved};}} .hint{{color:{faint};}}",
+            bar = theme::BAR,
+            text = theme::TEXT,
+            surface = theme::SURFACE,
+            hover = theme::HOVER,
+            faint = theme::FAINT,
+            saved = theme::SAVED,
+            muted = theme::MUTED,
+            line = theme::LINE,
+            ok = theme::OK,
+        )
+    }
+
+    /// The vertical rail: a wordmark, a tab search field, the tabs, and a way to
+    /// open another. Pinned tabs lead.
+    fn rail_html(&self, rail_w: u32) -> String {
+        let icons = rail_w <= RAIL_ICON_MAX;
+        let room = rail_label_room(rail_w);
+        let order = self.rail_order();
+        let rows: String = order
             .iter()
-            .enumerate()
-            .map(|(i, t)| {
-                let class = match (i == self.active, hovered == Some(i)) {
-                    (true, _) => "tab active",
-                    (false, true) => "tab hot",
-                    (false, false) => "tab",
+            .map(|i| {
+                let tab = &self.tabs[*i];
+                let base = match *i == self.active {
+                    true => "tab active",
+                    false => "tab",
                 };
-                let label = label_for(&t.doc.title(), &t.address);
-                // The x sits in the row's right margin, where clicks close the tab.
+                let class = self.lit(&format!("tab:{i}"), base);
+                if icons {
+                    return format!(
+                        "<div id=\"tab:{i}\" class=\"{class}\">{}</div>",
+                        escape(&initial(&tab.label()))
+                    );
+                }
+                let pin = match tab.pinned {
+                    true => format!("<span class=\"pin\">{} </span>", icon::PINNED),
+                    false => String::new(),
+                };
                 format!(
-                    "<div class=\"{class}\"><span class=\"name\">{}</span>                     <span class=\"x\">{}</span></div>",
-                    escape(&label),
+                    "<div id=\"tab:{i}\" class=\"{class}\">\
+                     <span class=\"name\">{pin}{}</span>\
+                     <span id=\"close:{i}\" class=\"{}\">{}</span></div>",
+                    escape(&tab.label_capped(room)),
+                    self.lit(&format!("close:{i}"), "x"),
                     icon::CLOSE,
                 )
             })
             .collect();
-        let new_class = if new_tab_hot { "tab new hot" } else { "tab new" };
-        format!(
-            "<html><body><div id=\"head\">zero</div>{rows}             <div class=\"{new_class}\">{}  New tab</div></body></html>",
+        let new = format!(
+            "<div id=\"new\" class=\"{}\">{}{}</div>",
+            self.lit("new", "tab new"),
             icon::ADD,
+            if icons { String::new() } else { "  New tab".to_string() },
+        );
+        if icons {
+            return format!(
+                "<html><body><div id=\"head\">0</div>{rows}{new}</body></html>"
+            );
+        }
+        // The search field replaces the header's subtitle while it is open, so the
+        // rail never grows a row it did not have a moment ago.
+        let search = match &self.focus {
+            Focus::TabSearch(query) => format!(
+                "<div id=\"search\" class=\"find on\">{} {}|</div>",
+                icon::FIND,
+                escape(query)
+            ),
+            _ => format!(
+                "<div id=\"search\" class=\"{}\">{} Search tabs</div>",
+                self.lit("search", "find"),
+                icon::FIND
+            ),
+        };
+        let empty = match rows.is_empty() {
+            true => "<div class=\"none\">No tab matches that.</div>",
+            false => "",
+        };
+        format!(
+            "<html><body><div id=\"head\">zero</div>{search}{rows}{empty}{new}</body></html>"
         )
     }
 
-    /// Height is injected so the sidebar background fills the window.
-    fn sidebar_css(height: u32) -> String {
+    /// Height is injected so the rail background fills the window, and the rail's
+    /// own width because it animates — every inner measurement follows from it.
+    fn rail_css(height: u32, rail_w: u32) -> String {
+        let icons = rail_w <= RAIL_ICON_MAX;
+        // The name gives up whatever the close affordance and the row's own
+        // insets need, so a long title is truncated rather than wrapping the
+        // close glyph onto a second line.
+        let (row_pad, name_w) = match icons {
+            true => (0, 0),
+            false => (12, rail_name_width(rail_w)),
+        };
         format!(
-            "body{{background:{chrome};color:{muted};font-size:14px;height:{height}px;}} \
-             #head{{color:{accent};padding:12px;height:20px;font-size:16px;}} \
-             .tab{{padding:10px;height:20px;border-radius:8px;}} \
+            "body{{background:{chrome};color:{muted};font-size:13px;height:{height}px;\
+                  padding-left:8px;padding-right:8px;}} \
+             #head{{color:{accent};padding-top:14px;padding-bottom:14px;padding-left:{row_pad}px;\
+                   font-size:15px;text-align:{align};}} \
+             .find{{color:{faint};font-size:12px;padding-top:8px;padding-bottom:8px;\
+                   padding-left:{row_pad}px;border-radius:8px;margin-bottom:6px;}} \
+             .on{{background:{surface};color:{text};}} \
+             .tab{{padding-top:9px;padding-bottom:9px;padding-left:{row_pad}px;\
+                  padding-right:8px;border-radius:9px;\
+                  border-left-width:3px;border-color:{chrome};text-align:{align};}} \
              .hot{{background:{hover};color:{text};}} \
-             .active{{background:{surface};color:{text};}} \
-             .new{{color:{faint};}} \
-             .name{{display:inline-block;width:{name}px;}} \
-             .x{{display:inline-block;width:{close}px;color:{faint};text-align:right;}}",
-            name = SIDEBAR_W - CLOSE_W - 24, // 24 = the row's left+right padding
-            close = CLOSE_W - 8,
+             .active{{background:{soft};color:{text};border-left-width:3px;border-color:{accent};}} \
+             .new{{color:{faint};margin-top:4px;}} \
+             .none{{color:{faint};font-size:12px;padding-top:10px;padding-left:{row_pad}px;}} \
+             .pin{{color:{accent};font-size:9px;}} \
+             .name{{display:inline-block;width:{name_w}px;}} \
+             .x{{display:inline-block;width:24px;color:{faint};text-align:right;\
+                border-radius:6px;}}",
+            align = if icons { "center" } else { "left" },
             chrome = theme::CHROME,
             surface = theme::SURFACE,
+            soft = theme::ACCENT_SOFT,
             hover = theme::HOVER,
             text = theme::TEXT,
             muted = theme::MUTED,
@@ -1118,31 +1719,278 @@ impl App {
         )
     }
 
+    /// The rail's footer: a permanent home for settings, pinned to the bottom of
+    /// the window by being its own surface rather than by padding arithmetic.
+    fn rail_foot_html(&self, icons: bool) -> String {
+        let settings = format!(
+            "<span id=\"go:settings\" class=\"{}\">{}{}</span>",
+            self.lit("go:settings", "foot"),
+            icon::SETTINGS,
+            if icons { String::new() } else { "  Settings".to_string() },
+        );
+        let downloads = match icons {
+            true => String::new(),
+            false => format!(
+                "<span id=\"go:downloads\" class=\"{}\">{}</span>",
+                self.lit("go:downloads", "foot"),
+                icon::DOWNLOAD
+            ),
+        };
+        format!("<html><body><div id=\"row\">{settings}{downloads}</div></body></html>")
+    }
+
+    fn rail_foot_css(icons: bool) -> String {
+        format!(
+            "body{{background:{chrome};color:{muted};font-size:13px;\
+                  padding-left:8px;padding-right:8px;}} \
+             #row{{display:flex;justify-content:{justify};align-items:center;\
+                  padding-top:10px;border-top-width:1px;border-color:{line};height:24px;}} \
+             .foot{{display:inline-block;color:{faint};padding-top:5px;padding-bottom:5px;\
+                   padding-left:10px;padding-right:10px;border-radius:8px;}} \
+             .hot{{background:{hover};color:{text};}}",
+            justify = if icons { "center" } else { "space-between" },
+            chrome = theme::CHROME,
+            hover = theme::HOVER,
+            text = theme::TEXT,
+            muted = theme::MUTED,
+            faint = theme::FAINT,
+            line = theme::LINE,
+        )
+    }
+
+    /// The horizontal tab strip. Tabs that do not fit are reachable from tab
+    /// search and Ctrl+Tab.
+    ///
+    /// ponytail: no scrolling or overflow chevron — the count tells you how many
+    /// are hidden. Add a scroll offset here if people start living past tab 8.
+    fn strip_html(&self, regions: &Regions) -> String {
+        let order = self.rail_order();
+        let room = (regions.width.saturating_sub(140) / STRIP_TAB_W).max(1) as usize;
+        let shown = order.len().min(room);
+        let tabs: String = order[..shown]
+            .iter()
+            .map(|i| {
+                let tab = &self.tabs[*i];
+                let base = match *i == self.active {
+                    true => "tab active",
+                    false => "tab",
+                };
+                let pin = match tab.pinned {
+                    true => format!("<span class=\"pin\">{} </span>", icon::PINNED),
+                    false => String::new(),
+                };
+                // A strip tab is narrower than a rail row, so it names itself
+                // more briefly. The tooltip still gives the full title.
+                let room = if tab.pinned { 14 } else { 16 };
+                format!(
+                    "<span id=\"tab:{i}\" class=\"{}\"><span class=\"name\">{pin}{}</span>\
+                     <span id=\"close:{i}\" class=\"{}\">{}</span></span>",
+                    self.lit(&format!("tab:{i}"), base),
+                    escape(&tab.label_capped(room)),
+                    self.lit(&format!("close:{i}"), "x"),
+                    icon::CLOSE,
+                )
+            })
+            .collect();
+        let more = match order.len() - shown {
+            0 => String::new(),
+            n => format!("<span class=\"more\">+{n}</span>"),
+        };
+        format!(
+            "<html><body><div id=\"strip\"><span class=\"mark\">zero</span>{tabs}\
+             <span id=\"new\" class=\"{}\">{}</span>{more}\
+             <span id=\"rail\" class=\"{}\">{}</span></div></body></html>",
+            self.lit("new", "add"),
+            icon::ADD,
+            self.lit("rail", "add"),
+            icon::COLLAPSE,
+        )
+    }
+
+    fn strip_css() -> String {
+        format!(
+            "body{{background:{chrome};color:{muted};font-size:13px;}} \
+             #strip{{padding-left:10px;padding-top:6px;height:26px;\
+                    border-bottom-width:1px;border-color:{line};}} \
+             .mark{{display:inline-block;color:{accent};width:44px;font-size:15px;\
+                   padding-top:5px;padding-bottom:5px;}} \
+             .tab{{display:inline-block;width:{tab_w}px;padding-top:5px;padding-bottom:5px;\
+                  padding-left:10px;padding-right:6px;border-radius:8px;\
+                  border-bottom-width:2px;border-color:{chrome};}} \
+             .active{{display:inline-block;width:{tab_w}px;background:{soft};color:{text};\
+                     padding-top:5px;padding-bottom:5px;padding-left:10px;padding-right:6px;\
+                     border-radius:8px;border-bottom-width:2px;border-color:{accent};}} \
+             .hot{{background:{hover};color:{text};}} \
+             .name{{display:inline-block;width:{name_w}px;}} \
+             .x{{display:inline-block;width:18px;color:{faint};text-align:right;}} \
+             .add{{display:inline-block;color:{muted};width:20px;padding:5px;\
+                  border-radius:7px;text-align:center;}} \
+             .more{{display:inline-block;color:{faint};font-size:12px;padding:6px;}} \
+             .pin{{color:{accent};font-size:9px;}}",
+            tab_w = STRIP_TAB_W - 32,
+            name_w = STRIP_TAB_W - 32 - 34,
+            chrome = theme::CHROME,
+            soft = theme::ACCENT_SOFT,
+            hover = theme::HOVER,
+            text = theme::TEXT,
+            muted = theme::MUTED,
+            faint = theme::FAINT,
+            accent = theme::ACCENT,
+            line = theme::LINE,
+        )
+    }
+
+    fn menu_html(&self) -> String {
+        let items: String = MENU_ITEMS
+            .iter()
+            .map(|(id, label, key)| {
+                if id.is_empty() {
+                    return "<div class=\"rule\"></div>".to_string();
+                }
+                if *id == "menu:zoom" {
+                    // Zoom is a value, not a destination, so it gets a stepper.
+                    // Laid out in normal flow rather than as a flex row: the
+                    // engine will not hold three small boxes on one flex line.
+                    return format!(
+                        "<div class=\"zoom\"><span class=\"zlabel\">Zoom</span>\
+                         <span id=\"zoom:out\" class=\"{}\">{}</span>\
+                         <span id=\"zoom:reset\" class=\"{}\">{}%</span>\
+                         <span id=\"zoom:in\" class=\"{}\">{}</span></div>",
+                        self.lit("zoom:out", "step"),
+                        icon::MINUS,
+                        self.lit("zoom:reset", "level"),
+                        self.tab().zoom,
+                        self.lit("zoom:in", "step"),
+                        icon::ADD,
+                    );
+                }
+                let label = match *id {
+                    "menu:pin" if self.tab().pinned => "Unpin this tab",
+                    "menu:reopen" if self.closed.is_empty() => return String::new(),
+                    _ => label,
+                };
+                format!(
+                    "<div id=\"{id}\" class=\"{}\"><span class=\"label\">{label}</span>\
+                     <span class=\"key\">{key}</span></div>",
+                    self.lit(id, "row item"),
+                )
+            })
+            .collect();
+        format!("<html><body>{items}</body></html>")
+    }
+
+    fn menu_css() -> String {
+        format!(
+            "body{{background:{bar};color:{text};font-size:13px;\
+                  border-width:1px;border-color:{line};\
+                  padding-top:6px;padding-bottom:6px;padding-left:6px;padding-right:6px;}} \
+             .row{{display:flex;justify-content:space-between;align-items:center;\
+                  padding-top:8px;padding-bottom:8px;padding-left:10px;padding-right:10px;\
+                  border-radius:7px;}} \
+             .item{{color:{text};}} \
+             .hot{{background:{hover};}} \
+             .rule{{height:1px;background:{line};margin-top:6px;margin-bottom:6px;}} \
+             .label{{color:{text};}} \
+             .key{{color:{faint};font-size:12px;}} \
+             .zoom{{padding-top:8px;padding-bottom:8px;\
+                   padding-left:10px;padding-right:10px;}} \
+             .zlabel{{display:inline-block;color:{text};width:96px;}} \
+             .step{{display:inline-block;background:{surface};color:{text};width:16px;\
+                   padding:4px;border-radius:6px;text-align:center;}} \
+             .level{{display:inline-block;color:{muted};width:44px;font-size:12px;\
+                    padding:4px;text-align:center;border-radius:6px;}}",
+            bar = theme::BAR,
+            surface = theme::SURFACE,
+            hover = theme::HOVER,
+            text = theme::TEXT,
+            muted = theme::MUTED,
+            faint = theme::FAINT,
+            line = theme::LINE,
+        )
+    }
+
+    fn tooltip_css() -> String {
+        format!(
+            "body{{background:{surface};color:{text};font-size:12px;\
+                  border-width:1px;border-color:{line};}} \
+             #tip{{padding-top:6px;padding-bottom:6px;padding-left:10px;padding-right:10px;\
+                  text-align:center;}}",
+            surface = theme::SURFACE,
+            text = theme::TEXT,
+            line = theme::LINE,
+        )
+    }
+
+    /// What the cursor is resting on, if it has something to say. Tab rows
+    /// describe themselves, which is the whole point of the icon rail.
+    fn tooltip_text(&self) -> Option<String> {
+        if self.menu_open {
+            return None; // an open menu already names everything it offers
+        }
+        let id = self.hovered.as_deref()?;
+        if let Some(index) = id.strip_prefix("tab:").and_then(|i| i.parse::<usize>().ok()) {
+            return self.tabs.get(index).map(|tab| tab.label());
+        }
+        if id.starts_with("close:") {
+            return Some("Close tab  ·  Ctrl+W".to_string());
+        }
+        TIPS.iter().find(|(key, _)| *key == id).map(|(_, tip)| tip.to_string())
+    }
+
+    // --- compositing ---
+
+    /// Render a chrome document and record where it painted each of its controls,
+    /// in window coordinates. `interactive` documents contribute to hit-testing;
+    /// tooltips do not, because you cannot click a tooltip.
+    fn chrome(
+        engine: &Engine,
+        hits: &mut Vec<Hit>,
+        html: &str,
+        css: &str,
+        (x, y): (u32, u32),
+        (w, h): (u32, u32),
+        interactive: bool,
+    ) -> Canvas {
+        let loader = ShellLoader::new(String::new());
+        let page = engine.render_page(html, css, w as f32, h as f32, &loader);
+        if interactive {
+            hits.extend(page.element_rects.iter().filter(|r| !r.id.is_empty()).map(|r| Hit {
+                id: r.id.clone(),
+                x: r.x + x as f32,
+                y: r.y + y as f32,
+                width: r.width,
+                height: r.height,
+            }));
+        }
+        page.canvas
+    }
+
     /// Render every region and compose them into one frame (0xRRGGBB per pixel).
     ///
     /// Independent of the window, so a headless screenshot goes through exactly
     /// the same path the user sees rather than a second, drifting copy.
     fn frame(&mut self, w: u32, h: u32) -> Vec<u32> {
-        let sw = SIDEBAR_W.min(w);
-        // The assistant panel takes width from the content area, so the page reflows.
-        let aw = if self.ai_open { AI_PANEL_W.min(w.saturating_sub(sw)) } else { 0 };
-        let content_w = w.saturating_sub(sw + aw).max(1);
-        let tb = TOOLBAR_H.min(h);
-        let page_vh = h.saturating_sub(tb).max(1);
+        self.animating = self.advance_rail();
+        let regions = Regions::of(w, h, self.settings, self.ai_open, self.rail_px.round() as u32);
+        let zoom = self.tab().zoom_factor();
 
         // Re-render the active tab only when its page or layout size changed;
-        // scrolling and tab switching just re-blit cached canvases.
+        // scrolling and tab switching just re-blit cached canvases. The page is
+        // laid out at the zoomed-down width, so zooming reflows rather than crops.
+        let (layout_w, layout_h) = layout_size(regions.content_w, regions.content_h, zoom);
         {
             let engine = &self.engine;
+            let animating = self.animating;
             let tab = &mut self.tabs[self.active];
-            if tab.page_canvas.is_none() || tab.cache_w != content_w || tab.cache_h != page_vh {
+            // Mid-animation the content area changes width every frame, and
+            // re-laying out a real page at 60fps would make the slide stutter.
+            // The last layout is slid instead, and reflows once the rail lands —
+            // which is what every other browser does with an animating panel.
+            let stale = tab.cache_w != layout_w as u32 || tab.cache_h != layout_h as u32;
+            if tab.page_canvas.is_none() || (stale && !animating) {
                 let loader = tab.loader.clone();
-                let page = engine.render_document(
-                    &mut tab.doc,
-                    content_w as f32,
-                    page_vh as f32,
-                    loader.as_ref(),
-                );
+                let page =
+                    engine.render_document(&mut tab.doc, layout_w, layout_h, loader.as_ref());
                 tab.blocked_count = loader.blocked.get();
                 for line in &page.console {
                     eprintln!("[js] {line}");
@@ -1152,74 +2000,209 @@ impl App {
                 tab.matches = page.find_matches;
                 tab.uses_hover = page.uses_hover;
                 tab.element_rects = page.element_rects;
-                tab.cache_w = content_w;
-                tab.cache_h = page_vh;
+                tab.cache_w = layout_w as u32;
+                tab.cache_h = layout_h as u32;
             }
-            // Clamp scroll to available overflow.
-            let page_height = tab.page_canvas.as_ref().unwrap().height;
-            let max_scroll = page_height.saturating_sub(page_vh as usize) as f32;
+            // Clamp scroll to available overflow, in screen pixels.
+            let content = tab.page_canvas.as_ref().expect("just rendered").height as f32 * zoom;
+            let max_scroll = (content - regions.content_h as f32).max(0.0);
             tab.scroll_y = tab.scroll_y.clamp(0.0, max_scroll);
         }
-        let scroll = self.tab().scroll_y as usize;
+        let scroll = self.tab().scroll_y;
 
-        // Chrome is cheap; render fresh each frame so typing/tab changes show.
-        let sidebar =
-            self.engine.render(&self.sidebar_html(), &Self::sidebar_css(h), sw as f32, h as f32);
-        let toolbar_page = self.engine.render_page(
-            &self.toolbar_html(),
-            &toolbar_css(content_w),
-            content_w as f32,
-            tb as f32,
-            &crate::net::ShellLoader::new(String::new()),
-        );
-        self.toolbar_rects = toolbar_page.element_rects;
-        let toolbar = toolbar_page.canvas;
-        let ai_panel = if aw > 0 {
-            Some(self.engine.render(&self.ai_html(), ai_css(), aw as f32, h as f32))
-        } else {
-            None
-        };
+        // Chrome is cheap; render fresh each frame so typing and tab changes show.
+        let mut hits = Vec::new();
+        let engine = &self.engine;
+        let mut surfaces: Vec<(Canvas, u32, u32)> = Vec::new();
+        if regions.rail_w > 0 {
+            let icons = regions.rail_w <= RAIL_ICON_MAX;
+            let list_h = regions.rail_list_h();
+            surfaces.push((
+                Self::chrome(
+                    engine,
+                    &mut hits,
+                    &self.rail_html(regions.rail_w),
+                    &Self::rail_css(list_h, regions.rail_w),
+                    (0, 0),
+                    (regions.rail_w, list_h),
+                    true,
+                ),
+                0,
+                0,
+            ));
+            surfaces.push((
+                Self::chrome(
+                    engine,
+                    &mut hits,
+                    &self.rail_foot_html(icons),
+                    &Self::rail_foot_css(icons),
+                    (0, list_h),
+                    (regions.rail_w, RAIL_FOOT_H),
+                    true,
+                ),
+                0,
+                list_h,
+            ));
+        }
+        if regions.strip_h > 0 {
+            surfaces.push((
+                Self::chrome(
+                    engine,
+                    &mut hits,
+                    &self.strip_html(&regions),
+                    &Self::strip_css(),
+                    (0, 0),
+                    (regions.width, regions.strip_h),
+                    true,
+                ),
+                0,
+                0,
+            ));
+        }
+        surfaces.push((
+            Self::chrome(
+                engine,
+                &mut hits,
+                &self.toolbar_html(&regions),
+                &Self::toolbar_css(),
+                (regions.rail_w, regions.strip_h),
+                (regions.toolbar_w(), TOOLBAR_H),
+                true,
+            ),
+            regions.rail_w,
+            regions.strip_h,
+        ));
+        if regions.ai_w > 0 {
+            let x = regions.width - regions.ai_w;
+            surfaces.push((
+                Self::chrome(
+                    engine,
+                    &mut hits,
+                    &self.ai_html(),
+                    Self::ai_css(),
+                    (x, regions.content_y),
+                    (regions.ai_w, regions.content_h),
+                    false,
+                ),
+                x,
+                regions.content_y,
+            ));
+        }
 
-        let page = self.tabs[self.active].page_canvas.as_ref().unwrap();
-        let mut buffer = vec![0u32; (w * h) as usize];
-
-        let (w, sw, tb, aw) = (w as usize, sw as usize, tb as usize, aw as usize);
-        let ai_x0 = w - aw; // panel occupies the right edge
-        for y in 0..h as usize {
-            for x in 0..w {
-                let px = if x < sw {
-                    sidebar.pixels[y * sidebar.width + x]
-                } else if aw > 0 && x >= ai_x0 {
-                    let panel = ai_panel.as_ref().unwrap();
-                    panel.pixels[y * panel.width + (x - ai_x0)]
-                } else if y < tb {
-                    toolbar.pixels[y * toolbar.width + (x - sw)]
-                } else {
-                    let py = (y - tb) + scroll;
-                    page.pixels[py * page.width + (x - sw)]
-                };
-                buffer[y * w + x] = (px.r as u32) << 16 | (px.g as u32) << 8 | px.b as u32;
+        // --- compose ---
+        // Starts as the canvas colour rather than black, because mid-animation
+        // the page can be narrower than the area it is being slid into.
+        let mut buffer = vec![CANVAS_RGB; (w * h) as usize];
+        let page = self.tabs[self.active].page_canvas.as_ref().expect("rendered above");
+        let inv_zoom = 1.0 / zoom;
+        for y in regions.content_y..h {
+            let sy = ((y - regions.content_y) as f32 + scroll) * inv_zoom;
+            let sy = (sy as usize).min(page.height.saturating_sub(1));
+            let row = sy * page.width;
+            for x in regions.content_x..(regions.content_x + regions.content_w).min(w) {
+                let sx = ((x - regions.content_x) as f32 * inv_zoom) as usize;
+                if sx >= page.width {
+                    break; // a stale layout narrower than the area it is sliding into
+                }
+                let px = page.pixels[row + sx];
+                buffer[(y * w + x) as usize] =
+                    (px.r as u32) << 16 | (px.g as u32) << 8 | px.b as u32;
             }
+        }
+        for (canvas, x, y) in &surfaces {
+            blit(&mut buffer, w, h, canvas, *x, *y);
         }
 
         // Scrollbar: a track down the right edge of the page, with a thumb sized
         // to the visible fraction. Only shown when the page actually overflows.
-        let content_h = page.height as f32;
-        let viewport_h = (h as usize - tb) as f32;
-        if let Some((offset, thumb_h)) = scrollbar_thumb(content_h, viewport_h, scroll as f32) {
-            let bar_w = SCROLLBAR_W as usize;
-            let x0 = (w - aw).saturating_sub(bar_w);
-            let thumb = thumb_h as usize;
-            let thumb_top = tb + offset as usize;
-            for y in tb..h as usize {
+        let content_h = page.height as f32 * zoom;
+        if let Some((offset, thumb_h)) =
+            scrollbar_thumb(content_h, regions.content_h as f32, scroll)
+        {
+            let bar_w = SCROLLBAR_W;
+            let x0 = (regions.content_x + regions.content_w).saturating_sub(bar_w);
+            let thumb_top = regions.content_y + offset as u32;
+            for y in regions.content_y..h {
                 for x in x0..(x0 + bar_w).min(w) {
-                    let on_thumb = y >= thumb_top && y < thumb_top + thumb;
-                    let shade: u32 = if on_thumb { 0x5f636d } else { 0x1a1c21 };
-                    buffer[y * w + x] = shade;
+                    let on_thumb = y >= thumb_top && y < thumb_top + thumb_h as u32;
+                    buffer[(y * w + x) as usize] = if on_thumb { 0x5f636d } else { 0x1a1c21 };
                 }
             }
         }
+
+        // Overlays last, so they sit above the page and the chrome alike.
+        if self.menu_open {
+            let x = regions.width.saturating_sub(MENU_W + 10);
+            let y = regions.content_y + 4;
+            let menu = Self::chrome(
+                engine,
+                &mut hits,
+                &self.menu_html(),
+                &Self::menu_css(),
+                (x, y),
+                (MENU_W, 1), // height comes from the content
+                true,
+            );
+            blit(&mut buffer, w, h, &menu, x, y);
+        }
+        if let Some(text) = self.tooltip_text() {
+            if let Some((x, y, tw)) = self.tooltip_box(&text, &hits, &regions) {
+                let tip = Self::chrome(
+                    engine,
+                    &mut hits,
+                    &format!("<html><body><div id=\"tip\">{}</div></body></html>", escape(&text)),
+                    &Self::tooltip_css(),
+                    (x, y),
+                    (tw, 1),
+                    false,
+                );
+                blit(&mut buffer, w, h, &tip, x, y);
+            }
+        }
+
+        self.hits = hits;
         buffer
+    }
+
+    /// Where a tooltip goes: beside the rail so it does not cover the tab it
+    /// names, below anything else, and always inside the window.
+    ///
+    /// ponytail: the width is estimated from the character count rather than
+    /// measured, so a proportional font leaves a little slack — which centring
+    /// spends symmetrically. Ask the engine to measure if it ever looks wrong.
+    fn tooltip_box(&self, text: &str, hits: &[Hit], regions: &Regions) -> Option<(u32, u32, u32)> {
+        let id = self.hovered.as_deref()?;
+        let anchor = hits.iter().find(|hit| hit.id == id)?;
+        let width = (text.chars().count() as u32 * 7 + 24).clamp(72, 280);
+        let in_rail = regions.rail_w > 0 && anchor.x < regions.rail_w as f32;
+        let (x, y) = match in_rail {
+            true => (regions.rail_w + 6, anchor.y as u32),
+            false => (
+                (anchor.x + anchor.width / 2.0 - width as f32 / 2.0).max(6.0) as u32,
+                (anchor.y + anchor.height) as u32 + 8,
+            ),
+        };
+        // Keep the whole tip on screen, including when the control is at the edge.
+        let x = x.min(regions.width.saturating_sub(width + 6));
+        let y = y.min(regions.height.saturating_sub(40));
+        Some((x, y, width))
+    }
+
+    fn ai_css() -> &'static str {
+        static CSS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        CSS.get_or_init(|| {
+            format!(
+                "body{{background:{chrome};color:{muted};font-size:13px;}} \
+                 #head{{background:{surface};color:{text};padding:12px;height:20px;}} \
+                 .line{{padding:3px;color:{text};}} \
+                 .src{{color:{faint};padding:12px;font-size:12px;}}",
+                chrome = theme::CHROME,
+                surface = theme::SURFACE,
+                text = theme::TEXT,
+                muted = theme::MUTED,
+                faint = theme::FAINT,
+            )
+        })
     }
 
     /// Blit a composed frame to the window.
@@ -1236,41 +2219,367 @@ impl App {
         let mut buffer = surface.buffer_mut().expect("surface buffer");
         buffer.copy_from_slice(&frame);
         buffer.present().expect("buffer present");
+        // An unfinished animation asks for the next frame itself. Nothing else
+        // drives a clock, so the window goes back to sleep the moment it lands.
+        if self.animating {
+            self.request_redraw();
+        }
     }
 }
 
+/// Copy a rendered surface into the window buffer, clipped at its edges.
+fn blit(buffer: &mut [u32], w: u32, h: u32, canvas: &Canvas, x0: u32, y0: u32) {
+    for y in 0..canvas.height.min(h.saturating_sub(y0) as usize) {
+        for x in 0..canvas.width.min(w.saturating_sub(x0) as usize) {
+            let px = canvas.pixels[y * canvas.width + x];
+            buffer[(y0 as usize + y) * w as usize + x0 as usize + x] =
+                (px.r as u32) << 16 | (px.g as u32) << 8 | px.b as u32;
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn sidebar_clicks_land_on_the_right_row() {
-        let head = SIDEBAR_HEAD_H as f32;
-        let row_h = TAB_ROW_H as f32;
-        // The header is not a tab.
-        assert_eq!(sidebar_hit(50.0, head - 1.0, 3), SidebarHit::None);
-        // First and third rows.
-        assert_eq!(sidebar_hit(50.0, head + 1.0, 3), SidebarHit::Select(0));
-        assert_eq!(sidebar_hit(50.0, head + 2.0 * row_h, 3), SidebarHit::Select(2));
-        // The right margin closes rather than selects.
-        let close_x = (SIDEBAR_W - CLOSE_W) as f32 + 1.0;
-        assert_eq!(sidebar_hit(close_x, head + 1.0, 3), SidebarHit::Close(0));
-        // The row after the last tab opens a new one; below that, nothing.
-        assert_eq!(sidebar_hit(50.0, head + 3.0 * row_h, 3), SidebarHit::NewTab);
-        assert_eq!(sidebar_hit(50.0, head + 4.0 * row_h, 3), SidebarHit::None);
+    fn settings_with(layout: TabLayout, rail: Rail) -> Settings {
+        Settings { layout, rail, ..Settings::default() }
     }
 
     #[test]
-    fn tab_labels_prefer_the_page_title() {
-        assert_eq!(label_for("Hacker News", "https://news.ycombinator.com"), "Hacker News");
+    fn the_rail_takes_width_from_the_page_and_gives_it_back() {
+        let expanded = Regions::settled(1000, 700, settings_with(TabLayout::Vertical, Rail::Expanded), false);
+        assert_eq!(expanded.rail_w, RAIL_W);
+        assert_eq!(expanded.content_x, RAIL_W);
+        assert_eq!(expanded.content_w, 1000 - RAIL_W);
+        assert_eq!(expanded.strip_h, 0);
+
+        let icons = Regions::settled(1000, 700, settings_with(TabLayout::Vertical, Rail::Icons), false);
+        assert_eq!(icons.rail_w, RAIL_ICON_W);
+
+        // Hidden gives the page the whole window width.
+        let hidden = Regions::settled(1000, 700, settings_with(TabLayout::Vertical, Rail::Hidden), false);
+        assert_eq!(hidden.rail_w, 0);
+        assert_eq!(hidden.content_w, 1000);
+        assert_eq!(hidden.content_y, TOOLBAR_H);
+    }
+
+    #[test]
+    fn horizontal_layout_trades_the_rail_for_a_strip() {
+        let regions = Regions::settled(1000, 700, settings_with(TabLayout::Horizontal, Rail::Expanded), false);
+        assert_eq!(regions.rail_w, 0, "no rail when tabs are on top");
+        assert_eq!(regions.strip_h, TABSTRIP_H);
+        // The page starts below both the strip and the toolbar.
+        assert_eq!(regions.content_y, TABSTRIP_H + TOOLBAR_H);
+        assert_eq!(regions.content_w, 1000);
+    }
+
+    #[test]
+    fn the_assistant_panel_never_squeezes_the_page_away() {
+        let regions = Regions::settled(400, 700, settings_with(TabLayout::Vertical, Rail::Expanded), true);
+        assert!(regions.content_w >= 1);
+        assert!(regions.rail_w + regions.ai_w <= 400);
+        // A window narrower than the chrome still produces a usable page area.
+        let tiny = Regions::settled(60, 40, settings_with(TabLayout::Vertical, Rail::Expanded), true);
+        assert!(tiny.content_w >= 1 && tiny.content_h >= 1);
+    }
+
+    #[test]
+    fn the_rail_eases_to_its_target_and_then_stops() {
+        let (mut px, target) = (RAIL_W as f32, RAIL_ICON_W as f32);
+        let mut frames = 0;
+        while px != target {
+            let before = px;
+            px = ease_toward(px, target, 1.0 / 60.0);
+            assert!(px < before, "the rail must keep closing, not stall at {px}");
+            frames += 1;
+            assert!(frames < 120, "the rail never settled");
+        }
+        // Between 100ms and 330ms at 60fps: fast enough not to be in the way,
+        // slow enough to read as motion. docs/02-UI-UX-SPEC.md §3.5.
+        assert!((6..=20).contains(&frames), "settled in {frames} frames");
+        // Once there it stays there, so the window can stop redrawing.
+        assert_eq!(ease_toward(target, target, 1.0 / 60.0), target);
+    }
+
+    #[test]
+    fn the_rail_animation_retargets_mid_flight() {
+        // Collapse halfway, then change your mind: it must turn around from
+        // where it is rather than snapping or restarting.
+        let mut px = ease_toward(RAIL_W as f32, 0.0, 0.05);
+        assert!(px < RAIL_W as f32 && px > 0.0);
+        let turning = ease_toward(px, RAIL_W as f32, 1.0 / 60.0);
+        assert!(turning > px, "it should head back out from where it got to");
+        px = turning;
+        for _ in 0..120 {
+            px = ease_toward(px, RAIL_W as f32, 1.0 / 60.0);
+        }
+        assert_eq!(px, RAIL_W as f32);
+    }
+
+    #[test]
+    fn turning_motion_off_moves_the_rail_at_once() {
+        let mut app = App::new(Engine::shapes_only(), vec![Tab::blank()], 0);
+        app.settings = Settings { motion: false, ..Settings::default() };
+        app.rail_px = RAIL_W as f32;
+        app.settings.rail = Rail::Hidden;
+        assert!(!app.advance_rail(), "nothing should be left to animate");
+        assert_eq!(app.rail_px, 0.0);
+    }
+
+    #[test]
+    fn the_rail_squeezes_its_labels_as_it_narrows() {
+        // Every width the animation passes through has to produce a layout that
+        // fits, not just the two settled ones.
+        let mut room = usize::MAX;
+        for rail_w in (RAIL_ICON_W..=RAIL_W).rev() {
+            let next = rail_label_room(rail_w);
+            assert!(next <= room, "room grew as the rail narrowed at {rail_w}");
+            assert!(next >= 3, "a label needs some room at {rail_w}");
+            room = next;
+            // The name can never claim more than the rail has.
+            assert!(rail_name_width(rail_w) < rail_w);
+        }
+        // A rail narrower than its own insets asks for no title width at all,
+        // rather than underflowing.
+        assert_eq!(rail_name_width(4), 0);
+    }
+
+    #[test]
+    fn the_canvas_colour_is_the_one_the_chrome_uses() {
+        assert_eq!(format!("#{CANVAS_RGB:06x}"), theme::CANVAS);
+    }
+
+    #[test]
+    fn zooming_in_narrows_the_layout_so_the_page_reflows() {
+        let (w, h) = (1000, 800);
+        assert_eq!(layout_size(w, h, 1.0), (1000.0, 800.0));
+        // At 200% the page is laid out for half the room and then magnified,
+        // which is what makes text bigger instead of the page being cropped.
+        assert_eq!(layout_size(w, h, 2.0), (500.0, 400.0));
+        // Zooming out gives the page more room than the window has.
+        assert_eq!(layout_size(w, h, 0.5), (2000.0, 1600.0));
+        // A page area of nothing still lays out, rather than dividing to zero.
+        assert_eq!(layout_size(0, 0, 2.0), (1.0, 1.0));
+    }
+
+    #[test]
+    fn zoom_walks_the_scale_and_stops_at_its_ends() {
+        assert_eq!(zoom_step(100, 1), 110);
+        assert_eq!(zoom_step(100, -1), 90);
+        assert_eq!(zoom_step(*ZOOM_STEPS.last().unwrap(), 1), *ZOOM_STEPS.last().unwrap());
+        assert_eq!(zoom_step(ZOOM_STEPS[0], -1), ZOOM_STEPS[0]);
+        // A value that is not a step snaps to the nearest one before moving.
+        assert_eq!(zoom_step(103, 1), 110);
+    }
+
+    #[test]
+    fn a_click_lands_on_the_topmost_control_that_covers_it() {
+        let mut app = App::new(Engine::shapes_only(), vec![Tab::blank()], 0);
+        app.hits = vec![
+            Hit { id: "back".into(), x: 0.0, y: 0.0, width: 40.0, height: 40.0 },
+            // A menu drawn later covers the same pixels and must win.
+            Hit { id: "menu:new".into(), x: 20.0, y: 20.0, width: 40.0, height: 40.0 },
+        ];
+        assert_eq!(app.hit_at(5.0, 5.0), Some("back"));
+        assert_eq!(app.hit_at(25.0, 25.0), Some("menu:new"));
+        assert_eq!(app.hit_at(500.0, 500.0), None);
+    }
+
+    #[test]
+    fn tab_ids_survive_the_rail_reordering_pinned_tabs_to_the_top() {
+        let mut app = App::new(Engine::shapes_only(), vec![Tab::blank(), Tab::blank(), Tab::blank()], 0);
+        app.tabs[2].pinned = true;
+        // The pinned tab leads, but every row still carries its real index.
+        assert_eq!(app.rail_order(), vec![2, 0, 1]);
+        app.act_on("tab:1");
+        assert_eq!(app.active, 1, "ids address tabs, not rail positions");
+    }
+
+    #[test]
+    fn tab_search_filters_by_title_and_address() {
+        let mut app = App::new(
+            Engine::shapes_only(),
+            vec![Tab::new("https://news.ycombinator.com".into(), String::new(), String::new()),
+                 Tab::new("https://en.wikipedia.org".into(), String::new(), String::new())],
+            0,
+        );
+        app.focus = Focus::TabSearch("wiki".into());
+        assert_eq!(app.rail_order(), vec![1]);
+        app.focus = Focus::TabSearch("nothing here".into());
+        assert!(app.rail_order().is_empty());
+    }
+
+    #[test]
+    fn closing_a_tab_remembers_it_so_it_can_come_back() {
+        let mut app = App::new(
+            Engine::shapes_only(),
+            vec![Tab::new("https://a.com".into(), String::new(), String::new()), Tab::blank()],
+            0,
+        );
+        app.close_tab_at(0);
+        assert_eq!(app.closed, vec!["https://a.com".to_string()]);
+        // Closing the last tab leaves a blank one rather than an empty window.
+        app.close_tab_at(0);
+        assert_eq!(app.tabs.len(), 1);
+        // A new tab was never anywhere, so it is not worth reopening.
+        assert_eq!(app.closed, vec!["https://a.com".to_string()]);
+    }
+
+    #[test]
+    fn the_collapse_control_brings_the_rail_back_from_horizontal_layout() {
+        let mut app = App::new(Engine::shapes_only(), vec![Tab::blank()], 0);
+        app.settings = settings_with(TabLayout::Horizontal, Rail::Expanded);
+        app.cycle_rail();
+        assert_eq!(app.settings.layout, TabLayout::Vertical);
+        // From there it cycles through the rail's own states.
+        app.cycle_rail();
+        assert_eq!(app.settings.rail, Rail::Icons);
+    }
+
+    /// The href of the first link on the settings page whose value is `value`.
+    fn settings_link(value: &str) -> String {
+        let page = crate::internal::page("zero://settings");
+        let needle = format!("href=\"zero://settings?{value}\"");
+        assert!(page.contains(&needle), "no control on the page sets {value}");
+        format!("zero://settings?{value}")
+    }
+
+    #[test]
+    fn clicking_a_control_on_the_settings_page_changes_the_setting() {
+        // The whole path a click takes: the href the page actually renders,
+        // through link resolution, into the browser's live settings. Resolution
+        // is in the middle because that is where it broke — `zero://` was not
+        // treated as absolute, so every control on the page did nothing.
+        let mut app = App::new(Engine::shapes_only(), vec![Tab::blank()], 0);
+        assert_eq!(app.settings.layout, TabLayout::Vertical);
+
+        let href = settings_link("layout=horizontal");
+        let target = crate::net::resolve_url("zero://settings", &href);
+        assert_eq!(target, href, "the link must survive resolution intact");
+        app.go_to(target);
+        assert_eq!(app.settings.layout, TabLayout::Horizontal, "the click did not land");
+        // And the address that lands in the tab is clean.
+        assert_eq!(app.tab().address, "zero://settings");
+
+        // Every other control on the page reaches its setting too.
+        for value in ["rail=icons", "zoom=125", "engine=brave", "blocking=off", "restore=off"] {
+            let href = settings_link(value);
+            app.go_to(crate::net::resolve_url("zero://settings", &href));
+        }
+        assert_eq!(app.settings.rail, Rail::Icons);
+        assert_eq!(app.settings.zoom, 125);
+        assert_eq!(app.settings.engine().0, "brave");
+        assert!(!app.settings.blocking);
+        assert!(!app.settings.restore);
+    }
+
+    #[test]
+    fn every_control_on_the_settings_page_is_actually_clickable() {
+        // The half the test above cannot see: a click only reaches a href if
+        // layout produced a link area for it. The controls are `<a>` elements
+        // styled `display:inline-block`, and an `<a>` that is its own box used
+        // to carry no href down to its text — so the whole page rendered as
+        // links you could not click.
+        let engine = crate::fonts::build_engine();
+        let html = crate::internal::page("zero://settings");
+        let loader = ShellLoader::new("zero://settings".to_string());
+        let page = engine.render_page(&html, "", 1000.0, 700.0, &loader);
+        for value in ["layout=horizontal", "rail=icons", "zoom=125", "engine=brave"] {
+            let href = format!("zero://settings?{value}");
+            let area = page.links.iter().find(|l| l.href == href);
+            let area = area.unwrap_or_else(|| panic!("nothing to click for {value}"));
+            assert!(area.width > 0.0 && area.height > 0.0, "{value} has an empty target");
+        }
+    }
+
+    #[test]
+    fn a_settings_link_is_applied_and_then_forgotten() {
+        let mut app = App::new(Engine::shapes_only(), vec![Tab::blank()], 0);
+        let landed = app.apply_setting_link("zero://settings?rail=hidden".into());
+        assert_eq!(landed, "zero://settings", "the query does not belong in history");
+        assert_eq!(app.settings.rail, Rail::Hidden);
+        // Anything else passes straight through.
+        assert_eq!(app.apply_setting_link("https://a.com".into()), "https://a.com");
+    }
+
+    #[test]
+    fn every_control_with_a_tooltip_is_one_the_chrome_can_act_on() {
+        let mut app = App::new(Engine::shapes_only(), vec![Tab::blank()], 0);
+        for (id, tip) in TIPS {
+            assert!(!tip.is_empty(), "{id} has an empty tooltip");
+            assert!(app.act_on(id), "{id} has a tooltip but nothing happens when clicked");
+        }
+    }
+
+    #[test]
+    fn every_menu_entry_does_something() {
+        let mut app = App::new(Engine::shapes_only(), vec![Tab::blank()], 0);
+        for (id, label, _) in MENU_ITEMS {
+            if id.is_empty() {
+                continue; // a rule, not an entry
+            }
+            assert!(!label.is_empty(), "{id} has no label");
+            // The zoom row is a label with its own stepper rather than one control.
+            let ids: &[&str] = match *id {
+                "menu:zoom" => &["zoom:out", "zoom:reset", "zoom:in"],
+                other => &[other],
+            };
+            for id in ids {
+                assert!(
+                    app.act_on_menu(id) || app.act_on(id),
+                    "{id} is in the menu but nothing happens when clicked"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tooltips_stay_inside_the_window() {
+        let mut app = App::new(Engine::shapes_only(), vec![Tab::blank()], 0);
+        let regions = Regions::settled(800, 600, Settings::default(), false);
+        // A control hard against the right edge.
+        app.hovered = Some("menu".into());
+        let hits = vec![Hit { id: "menu".into(), x: 780.0, y: 10.0, width: 20.0, height: 20.0 }];
+        let (x, _, width) = app.tooltip_box("More", &hits, &regions).expect("a box");
+        assert!(x + width <= 800, "tip runs off the right edge");
+    }
+
+    #[test]
+    fn a_rail_tooltip_sits_beside_the_rail_rather_than_over_it() {
+        let mut app = App::new(Engine::shapes_only(), vec![Tab::blank()], 0);
+        let regions = Regions::settled(1000, 700, Settings::default(), false);
+        app.hovered = Some("tab:0".into());
+        let hits = vec![Hit { id: "tab:0".into(), x: 8.0, y: 90.0, width: 200.0, height: 34.0 }];
+        let (x, y, _) = app.tooltip_box("Hacker News", &hits, &regions).expect("a box");
+        assert!(x >= regions.rail_w, "a rail tooltip must not cover the rail");
+        assert_eq!(y, 90, "it lines up with the row it names");
+    }
+
+    #[test]
+    fn tab_labels_prefer_the_page_title_and_fit_the_space_given() {
+        assert_eq!(label_for("Hacker News", "https://news.ycombinator.com", 22), "Hacker News");
         // No title: fall back to the host, not the whole URL.
-        assert_eq!(label_for("", "https://news.ycombinator.com/item?id=1"), "news.ycombinator.com");
-        assert_eq!(label_for("   ", "https://example.com"), "example.com");
-        // Long titles are truncated to fit the sidebar.
-        let long = label_for("Rust (programming language) - Wikipedia", "https://x.com");
-        assert_eq!(long.chars().count(), 24);
-        assert!(long.ends_with("..."));
+        assert_eq!(
+            label_for("", "https://news.ycombinator.com/item?id=1", 22),
+            "news.ycombinator.com"
+        );
+        assert_eq!(label_for("   ", "https://example.com", 22), "example.com");
+        // A title too long for the space never exceeds it — the engine has no
+        // text-overflow, so anything over would wrap and be clipped instead.
+        let title = "Rust (programming language) - Wikipedia";
+        for max in [8, 16, 22] {
+            let short = label_for(title, "https://x.com", max);
+            assert_eq!(short.chars().count(), max, "max {max}");
+            assert!(short.ends_with('\u{2026}'), "max {max}");
+        }
+    }
+
+    #[test]
+    fn the_icon_rail_labels_a_tab_with_one_character() {
+        assert_eq!(initial("Hacker News"), "H");
+        assert_eq!(initial("  wikipedia.org"), "W");
+        assert_eq!(initial("...."), "\u{2022}"); // nothing to letter it with
     }
 
     #[test]

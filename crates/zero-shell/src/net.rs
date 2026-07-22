@@ -39,6 +39,19 @@ pub fn is_url(s: &str) -> bool {
     s.starts_with("http://") || s.starts_with("https://")
 }
 
+/// True for a target that already names its own scheme — `https://`, but also
+/// `zero://`. Distinct from [`is_url`], which asks the narrower question of
+/// whether something is fetchable over the network.
+pub fn has_scheme(s: &str) -> bool {
+    match s.split_once("://") {
+        Some((scheme, _)) => {
+            !scheme.is_empty()
+                && scheme.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+        }
+        None => false,
+    }
+}
+
 thread_local! {
     /// One jar for the process, loaded once and written back after each response.
     static JAR: RefCell<CookieJar> = RefCell::new(
@@ -307,7 +320,11 @@ fn fetch_bytes(url: &str) -> Option<impl Read> {
 /// Resolve a possibly-relative resource URL against a base page URL or file path.
 pub fn resolve_url(base: &str, src: &str) -> String {
     let src = src.trim();
-    if is_url(src) || src.starts_with("data:") {
+    // Anything that names its own scheme is already absolute. This has to accept
+    // more than http(s): `zero://settings?rail=icons` is a link on a built-in
+    // page, and treating it as a relative path silently produced a target that
+    // went nowhere — which is what made every settings control do nothing.
+    if has_scheme(src) || src.starts_with("data:") {
         return src.to_string();
     }
     if let Some(rest) = src.strip_prefix("//") {
@@ -348,12 +365,13 @@ pub fn normalize_target(s: &str) -> String {
     }
 }
 
-/// Anything that isn't an address is a search.
+/// Anything that isn't an address is a search, sent to the engine chosen in
+/// `zero://settings`.
 ///
 /// DuckDuckGo's HTML endpoint is the default because it needs no JavaScript and
 /// does not profile the user — the same reasoning as docs/04-SECURITY-PRIVACY.md.
 pub fn search_url(query: &str) -> String {
-    format!("https://duckduckgo.com/html/?q={}", zero_engine::percent_encode(query))
+    crate::settings::current().search_url(query)
 }
 
 /// A loaded document, plus the URL it actually came from and whether the
@@ -457,6 +475,38 @@ fn error_page(target: &str, why: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_link_that_names_its_own_scheme_is_left_alone() {
+        // The bug this guards: `zero://` was not recognised as absolute, so a
+        // settings link was resolved as a path relative to the current page and
+        // every control on zero://settings quietly did nothing.
+        assert_eq!(
+            resolve_url("zero://settings", "zero://settings?rail=icons"),
+            "zero://settings?rail=icons"
+        );
+        assert_eq!(resolve_url("zero://newtab", "https://a.com/x"), "https://a.com/x");
+        assert_eq!(
+            resolve_url("examples/page.html", "zero://downloads"),
+            "zero://downloads"
+        );
+        // Relative links still resolve against their base.
+        assert_eq!(resolve_url("https://a.com/docs/x.html", "y.html"), "https://a.com/docs/y.html");
+        assert_eq!(resolve_url("https://a.com/docs/x.html", "/z"), "https://a.com/z");
+        // A scheme-relative link takes the base's scheme.
+        assert_eq!(resolve_url("https://a.com/", "//b.com/x"), "https://b.com/x");
+    }
+
+    #[test]
+    fn a_scheme_is_more_than_a_pair_of_slashes() {
+        assert!(has_scheme("zero://settings"));
+        assert!(has_scheme("https://a.com"));
+        assert!(has_scheme("view-source://a"));
+        assert!(!has_scheme("//a.com/x")); // scheme-relative, not absolute
+        assert!(!has_scheme("a/b"));
+        assert!(!has_scheme("not a scheme://x")); // spaces are not scheme characters
+        assert!(!has_scheme("C:/Users/x.html"));
+    }
 
     #[test]
     fn failures_are_described_in_plain_words() {

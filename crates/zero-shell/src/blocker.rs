@@ -139,8 +139,11 @@ fn shared() -> &'static Blocker {
 }
 
 /// True if this URL points at a known tracker/ad host.
+///
+/// Honours the tracker-blocking preference, so turning it off in `zero://settings`
+/// actually lets the request through rather than only hiding the count.
 pub fn is_blocked(url: &str) -> bool {
-    shared().blocks(url)
+    crate::settings::current().blocking && shared().blocks(url)
 }
 
 fn parse_rule(line: &str) -> Option<Rule> {

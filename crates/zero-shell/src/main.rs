@@ -22,6 +22,7 @@ mod fonts;
 mod internal;
 mod localstore;
 mod net;
+mod settings;
 mod storage;
 
 use ai::Assistant;
@@ -98,14 +99,21 @@ fn main() {
         let out_path = args.next().unwrap_or_else(|| "window.png".into());
         // A trailing WxH exercises breakpoints: sites switch layout on the
         // *content* width, which is the window minus Zero's own chrome.
-        let (w, h) = args
-            .next()
-            .and_then(|size| {
-                let (w, h) = size.split_once(['x', 'X'])?;
-                Some((w.parse().ok()?, h.parse().ok()?))
-            })
-            .unwrap_or((1280, 800));
-        let (pixels, w, h) = app::screenshot(engine, html, css, address, w, h);
+        let mut rest: Vec<String> = args.collect();
+        // A leading WxH exercises breakpoints; anything after it poses the
+        // chrome (`menu`, `hover:star`, `layout=horizontal`, `tabs:4`, …) so
+        // every surface can be reviewed without holding the mouse still.
+        let (w, h) = match rest.first().and_then(|size| size.split_once(['x', 'X'])) {
+            Some((w, h)) => match (w.parse(), h.parse()) {
+                (Ok(w), Ok(h)) => {
+                    rest.remove(0);
+                    (w, h)
+                }
+                _ => (1280, 800),
+            },
+            None => (1280, 800),
+        };
+        let (pixels, w, h) = app::screenshot(engine, html, css, address, w, h, &rest);
         let buffer: Vec<u8> = pixels
             .iter()
             .flat_map(|p| [(p >> 16) as u8, (p >> 8) as u8, *p as u8, 255])

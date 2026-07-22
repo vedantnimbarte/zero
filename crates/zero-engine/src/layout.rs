@@ -1384,11 +1384,9 @@ fn collect_inline_text(
     let mut decorated = false;
 
     if let BoxType::InlineNode(styled) = bx.box_type {
-        if let NodeType::Element(ref e) = styled.node.node_type {
-            if e.tag_name == "a" {
-                if let Some(h) = e.attributes.get("href") {
-                    current_href = Some(h.clone());
-                }
+        if let NodeType::Element(_) = styled.node.node_type {
+            if let Some(h) = href_of(styled) {
+                current_href = Some(h.to_string());
             }
             if let Some(style) = inline_style_of(styled) {
                 out.push(InlinePiece::Enter(style));
@@ -1423,6 +1421,14 @@ fn collect_inline_text(
     }
     if decorated {
         out.push(InlinePiece::Exit);
+    }
+}
+
+/// The link target this node carries, whatever box it turned into.
+fn href_of<'a>(styled: &'a StyledNode<'a>) -> Option<&'a str> {
+    match &styled.node.node_type {
+        NodeType::Element(e) if e.tag_name == "a" => e.attributes.get("href").map(String::as_str),
+        _ => None,
     }
 }
 
@@ -1895,6 +1901,24 @@ pub fn collect_element_rects(bx: &LayoutBox, out: &mut Vec<ElementRect>) {
 /// Gather every clickable link region from the laid-out tree (absolute coords).
 pub fn collect_links(bx: &LayoutBox, out: &mut Vec<LinkArea>) {
     out.extend(bx.link_areas.iter().cloned());
+    // An `<a>` that is a box in its own right — `display:inline-block`, or a
+    // block — never gets an inline link area: its text is laid out by an
+    // anonymous child that has no idea it sits inside a link. The box itself is
+    // the region to click, padding and all, which is also exactly what is
+    // painted. Without this every control on zero://settings looked like a
+    // button and did nothing.
+    if let BoxType::BlockNode(styled) = bx.box_type {
+        if let Some(href) = href_of(styled) {
+            let area = bx.dimensions.border_box();
+            out.push(LinkArea {
+                href: href.to_string(),
+                x: area.x,
+                y: area.y,
+                width: area.width,
+                height: area.height,
+            });
+        }
+    }
     for child in &bx.children {
         collect_links(child, out);
     }

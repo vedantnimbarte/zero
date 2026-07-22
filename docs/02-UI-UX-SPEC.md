@@ -202,18 +202,46 @@ Per reference image 1 (bottom-left space switcher, "Design" pill).
 
 ## 12. Key screens to design (deliverable checklist for the prototype phase)
 
+Built items are live in the Rust shell (`crates/zero-shell/src/app.rs`) and can be
+screenshotted headlessly with `--shot`'s poses — see the README.
+
 - [ ] First-run / onboarding (language, import, privacy explainer)
-- [ ] Main window — single tab (light + dark)
-- [ ] Main window — vertical tabs expanded / collapsed / hidden
+- [x] Main window — single tab (dark; light still to come)
+- [x] Main window — vertical tabs expanded / icons / hidden, and a horizontal strip
 - [ ] Split view (2 panes) + context menu
-- [ ] New-tab page (dark, per ref 2) + light variant
-- [ ] Command bar focused states (navigate / search / ask AI)
-- [ ] AI sidebar (chat with page) + agentic confirmation card
+- [x] New-tab page (dark, per ref 2) — light variant to come
+- [x] Find-in-page bar; command-bar AI states still to come
+- [x] AI sidebar (chat with page); agentic confirmation card to come
 - [ ] Spaces switcher + space theming
-- [ ] Privacy shield popover + Data passport
-- [ ] Settings (privacy-first IA)
-- [ ] Downloads / History / Bookmarks
-- [ ] Empty/loading/error/offline states
+- [x] Tracker-blocked count in the toolbar; shield popover + Data passport to come
+- [x] Settings (privacy-first IA) — `zero://settings`
+- [x] Downloads / History / Bookmarks — `zero://downloads`, `zero://history`, `zero://bookmarks`
+- [x] Empty states for the built-in pages; loading/offline states to come
+
+### Notes from the first build
+
+The chrome is rendered by Zero's own engine as small HTML documents, which
+constrains the visual language in ways worth recording:
+
+- **No `font-weight`.** Hierarchy comes from size, colour and spacing alone.
+  Brightness is the weight axis: `--text-primary` reads as bold, `--text-secondary`
+  as regular, `--text-tertiary` as light.
+- **No CSS transitions.** Motion has to be animated by the shell instead. The tab
+  rail's width eases toward its target with exponential smoothing (~260ms), and
+  the window requests the next frame only while something is moving. The rail's
+  markup is sized from its *current* width, not its setting, so it squeezes its
+  labels on the way and swaps to initials as it passes 150px. The page is not
+  re-laid-out mid-slide — the last layout is slid and reflows on landing.
+  §3.5's other motion (tab reorder, FLIP, spring curves) is still deferred.
+- **No `prefers-reduced-motion`.** winit exposes no such signal, so it is an
+  explicit **Animation** setting rather than an assumption.
+- **Hairlines carry the structure** that bolder type would otherwise carry, which
+  is why `--border-subtle` does much more work here than the spec anticipated.
+- **The accent marks position, never fills.** The active tab takes an accent
+  *edge* — left in the rail, bottom in the horizontal strip, bottom on the chosen
+  segment in Settings. The only accent fill in the product is the wordmark.
+- **No `text-overflow`.** Labels are truncated in Rust to a character count that
+  fits, because an over-long label wraps and is clipped instead of trailing off.
 
 ---
 

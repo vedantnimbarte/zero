@@ -66,11 +66,17 @@ pub fn is_internal(target: &str) -> bool {
 }
 
 /// Render a built-in page, or a "not found" page for an unknown one.
+///
+/// The query string is stripped before matching: `zero://settings?rail=icons`
+/// is the settings page, and the shell has already applied the preference.
 pub fn page(target: &str) -> String {
-    match target.trim_end_matches('/') {
+    let path = target.split('?').next().unwrap_or(target);
+    match path.trim_end_matches('/') {
         "zero://newtab" => newtab_page(),
         "zero://history" => history_page(),
         "zero://bookmarks" => bookmarks_page(),
+        "zero://downloads" => downloads_page(),
+        "zero://settings" => settings_page(),
         other => wrap(
             "Unknown page",
             &format!("<div class=\"empty\">No built-in page at {}.</div>", escape(other)),
@@ -144,13 +150,16 @@ fn newtab_page() -> String {
         true => String::new(),
         false => format!("<div class=\"tiles-head\">Frequently visited</div><div class=\"tiles\">{tiles}</div>"),
     };
+    // The field submits to whichever engine settings names, so the start page
+    // and the address bar can never send a search to different places.
+    let (action, field) = crate::settings::current().search_form();
     format!(
         "<html><head><title>New Tab</title>{style}</head><body>\
          <div class=\"hero\">\
          <div class=\"mark\">zero</div>\
          <div class=\"tag\">A browser built from scratch, in India.</div>\
-         <form action=\"https://duckduckgo.com/html/\">\
-         <input name=\"q\" class=\"q\" placeholder=\"Search the web, privately\">\
+         <form action=\"{action}\">\
+         <input name=\"{field}\" class=\"q\" placeholder=\"Search the web, privately\">\
          </form>\
          </div>{tiles}</body></html>",
         style = newtab_style(),
@@ -181,6 +190,216 @@ fn short(title: &str, url: &str) -> String {
         n if n > 24 => title.chars().take(23).chain(['…']).collect(),
         _ => title.to_string(),
     }
+}
+
+/// Settings and downloads share a layout: a column of rows, each separated by a
+/// hairline rather than a filled card. The engine has one font weight, so
+/// hierarchy comes from size and colour alone — `.name` reads as bold because it
+/// is the brightest thing in the row, `.hint` as light because it is the dimmest.
+fn console_style() -> String {
+    format!(
+        "<style>\
+         body{{background:{canvas};color:{text};padding-left:56px;padding-right:56px;\
+              padding-top:44px;padding-bottom:64px;font-size:14px;}}\
+         h1{{color:{text};font-size:26px;}}\
+         .lede{{color:{faint};font-size:13px;padding-bottom:28px;}}\
+         .sec{{color:{muted};font-size:11px;padding-top:32px;padding-bottom:10px;}}\
+         .row{{display:flex;justify-content:space-between;align-items:center;\
+              padding-top:14px;padding-bottom:14px;\
+              border-bottom-width:1px;border-color:{line};}}\
+         .name{{color:{text};font-size:14px;}}\
+         .hint{{color:{faint};font-size:12px;padding-top:3px;}}\
+         .seg{{display:inline-block;text-align:right;\
+              padding-top:3px;padding-bottom:3px;}}\
+         .opt{{display:inline-block;color:{muted};font-size:13px;border-radius:8px;\
+              padding-left:13px;padding-right:13px;padding-top:6px;padding-bottom:6px;}}\
+         .opton{{display:inline-block;background:{surface};color:{text};font-size:13px;\
+                border-radius:8px;padding-left:13px;padding-right:13px;\
+                padding-top:6px;padding-bottom:4px;\
+                border-bottom-width:2px;border-color:{accent};}}\
+         .optoff{{display:inline-block;color:{faint};font-size:13px;\
+                 padding-left:13px;padding-right:13px;padding-top:6px;padding-bottom:6px;}}\
+         .fact{{color:{muted};font-size:13px;}}\
+         .empty{{background:{surface};padding-left:22px;padding-right:22px;\
+                padding-top:20px;padding-bottom:20px;border-radius:12px;color:{muted};}}\
+         a{{color:{link};}}\
+         </style>",
+        canvas = theme::CANVAS,
+        surface = theme::SURFACE,
+        text = theme::TEXT,
+        muted = theme::MUTED,
+        faint = theme::FAINT,
+        accent = theme::ACCENT,
+        line = theme::LINE,
+        link = theme::LINK,
+    )
+}
+
+/// A row: what the setting is on the left, the control on the right.
+fn setting(name: &str, hint: &str, control: &str) -> String {
+    format!(
+        "<div class=\"row\"><div><div class=\"name\">{name}</div>\
+         <div class=\"hint\">{hint}</div></div>{control}</div>"
+    )
+}
+
+/// How wide a control holding these labels needs to be.
+///
+/// ponytail: the engine has no shrink-to-fit for a flex item and no way to ask
+/// how wide a string will be, so the width is estimated from the character count
+/// with room to spare. Options wrap onto a second line if this comes out short,
+/// so it errs high — and the control has no background of its own, which is what
+/// makes the slack invisible. Measure properly if the engine grows an API for it.
+fn control_width(labels: &[&str]) -> u32 {
+    labels.iter().map(|label| 30 + (label.chars().count() as u32 * 8)).sum::<u32>() + 10
+}
+
+/// A segmented control built from links. Each option is a `zero://settings` URL
+/// carrying its own value, so choosing one is an ordinary navigation — the same
+/// path any link on the web takes through this browser. The chosen option is
+/// marked with an accent edge, the same way the active tab is.
+fn segmented(key: &str, options: &[(&str, &str)], chosen: &str) -> String {
+    let labels: Vec<&str> = options.iter().map(|(_, label)| *label).collect();
+    let opts: String = options
+        .iter()
+        .map(|(value, label)| {
+            let class = if *value == chosen { "opton" } else { "opt" };
+            format!(
+                "<a class=\"{class}\" href=\"zero://settings?{key}={value}\">{}</a>",
+                escape(label)
+            )
+        })
+        .collect();
+    wrap_control(&labels, &opts)
+}
+
+/// The engine has no inline `style` attribute, so a control that needs its own
+/// width carries a one-rule stylesheet with it. `<style>` is `display:none` in
+/// the user-agent sheet, so it can sit anywhere — including inside a flex row.
+fn wrap_control(labels: &[&str], inner: &str) -> String {
+    let width = control_width(labels);
+    format!(
+        "<style>.w{width}{{width:{width}px;}}</style>\
+         <div class=\"seg w{width}\">{inner}</div>"
+    )
+}
+
+/// An option that exists in the design but not yet in the build. Shown rather
+/// than hidden, so the page is honest about what is coming.
+fn unavailable(label: &str) -> String {
+    format!("<span class=\"optoff\">{}</span>", escape(label))
+}
+
+fn on_off(key: &str, on: bool) -> String {
+    segmented(key, &[("on", "On"), ("off", "Off")], if on { "on" } else { "off" })
+}
+
+fn settings_page() -> String {
+    let now = crate::settings::current();
+    let layout = segmented(
+        "layout",
+        &[("vertical", "Vertical"), ("horizontal", "Horizontal")],
+        match now.layout {
+            crate::settings::TabLayout::Vertical => "vertical",
+            crate::settings::TabLayout::Horizontal => "horizontal",
+        },
+    );
+    let rail = segmented(
+        "rail",
+        &[("expanded", "Expanded"), ("icons", "Icons"), ("hidden", "Hidden")],
+        match now.rail {
+            crate::settings::Rail::Expanded => "expanded",
+            crate::settings::Rail::Icons => "icons",
+            crate::settings::Rail::Hidden => "hidden",
+        },
+    );
+    let zoom_options: Vec<(String, String)> = [80, 100, 125, 150]
+        .iter()
+        .map(|z| (z.to_string(), format!("{z}%")))
+        .collect();
+    let zoom = segmented(
+        "zoom",
+        &zoom_options.iter().map(|(v, l)| (v.as_str(), l.as_str())).collect::<Vec<_>>(),
+        &now.zoom.to_string(),
+    );
+    let engines: Vec<(&str, &str)> =
+        crate::settings::ENGINES.iter().map(|(key, label, _)| (*key, *label)).collect();
+    let engine = segmented("engine", &engines, now.engine().0);
+    let theme_control = wrap_control(
+        &["Dark", "Light"],
+        &format!("<span class=\"opton\">Dark</span>{}", unavailable("Light")),
+    );
+    let profile = crate::storage::profile_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unavailable".to_string());
+
+    let body = format!(
+        "<div class=\"lede\">Every preference is stored on this device, as text you can read.</div>\
+         <div class=\"sec\">APPEARANCE</div>{}{}{}{}{}\
+         <div class=\"sec\">SEARCH</div>{}\
+         <div class=\"sec\">PRIVACY</div>{}{}\
+         <div class=\"sec\">ABOUT</div>{}{}{}",
+        setting("Tab layout", "A rail down the side, or a strip across the top", &layout),
+        setting("Tab rail", "How much of the vertical rail stays open", &rail),
+        setting("Page zoom", "The size new tabs open at. Ctrl+= and Ctrl+- change one tab", &zoom),
+        setting("Theme", "Light is designed but not built yet", &theme_control),
+        setting(
+            "Animation",
+            "Slides the tab rail open and closed. Turn off to change it instantly",
+            &on_off("motion", now.motion),
+        ),
+        setting("Search engine", "Where the address bar sends anything that isn't a URL", &engine),
+        setting(
+            "Block trackers",
+            "Drops requests to known tracking and ad hosts before they are made",
+            &on_off("blocking", now.blocking),
+        ),
+        setting(
+            "Reopen tabs at launch",
+            "Restores the last session instead of starting on a new tab",
+            &on_off("restore", now.restore),
+        ),
+        setting("Engine", "HTML, CSS and JavaScript, written from scratch in Rust",
+            "<span class=\"fact\">Zero 0.1.0</span>"),
+        setting("Profile folder", "Where history, bookmarks and this file live",
+            &format!("<span class=\"fact\">{}</span>", escape(&profile))),
+        setting("Source", "Zero is open source, Apache-2.0",
+            "<span class=\"fact\">github.com/zero-browser</span>"),
+    );
+    console_wrap("Settings", &body)
+}
+
+fn downloads_page() -> String {
+    let mut saved = crate::storage::load_downloads();
+    saved.reverse(); // newest first, like history
+    if saved.is_empty() {
+        return console_wrap(
+            "Downloads",
+            "<div class=\"empty\">Nothing saved yet. Press Ctrl+S to keep a copy of the \
+             page you are reading.</div>",
+        );
+    }
+    let rows: String = saved
+        .iter()
+        .map(|file| {
+            setting(
+                &escape(&file.name),
+                &escape(&file.url),
+                &format!("<span class=\"fact\">{}</span>", escape(&date_of(file.when))),
+            )
+        })
+        .collect();
+    console_wrap(
+        "Downloads",
+        &format!("<div class=\"lede\">Saved pages, newest first.</div>{rows}"),
+    )
+}
+
+fn console_wrap(title: &str, body: &str) -> String {
+    format!(
+        "<html><head><title>{title}</title>{}</head><body><h1>{title}</h1>{body}</body></html>",
+        console_style()
+    )
 }
 
 /// Newest first, and only the most recent visit per URL so the list stays useful.
