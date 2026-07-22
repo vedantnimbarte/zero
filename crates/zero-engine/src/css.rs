@@ -250,6 +250,22 @@ pub fn parse(source: String) -> Stylesheet {
     }
 }
 
+/// Remove `/* ... */` from a value. Comments are whitespace between tokens, and
+/// a value read as one span of text would otherwise carry them into the parse.
+fn strip_comments(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("/*") {
+        out.push_str(&rest[..start]);
+        match rest[start..].find("*/") {
+            Some(end) => rest = &rest[start + end + 2..],
+            None => return out, // unterminated: the rest is comment
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// `an+b` in any of its spellings: `odd`, `even`, `3`, `2n`, `2n+1`, `-n+3`.
 fn parse_nth(text: &str) -> Option<(i32, i32)> {
     let text: String = text.chars().filter(|c| !c.is_whitespace()).collect();
@@ -892,7 +908,7 @@ impl Parser {
                 continue;
             }
             self.consume_char(); // ':'
-            let raw = self.consume_while(|c| c != ';' && c != '}');
+            let raw = strip_comments(&self.consume_while(|c| c != ';' && c != '}'));
             if self.starts_with(";") {
                 self.consume_char();
             }
@@ -1038,8 +1054,24 @@ impl Parser {
         result
     }
 
+    /// Whitespace, and comments — which are whitespace as far as the grammar is
+    /// concerned, and appear between any two tokens a real stylesheet has.
     fn consume_whitespace(&mut self) {
-        self.consume_while(char::is_whitespace);
+        loop {
+            self.consume_while(char::is_whitespace);
+            if !self.starts_with("/*") {
+                return;
+            }
+            self.pos += 2;
+            match self.input[self.pos..].find("*/") {
+                Some(end) => self.pos += end + 2,
+                // Unterminated: the rest of the sheet is inside the comment.
+                None => {
+                    self.pos = self.input.len();
+                    return;
+                }
+            }
+        }
     }
 }
 
@@ -1146,6 +1178,24 @@ mod tests {
             [Pseudo::Not(inner)] => assert_eq!(inner.class, vec!["skip".to_string()]),
             other => panic!("expected :not(.skip), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn comments_are_whitespace_wherever_they_appear() {
+        let sheet = parse(
+            "/* leading */ a { color: /* mid */ #ff0000; }              .b /* between */ .c { width: 4px; }              /* a rule commented out: p { color: #00ff00 } */              d { color: #0000ff } /* trailing"
+                .to_string(),
+        );
+        // Three rules survive; the commented-out one does not exist, and an
+        // unterminated comment swallows the rest rather than derailing it.
+        assert_eq!(sheet.rules.len(), 3);
+        assert_eq!(
+            sheet.rules[0].declarations[0].value,
+            Value::ColorValue(Color { r: 255, g: 0, b: 0, a: 255 })
+        );
+        // `.b /* x */ .c` is a descendant selector, not three compounds.
+        assert_eq!(sheet.rules[1].selectors[0].parts.len(), 2);
+        assert_eq!(sheet.rules[2].declarations[0].name, "color");
     }
 
     #[test]
