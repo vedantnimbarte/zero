@@ -22,6 +22,7 @@ pub fn parse(source: String) -> dom::Node {
     let mut parser = Parser {
         pos: 0,
         input: source,
+        depth: 0,
     };
     let mut nodes = parser.parse_nodes();
     // Whitespace *between* top-level tags belongs to no element and is not
@@ -40,7 +41,21 @@ pub fn parse(source: String) -> dom::Node {
 struct Parser {
     pos: usize,
     input: String,
+    /// How deep the open elements go. The parser recurses per element, so a
+    /// page nested thousands deep would otherwise run the stack out — which a
+    /// hostile page can arrange in a few hundred bytes of `<div>`.
+    depth: usize,
 }
+
+/// Past this, further nesting is flattened rather than recursed into.
+///
+/// Every stage after parsing recurses too — styling, layout, paint, and the
+/// tree's own drop — so the limit is set by whichever of them has the fattest
+/// stack frame, not by the parser. Measured: the pipeline survives 256 levels
+/// and dies by 320, so this leaves a factor of two. Real documents run tens
+/// deep; the deepest thing on a normal page is a table inside a layout inside
+/// a wrapper.
+const MAX_DEPTH: usize = 128;
 
 impl Parser {
     fn next_char(&self) -> char {
@@ -150,7 +165,15 @@ impl Parser {
             return dom::elem(tag, attrs, children);
         }
 
+        // Too deep: the children are still parsed, so the document is not
+        // truncated, but they become this element's siblings rather than
+        // another stack frame each.
+        if self.depth >= MAX_DEPTH {
+            return dom::elem(tag, attrs, vec![]);
+        }
+        self.depth += 1;
         let children = self.parse_nodes();
+        self.depth -= 1;
         self.consume_close_tag();
         dom::elem(tag, attrs, children)
     }
@@ -327,6 +350,30 @@ fn decode_one(body: &str) -> Option<char> {
 
 #[cfg(test)]
 mod tests {
+    /// A page can nest as deep as it likes; the parser may not.
+    #[test]
+    fn absurd_nesting_is_flattened_rather_than_overflowing_the_stack() {
+        let deep = format!("{}x{}", "<div>".repeat(20_000), "</div>".repeat(20_000));
+        let dom = super::parse(deep);
+        // It parsed, and the text inside is still somewhere in the tree.
+        fn depth_and_text(node: &super::dom::Node) -> (usize, String) {
+            let mut deepest = 0;
+            let mut text = match &node.node_type {
+                super::dom::NodeType::Text(t) => t.clone(),
+                _ => String::new(),
+            };
+            for child in &node.children {
+                let (d, t) = depth_and_text(child);
+                deepest = deepest.max(d + 1);
+                text.push_str(&t);
+            }
+            (deepest, text)
+        }
+        let (depth, text) = depth_and_text(&dom);
+        assert!(depth <= super::MAX_DEPTH + 2, "nested {depth} deep");
+        assert!(text.contains('x'), "the content was dropped, not flattened");
+    }
+
     use super::*;
     use crate::dom::NodeType;
 
