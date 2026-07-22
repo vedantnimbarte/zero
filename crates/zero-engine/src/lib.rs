@@ -1171,6 +1171,27 @@ mod tests {
         assert_eq!(grey.r, grey.b);
     }
 
+    #[test]
+    fn translate_moves_a_box_and_its_percentages_are_its_own_size() {
+        let engine = super::Engine::shapes_only();
+        let canvas = engine.render(
+            "<body><div id=\"mark\"></div></body>",
+            // The centring idiom: place the top-left at the centre point, then
+            // pull back by half the box's own size.
+            "#mark { position: absolute; left: 50px; top: 50px; width: 40px; height: 20px;
+                     background: #ff0000; transform: translate(-50%, -50%); }",
+            100.0,
+            100.0,
+        );
+        let red = |x: usize, y: usize| canvas.pixels[y * canvas.width + x].r == 255
+            && canvas.pixels[y * canvas.width + x].g == 0;
+        // Centred on (50, 50): 30..70 across, 40..60 down.
+        assert!(red(50, 50), "the box should straddle its anchor point");
+        assert!(red(31, 41) && red(68, 58), "corners land where translate put them");
+        // ...and nothing is left where it was laid out.
+        assert!(!red(85, 65), "the untranslated position must be empty");
+    }
+
     /// A search box: type into a field nested inside the form, press Enter.
     #[test]
     fn submitting_a_field_builds_a_get_query() {

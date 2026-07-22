@@ -292,6 +292,8 @@ const RAW_VALUE_PROPERTIES: &[&str] = &[
     "background-image",
     // `overflow: hidden auto` sets the two axes at once.
     "overflow",
+    // `translate(-50%, -50%)`, read at paint time.
+    "transform",
 ];
 
 /// The named colours worth carrying, plus `transparent`.

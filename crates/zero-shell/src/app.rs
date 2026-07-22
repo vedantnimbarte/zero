@@ -253,6 +253,7 @@ impl Regions {
     /// `rail_w` is passed in rather than derived from `settings`, because it
     /// animates: mid-collapse the rail sits between two states, and every other
     /// region has to be laid out against where it actually is right now.
+    #[cfg(test)]
     fn of(width: u32, height: u32, settings: Settings, ai_open: bool, rail_w: u32) -> Regions {
         Regions::split(width, height, settings, ai_open, rail_w, None, 0.5)
     }

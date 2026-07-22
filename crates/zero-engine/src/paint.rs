@@ -415,7 +415,7 @@ fn highlight_rects(list: &DisplayList, query: &str) -> Vec<Rect> {
 
 fn build_display_list(layout_root: &LayoutBox) -> DisplayList {
     let mut list = Vec::new();
-    render_layout_box(&mut list, layout_root, UNCLIPPED, 1.0);
+    render_layout_box(&mut list, layout_root, UNCLIPPED, 1.0, (0.0, 0.0));
     list
 }
 
@@ -477,7 +477,7 @@ fn clip_command(item: DisplayCommand, clip: Rect) -> Option<DisplayCommand> {
 
 /// The clip a box imposes on its descendants: its padding box, when `overflow`
 /// says content may not escape it.
-fn child_clip(layout_box: &LayoutBox, clip: Rect) -> Option<Rect> {
+fn child_clip(layout_box: &LayoutBox, clip: Rect, offset: (f32, f32)) -> Option<Rect> {
     let style = match layout_box.box_type {
         BoxType::BlockNode(s) | BoxType::InlineNode(s) => s,
         BoxType::AnonymousBlock => return Some(clip),
@@ -490,7 +490,11 @@ fn child_clip(layout_box: &LayoutBox, clip: Rect) -> Option<Rect> {
     match overflow.as_str() {
         // No scrollbars: a scrollable box shows its first screenful, which is
         // what a collapsed menu or a clipped banner needs.
-        "hidden" | "clip" | "auto" | "scroll" => intersect(layout_box.dimensions.padding_box(), clip),
+        "hidden" | "clip" | "auto" | "scroll" => {
+            let box_rect = layout_box.dimensions.padding_box();
+            let drawn = Rect { x: box_rect.x + offset.0, y: box_rect.y + offset.1, ..box_rect };
+            intersect(drawn, clip)
+        }
         _ => Some(clip),
     }
 }
@@ -553,6 +557,82 @@ fn fade(item: DisplayCommand, alpha: f32) -> DisplayCommand {
     }
 }
 
+/// How far `transform` moves this box and everything inside it.
+///
+/// ponytail: `translate` only. Percentages resolve against the box's own border
+/// box, which is what `translate(-50%, -50%)` — the way the web centres things —
+/// needs. `scale`, `rotate` and matrices are ignored rather than approximated:
+/// moving a box is exact, scaling it without resampling its text is not.
+fn translation_of(layout_box: &LayoutBox) -> (f32, f32) {
+    let style = match layout_box.box_type {
+        BoxType::BlockNode(s) | BoxType::InlineNode(s) => s,
+        BoxType::AnonymousBlock => return (0.0, 0.0),
+    };
+    let spec = match style.value("transform") {
+        Some(Value::Raw(text)) => text,
+        _ => return (0.0, 0.0),
+    };
+    let box_rect = layout_box.dimensions.border_box();
+    let mut shift = (0.0, 0.0);
+    let mut rest = spec.as_str();
+    // A transform list applies right to left, but translations commute, so the
+    // order they are summed in does not matter.
+    while let Some(open) = rest.find('(') {
+        let name = rest[..open].trim().trim_start_matches(',').trim().to_ascii_lowercase();
+        let Some(close) = rest[open..].find(')') else { break };
+        let args: Vec<&str> = rest[open + 1..open + close].split(',').map(str::trim).collect();
+        let ctx = style.length_context(0.0);
+        // A percentage is of this box's own size, so each axis has its own base.
+        let px = |token: &str, base: f32| match token.strip_suffix('%') {
+            Some(pct) => pct.trim().parse::<f32>().unwrap_or(0.0) / 100.0 * base,
+            None => crate::css::parse_length_token(token, ctx),
+        };
+        match name.as_str() {
+            "translate" => {
+                shift.0 += px(args[0], box_rect.width);
+                if let Some(y) = args.get(1) {
+                    shift.1 += px(y, box_rect.height);
+                }
+            }
+            "translatex" => shift.0 += px(args[0], box_rect.width),
+            "translatey" => shift.1 += px(args[0], box_rect.height),
+            _ => {} // scale/rotate/matrix: not modelled
+        }
+        rest = &rest[open + close + 1..];
+    }
+    shift
+}
+
+/// Move a command by `(dx, dy)`.
+fn shift(item: DisplayCommand, (dx, dy): (f32, f32)) -> DisplayCommand {
+    let moved = |r: Rect| Rect { x: r.x + dx, y: r.y + dy, ..r };
+    match item {
+        DisplayCommand::SolidColor(c, rect) => DisplayCommand::SolidColor(c, moved(rect)),
+        DisplayCommand::RoundedColor(c, rect, radius) => {
+            DisplayCommand::RoundedColor(c, moved(rect), radius)
+        }
+        DisplayCommand::Gradient { rect, radius, stops, horizontal } => DisplayCommand::Gradient {
+            rect: moved(rect),
+            radius,
+            stops,
+            horizontal,
+        },
+        DisplayCommand::Shadow { rect, radius, blur, color } => DisplayCommand::Shadow {
+            rect: moved(rect),
+            radius,
+            blur,
+            color,
+        },
+        DisplayCommand::Image(src, rect) => DisplayCommand::Image(src, moved(rect)),
+        DisplayCommand::Text(frag) => DisplayCommand::Text(TextFragment {
+            x: frag.x + dx,
+            y: frag.y + dy,
+            glyphs: frag.glyphs,
+            ..frag
+        }),
+    }
+}
+
 /// `z-index`, which decides paint order among siblings. Everything else keeps
 /// document order, so 0 is both the default and what an unpositioned box gets.
 fn z_index_of(layout_box: &LayoutBox) -> i32 {
@@ -566,20 +646,33 @@ fn z_index_of(layout_box: &LayoutBox) -> i32 {
     }
 }
 
-fn render_layout_box(list: &mut DisplayList, layout_box: &LayoutBox, clip: Rect, alpha: f32) {
+/// `clip` is in drawn coordinates; `offset` is how far every ancestor's
+/// `transform` has already moved this subtree.
+fn render_layout_box(
+    list: &mut DisplayList,
+    layout_box: &LayoutBox,
+    clip: Rect,
+    alpha: f32,
+    offset: (f32, f32),
+) {
     let alpha = alpha * opacity_of(layout_box);
+    // A transform moves the box and everything inside it, so it accumulates.
+    let own_shift = translation_of(layout_box);
+    let offset = (offset.0 + own_shift.0, offset.1 + own_shift.1);
     if !is_invisible(layout_box) && alpha > 0.0 {
         let mut own = Vec::new();
         render_own(&mut own, layout_box);
         list.extend(
             own.into_iter()
+                .map(|item| shift(item, offset))
                 .filter_map(|item| clip_command(item, clip))
                 .map(|item| fade(item, alpha)),
         );
     }
-    // An empty clip still has to be handed down: a child of a hidden box is
+    // This box's own clip comes from where it is *drawn*, not where it was laid
+    // out. An empty clip still has to be handed down: a child of a hidden box is
     // hidden too, however visible it declares itself.
-    let inner = child_clip(layout_box, clip).unwrap_or(Rect::default());
+    let inner = child_clip(layout_box, clip, offset).unwrap_or(Rect::default());
     // A higher `z-index` paints later, and equal ones keep document order.
     //
     // ponytail: one flat order rather than real stacking contexts, so a child's
@@ -588,7 +681,7 @@ fn render_layout_box(list: &mut DisplayList, layout_box: &LayoutBox, clip: Rect,
     let mut order: Vec<&LayoutBox> = layout_box.children.iter().collect();
     order.sort_by_key(|child| z_index_of(child));
     for child in order {
-        render_layout_box(list, child, inner, alpha);
+        render_layout_box(list, child, inner, alpha, offset);
     }
 }
 

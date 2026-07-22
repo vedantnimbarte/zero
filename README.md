@@ -94,7 +94,8 @@ forms.
   descendant/child/sibling selectors (`div p`, `>`, `+`, `~`),
   attribute selectors (`[type=text]`, `~=`, `^=`, `$=`, `*=`),
   pseudo-classes (`:hover`, `:nth-child()`, `:first-child`, `:not()`, `:checked`),
-  `visibility`, `opacity`, `z-index`, `overflow` clipping, custom properties (`var()`, defined on `:root`), the cascade with specificity, HTML presentation attributes (`bgcolor`, `width`, `align`),
+  `visibility`, `opacity`, `z-index`, `transform: translate`,
+  `overflow` clipping, custom properties (`var()`, defined on `:root`), the cascade with specificity, HTML presentation attributes (`bgcolor`, `width`, `align`),
   named colours, `rgb()`/`hsl()`, alpha
 - **Layout**: block, inline, inline-block, flex (wrap/grow/justify/align), grid
   (`repeat()`, `fr`, `minmax()`, spans, named areas), tables (colspan/rowspan),
