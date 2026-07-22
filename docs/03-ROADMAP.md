@@ -1,7 +1,21 @@
 # Zero Browser — Roadmap & Risk Register
 
-**Version:** 0.1 (Draft)
-**Last updated:** 2026-07-21
+**Version:** 0.2
+**Last updated:** 2026-07-22
+
+> **Where it stands.** Phase 0 and Phase 1 are done on the engine and product
+> side, minus the multi-process shell (see below), and several Phase 2–3 engine
+> items landed early because real sites needed them: flexbox, grid, floats,
+> `overflow` clipping, `opacity`/`z-index`, sibling and structural selectors,
+> WebP, and promises/`await`/`JSON` in the script engine. Split view (Phase 2)
+> and the English/Hindi interface with IME input (Phase 1) are in.
+>
+> **Still outstanding, and honestly so:** the browser runs in **one process with
+> no sandbox** — every risk in R5 is unmitigated today; there is no GPU
+> compositor (`softbuffer` blits on the CPU); no compat bridge; no sync,
+> profiles or spaces; the JS engine is still a tree-walking interpreter; and
+> encryption at rest has a Windows backend only. Those are the next real
+> milestones, not polish.
 
 > This roadmap is deliberately honest about the biggest fact of the project: a
 > from-scratch browser engine is a multi-year effort. The plan front-loads

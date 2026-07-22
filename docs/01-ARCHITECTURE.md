@@ -202,6 +202,14 @@ A dedicated, sandboxed process so AI features can't directly touch page memory o
 
 A Cargo workspace. Names indicative.
 
+**What exists today** is two crates, not twenty: `zero-engine` (HTML, CSS, style,
+layout, paint, JS, in one crate) and `zero-shell` (window, chrome, tabs, network,
+storage, AI, i18n). The split below is the shape this grows *into* as the pieces
+earn their own boundaries — a module that has never had a second consumer does
+not need to be a crate. The one boundary already real is the important one: the
+engine knows nothing about windows, tabs or files, and the shell is one embedder
+among possible others.
+
 ```
 zero/
 ├── crates/
