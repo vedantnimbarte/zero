@@ -26,9 +26,12 @@ otherwise. Instead of chasing full web-compatibility on day one, Zero ships in
 - **Phase 2–3:** Progressive engine expansion (flexbox/grid, more JS, media).
 - **Phase 4+:** Broad real-world site compatibility.
 
-A **compatibility-bridge fallback** (an embedded engine behind a feature flag) is
-specified so early adopters are never fully blocked while our engine matures.
-See [`docs/03-ROADMAP.md`](docs/03-ROADMAP.md) for the honest timeline and risks.
+So that nobody is ever stuck on a page Zero renders poorly, `Ctrl+Shift+O`
+hands it to whatever browser the system already has. That is a handoff, not the
+embedded-engine bridge the spec describes — the page opens *there*, outside
+Zero's cookie jar and blocking — and it costs one keystroke instead of a second
+engine. See [`docs/03-ROADMAP.md`](docs/03-ROADMAP.md) for the honest timeline
+and risks.
 
 ## Try it
 
@@ -69,6 +72,7 @@ saved settings.
 `Ctrl+L` clear address · `Ctrl+F` find · `Ctrl+D` bookmark · `Ctrl+S` save page ·
 `Ctrl+H` history · `Ctrl+B` bookmarks · `Ctrl+J` downloads · `Ctrl+,` settings ·
 `Ctrl+U` view source · `Ctrl+R` reload · `Ctrl+I` AI panel ·
+`Ctrl+Shift+O` open the page in your other browser ·
 `Ctrl+=`/`Ctrl+-`/`Ctrl+0` zoom (also `Ctrl`+wheel) · `Alt+←/→` back and forward.
 
 **Built-in pages:** `zero://newtab`, `zero://history`, `zero://bookmarks`,

@@ -30,8 +30,12 @@
 >   4–18x faster than it was, because measuring found the cost was never the AST
 >   walk (see `crates/zero-engine/examples/jsbench.rs`). A VM buys resolved
 >   variable slots next; worth doing when a real page's scripts are what is slow.
-> * **The compat bridge.** Embedding another engine behind a flag remains
->   specified and unbuilt.
+> * **The compat bridge.** Embedding another engine remains unbuilt, and is
+>   being questioned rather than scheduled: `Ctrl+Shift+O` hands the page to the
+>   browser the system already has, which keeps the promise nobody is stuck —
+>   without a second engine to ship, sandbox and keep current. If that proves
+>   insufficient in use, the bridge is the answer; until then it is 200 MB of
+>   speculation.
 > * **CSS transitions.** Deliberately not animated: the engine renders the
 >   settled state, which is the state that matters for reading a page. Animating
 >   needs a clock and per-element previous values — state the renderer does not

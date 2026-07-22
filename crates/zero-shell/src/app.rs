@@ -148,6 +148,7 @@ const MENU_ITEMS: &[(&str, &str, &str)] = &[
     ("menu:find", "Find on page", "Ctrl+F"),
     ("menu:save", "Save page", "Ctrl+S"),
     ("menu:source", "View source", "Ctrl+U"),
+    ("menu:handoff", "Open in your other browser", "Ctrl+Shift+O"),
     ("", "", ""),
     ("go:history", "History", "Ctrl+H"),
     ("go:bookmarks", "Bookmarks", "Ctrl+B"),
@@ -889,6 +890,37 @@ impl App {
         }
     }
 
+    /// Open this page in whatever browser the system already has.
+    ///
+    /// The specified answer to "Zero cannot render this yet" is a compat bridge
+    /// — another engine embedded behind a flag. This is the same promise kept
+    /// at a fraction of the weight: the machine already has a browser that
+    /// renders the whole web, and one keystroke reaches it. No 200 MB
+    /// dependency, no second engine to keep current, and nothing pretending the
+    /// page rendered here.
+    ///
+    /// ponytail: a handoff, not a bridge — the page opens *there*, outside this
+    /// browser's cookie jar and tracker blocking, which is exactly what handing
+    /// a page to another browser means and worth knowing before pressing it.
+    fn hand_off(&mut self) {
+        let url = self.tab().address.clone();
+        // Only ever a web address: anything else would be handing the system a
+        // path or a scheme of the page's choosing.
+        if !is_web_url(&url) {
+            return;
+        }
+        let launcher = if cfg!(windows) {
+            // Not `cmd /c start`: that would parse `&` in the URL as a command
+            // separator. `explorer` takes the target as one argument.
+            ("explorer", vec![url])
+        } else if cfg!(target_os = "macos") {
+            ("open", vec![url])
+        } else {
+            ("xdg-open", vec![url])
+        };
+        let _ = std::process::Command::new(launcher.0).args(launcher.1).spawn();
+    }
+
     /// Move to another space: a different profile, and so a different session,
     /// history, cookie jar and set of preferences.
     fn switch_space(&mut self, name: &str) {
@@ -1150,6 +1182,7 @@ impl App {
         match event.logical_key {
             // Shift changes what a chord means, so match on the lowercased key
             // and read Shift separately rather than on the character's case.
+            Key::Character(ref c) if ctrl && shift && lower(c) == "o" => self.hand_off(),
             Key::Character(ref c) if ctrl => match (lower(c).as_str(), shift) {
                 ("t", false) => self.new_tab(),
                 ("t", true) => self.reopen_closed(),
@@ -1355,6 +1388,7 @@ impl App {
             "menu:save" => self.save_page(),
             "menu:source" => self.view_source(),
             "menu:split" => self.toggle_split(),
+            "menu:handoff" => self.hand_off(),
             _ => return false,
         }
         true
@@ -2557,6 +2591,14 @@ fn timing_wanted() -> bool {
     *WANTED.get_or_init(|| std::env::var_os("ZERO_FRAME_TIMES").is_some())
 }
 
+/// Is this something a system browser should be handed — an `http(s)` address,
+/// and not a local path, a `zero://` page, or a scheme a page chose?
+fn is_web_url(url: &str) -> bool {
+    let lowered = url.trim().to_ascii_lowercase();
+    (lowered.starts_with("http://") || lowered.starts_with("https://"))
+        && !lowered.contains(char::is_whitespace)
+}
+
 fn blit_page(
     buffer: &mut [u32],
     w: u32,
@@ -2612,6 +2654,20 @@ mod tests {
 
     fn settings_with(layout: TabLayout, rail: Rail) -> Settings {
         Settings { layout, rail, ..Settings::default() }
+    }
+
+    #[test]
+    fn only_web_addresses_are_handed_to_another_browser() {
+        assert!(is_web_url("https://example.org/a?b=1&c=2"));
+        assert!(is_web_url("http://example.org"));
+        // A built-in page, a local file, and anything with a scheme of the
+        // page's choosing stay here.
+        assert!(!is_web_url("zero://settings"));
+        assert!(!is_web_url("file:///C:/secrets.txt"));
+        assert!(!is_web_url("javascript:alert(1)"));
+        assert!(!is_web_url(""));
+        // Whitespace is how a second argument would be smuggled in.
+        assert!(!is_web_url("https://example.org /x"));
     }
 
     #[test]
