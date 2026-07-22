@@ -53,7 +53,7 @@ fn newtab_style() -> String {
         text = theme::TEXT,
         muted = theme::MUTED,
         faint = theme::FAINT,
-        accent = theme::ACCENT,
+        accent = theme::accent(),
     )
 }
 
@@ -230,7 +230,7 @@ fn console_style() -> String {
         text = theme::TEXT,
         muted = theme::MUTED,
         faint = theme::FAINT,
-        accent = theme::ACCENT,
+        accent = theme::accent(),
         line = theme::LINE,
         link = theme::LINK,
     )
@@ -344,13 +344,18 @@ fn settings_page() -> String {
     );
     // Each language is named in its own script, so these labels are not translated.
     let language = segmented("lang", crate::settings::LANGUAGES, now.language());
+    // A space is named by whoever makes it, so its own name is its label.
+    let here = crate::spaces::current();
+    let names = crate::spaces::list();
+    let spaces: Vec<(&str, &str)> = names.iter().map(|n| (n.as_str(), n.as_str())).collect();
+    let spaces = segmented("space", &spaces, &here);
     let profile = crate::storage::profile_dir()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| "unavailable".to_string());
 
     let body = format!(
         "<div class=\"lede\">{lede}</div>\
-         <div class=\"sec\">{appearance}</div>{}{}{}{}{}{}\
+         <div class=\"sec\">{appearance}</div>{}{}{}{}{}{}{}\
          <div class=\"sec\">{search}</div>{}\
          <div class=\"sec\">{privacy}</div>{}{}\
          <div class=\"sec\">{about}</div>{}{}{}{}",
@@ -358,6 +363,11 @@ fn settings_page() -> String {
         setting_t("Tab rail", "How much of the vertical rail stays open", &rail),
         setting_t("Page zoom", "The size new tabs open at. Ctrl+= and Ctrl+- change one tab", &zoom),
         setting_t("Language", "What the browser's own screens are written in", &language),
+        setting_t(
+            "Space",
+            "Separate profiles: their own tabs, history, cookies and colour.              Open zero://settings?space=work to make one",
+            &spaces,
+        ),
         setting_t("Theme", "Light is designed but not built yet", &theme_control),
         setting_t(
             "Animation",

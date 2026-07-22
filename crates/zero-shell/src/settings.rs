@@ -208,6 +208,14 @@ thread_local! {
         RefCell::new(if cfg!(test) { Settings::default() } else { Settings::read() });
 }
 
+/// Re-read the settings from disk. Switching space swaps the file underneath
+/// us, and the new space's preferences are not the old one's.
+pub fn reload() {
+    if !cfg!(test) {
+        preview(Settings::read());
+    }
+}
+
 pub fn current() -> Settings {
     CURRENT.with(|c| *c.borrow())
 }

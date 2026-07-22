@@ -21,6 +21,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// the real profile. Functions that take a directory explicitly are tested
 /// against a scratch one instead.
 pub fn profile_dir() -> Option<PathBuf> {
+    let dir = crate::spaces::dir_of(&crate::spaces::current())?;
+    fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
+/// Where every space lives. The default space keeps this directory itself, so a
+/// profile written before spaces existed needs no migration.
+pub fn root_dir() -> Option<PathBuf> {
     if cfg!(test) {
         return None;
     }

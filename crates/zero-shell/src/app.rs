@@ -64,9 +64,24 @@ pub mod theme {
     pub const TEXT: &str = "#e8eaed";
     pub const MUTED: &str = "#8b919b";
     pub const FAINT: &str = "#5f646e";
-    pub const ACCENT: &str = "#e5484d"; // the mark, and the active tab
-    /// The accent at roughly 12% over CHROME — the active tab's wash.
-    pub const ACCENT_SOFT: &str = "#2b171b";
+    /// The mark and the active tab, in the current space's colour — which is
+    /// how you can tell at a glance which profile you are typing into.
+    pub fn accent() -> &'static str {
+        crate::spaces::accent_of(&crate::spaces::current())
+    }
+
+    /// The accent at roughly 12% over [`CHROME`] — the active tab's wash.
+    /// Mixed rather than listed, so a new accent needs no second constant.
+    pub fn accent_soft() -> String {
+        let mix = |i: usize| {
+            let hex = |text: &str, at: usize| {
+                u8::from_str_radix(&text[at..at + 2], 16).unwrap_or(0) as f32
+            };
+            let (accent, chrome) = (hex(accent(), 1 + i * 2), hex(CHROME, 1 + i * 2));
+            (chrome + (accent - chrome) * 0.12).round() as u8
+        };
+        format!("#{:02x}{:02x}{:02x}", mix(0), mix(1), mix(2))
+    }
     pub const SAVED: &str = "#f5a524"; // a bookmarked page
     pub const OK: &str = "#30a46c"; // a secure connection
     pub const LINK: &str = "#66ccff";
@@ -585,6 +600,7 @@ pub fn screenshot(
             ("railpx", _) => {} // applied after the loop, once settings are known
             ("search", query) => app.focus = Focus::TabSearch(query.to_string()),
             ("split", _) => app.toggle_split(),
+            ("space", name) => app.switch_space(name),
             ("tabs", n) => {
                 // Extra tabs, so the rail and the strip can be seen carrying more
                 // than one thing.
@@ -864,6 +880,25 @@ impl App {
             true => Some((self.active > other) as usize),
             false => None,
         }
+    }
+
+    /// Move to another space: a different profile, and so a different session,
+    /// history, cookie jar and set of preferences.
+    fn switch_space(&mut self, name: &str) {
+        if name == crate::spaces::current() {
+            return;
+        }
+        self.save_session(); // the space being left keeps its tabs
+        let Some(_) = crate::spaces::switch(name) else { return };
+        settings::reload();
+        self.settings = settings::current();
+        // Nothing from the old space may stay on screen: its tabs are its own.
+        self.tabs = vec![Tab::blank()];
+        self.active = 0;
+        self.split = None;
+        self.closed.clear();
+        self.rail_px = rail_target(self.settings) as f32;
+        self.request_redraw();
     }
 
     /// Show `index` beside the active tab, or close the split if it is already
@@ -1348,6 +1383,13 @@ impl App {
     /// Apply `zero://settings?key=value`, returning the address to actually open.
     fn apply_setting_link(&mut self, target: String) -> String {
         let Some(query) = target.strip_prefix("zero://settings?") else { return target };
+        // A space is not a preference — it decides which preferences file the
+        // rest of this query would even be written to, so it goes first and
+        // alone.
+        if let Some(name) = query.strip_prefix("space=") {
+            self.switch_space(&name.replace("+", " ").replace("%20", " "));
+            return "zero://settings".to_string();
+        }
         let mut settings = self.settings;
         settings.apply_query(query);
         self.store_settings(settings);
@@ -1882,12 +1924,12 @@ impl App {
             align = if icons { "center" } else { "left" },
             chrome = theme::CHROME,
             surface = theme::SURFACE,
-            soft = theme::ACCENT_SOFT,
+            soft = theme::accent_soft(),
             hover = theme::HOVER,
             text = theme::TEXT,
             muted = theme::MUTED,
             faint = theme::FAINT,
-            accent = theme::ACCENT,
+            accent = theme::accent(),
         )
     }
 
@@ -2002,12 +2044,12 @@ impl App {
             tab_w = STRIP_TAB_W - 32,
             name_w = STRIP_TAB_W - 32 - 34,
             chrome = theme::CHROME,
-            soft = theme::ACCENT_SOFT,
+            soft = theme::accent_soft(),
             hover = theme::HOVER,
             text = theme::TEXT,
             muted = theme::MUTED,
             faint = theme::FAINT,
-            accent = theme::ACCENT,
+            accent = theme::accent(),
             line = theme::LINE,
         )
     }

@@ -24,6 +24,7 @@ mod internal;
 mod localstore;
 mod net;
 mod settings;
+mod spaces;
 mod storage;
 
 use ai::Assistant;

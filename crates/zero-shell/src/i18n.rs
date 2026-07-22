@@ -67,6 +67,11 @@ const HINDI: &[(&str, &str)] = &[
     ("The size new tabs open at. Ctrl+= and Ctrl+- change one tab", "नए टैब किस आकार में खुलें। Ctrl+= और Ctrl+- एक टैब बदलते हैं"),
     ("Language", "भाषा"),
     ("What the browser's own screens are written in", "ब्राउज़र के अपने पृष्ठ किस भाषा में लिखे हों"),
+    ("Space", "स्थान"),
+    (
+        "Separate profiles: their own tabs, history, cookies and colour. Open zero://settings?space=work to make one",
+        "अलग प्रोफ़ाइल: अपने टैब, इतिहास, कुकीज़ और रंग। बनाने के लिए zero://settings?space=work खोलें",
+    ),
     ("Theme", "रंग-रूप"),
     ("Light is designed but not built yet", "हल्का रूप बनाया गया है, बना नहीं"),
     ("Animation", "गति"),

@@ -58,6 +58,7 @@ saved settings.
 | `search:wiki` | tab search, filtering |
 | `tabs:5` | extra tabs, one of them pinned |
 | `split` | two pages side by side |
+| `space:work` | a different profile, with its own accent |
 | `railpx:150` | the tab rail caught mid-slide |
 | `layout=horizontal`, `rail=icons`, `zoom=150`, … | any setting |
 
@@ -70,6 +71,12 @@ saved settings.
 
 **Built-in pages:** `zero://newtab`, `zero://history`, `zero://bookmarks`,
 `zero://downloads`, `zero://settings`.
+
+**Spaces** are separate profiles in one browser — their own tabs, history,
+cookies, `localStorage`, downloads, settings and encryption key, because a space
+*is* a profile directory. `zero://settings?space=work` makes one and switches to
+it; the accent colour changes with it, so you can see which profile you are
+typing into.
 
 **Settings** live at `zero://settings` — tab layout (vertical rail or a horizontal
 strip), how far the rail collapses, page zoom, interface language (English or
@@ -106,7 +113,7 @@ forms.
 - **JavaScript**: own lexer, parser and interpreter — closures, classes with
   `super`, `try/catch/finally`, regex literals, `setTimeout`, `JSON`, `fetch`
   with promises and `await`, DOM query and mutation, events
-- **Browser**: vertical tabs, split view, session restore, history, bookmarks, find-in-page,
+- **Browser**: vertical tabs, split view, spaces (separate profiles), session restore, history, bookmarks, find-in-page,
   form submission and search, an on-device page assistant, an English/Hindi
   interface, and input-method text so Indic scripts can be typed
 - **Privacy**: tracker/ad filtering (Adblock syntax), HTTPS-first, cookies and
