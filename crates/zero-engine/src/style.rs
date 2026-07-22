@@ -66,6 +66,21 @@ impl<'a> StyledNode<'a> {
     }
 
     pub fn display(&self) -> Display {
+        let display = self.declared_display();
+        // A float is block-level whatever it says it is (CSS 9.7), and the box
+        // tree has to agree with layout about that or a floated <img> ends up
+        // in a line box that never places it.
+        match display {
+            Display::Inline | Display::InlineBlock
+                if crate::layout::float_side_of(self).is_some() =>
+            {
+                Display::Block
+            }
+            other => other,
+        }
+    }
+
+    fn declared_display(&self) -> Display {
         match self.value("display") {
             Some(Value::Keyword(s)) => match &*s {
                 "block" => Display::Block,

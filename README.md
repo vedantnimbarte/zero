@@ -90,12 +90,13 @@ correctly, including their own stylesheets, tables and forms.
 - **HTML**: tolerant parser, character references, raw-text and void elements
 - **CSS**: external `<link>` sheets and `@import`, `@media` (type + width), descendant/child
   selectors, attribute selectors (`[type=text]`, `~=`, `^=`, `$=`, `*=`),
-  `:hover`,
+  pseudo-classes (`:hover`, `:nth-child()`, `:first-child`, `:not()`, `:checked`),
   custom properties (`var()`, defined on `:root`), the cascade with specificity, HTML presentation attributes (`bgcolor`, `width`, `align`),
   named colours, `rgb()`/`hsl()`, alpha
 - **Layout**: block, inline, inline-block, flex (wrap/grow/justify/align), grid
   (`repeat()`, `fr`, `minmax()`, spans, named areas), tables (colspan/rowspan),
-  out-of-flow positioning, intrinsic sizing, `text-align`, `white-space: pre`
+  floats and `clear`, out-of-flow positioning, intrinsic sizing, `text-align`,
+  `white-space: pre`
 - **Text**: shaping via HarfBuzz with a font fallback chain — Latin, Indic
   (Devanagari, Tamil, Telugu, Bengali and more) and CJK
 - **JavaScript**: own lexer, parser and interpreter — closures, classes with
@@ -106,10 +107,11 @@ correctly, including their own stylesheets, tables and forms.
   `localStorage` partitioned per site, profile data encrypted at rest (DPAPI on
   Windows; macOS and Linux backends are still to come)
 
-**Known limits.** Pseudo-classes other than `:root` and `:hover` are skipped —
-a rule using one is dropped rather than misapplied. Wikipedia's skin renders its columns correctly at
-wide window sizes but still overlaps its floating tools rail. Layout and paint are
-single-threaded, and a page is painted in full rather than by viewport.
+**Known limits.** A pseudo-class the engine cannot honour exactly (`::before`,
+`:has()`) still takes its rule with it, rather than being misapplied. Text does
+not re-widen below a short float — a block beside one keeps its narrowed width
+for its whole height. Layout and paint are single-threaded, and a page is
+painted in full rather than by viewport.
 
 ## The documents
 

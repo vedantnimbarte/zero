@@ -134,6 +134,49 @@ pub enum BoxType<'a> {
     AnonymousBlock,
 }
 
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Side {
+    Left,
+    Right,
+}
+
+/// A float already placed in this block, in page coordinates.
+struct FloatRect {
+    side: Side,
+    left: f32,
+    right: f32,
+    bottom: f32,
+}
+
+/// `float: left | right` on a styled node. Lives outside [`LayoutBox`] because
+/// [`StyledNode::display`] needs it too — a float is block-level whatever its
+/// own `display` says.
+pub fn float_side_of(style: &StyledNode) -> Option<Side> {
+    match style.value("float") {
+        Some(Value::Keyword(ref k)) if k == "left" => Some(Side::Left),
+        Some(Value::Keyword(ref k)) if k == "right" => Some(Side::Right),
+        _ => None,
+    }
+}
+
+/// The horizontal space still free at height `top`, given the floats placed so far.
+///
+/// ponytail: the span is measured once, at the box's top edge, and used for its
+/// whole height — text does not re-widen below a short float. Doing that
+/// properly means asking per line box, which is where it should move if a page
+/// needs it.
+fn free_span(floats: &[FloatRect], top: f32, content: Rect) -> (f32, f32) {
+    let mut left = content.x;
+    let mut right = content.x + content.width;
+    for float in floats.iter().filter(|f| f.bottom > top) {
+        match float.side {
+            Side::Left => left = left.max(float.right),
+            Side::Right => right = right.min(float.left),
+        }
+    }
+    (left, right.max(left))
+}
+
 impl<'a> LayoutBox<'a> {
     fn new(box_type: BoxType<'a>) -> LayoutBox<'a> {
         LayoutBox {
@@ -150,6 +193,28 @@ impl<'a> LayoutBox<'a> {
         match self.box_type {
             BoxType::BlockNode(node) | BoxType::InlineNode(node) => node,
             BoxType::AnonymousBlock => panic!("Anonymous block box has no style node"),
+        }
+    }
+
+    /// `float: left | right`, if this box is floated.
+    fn float_side(&self) -> Option<Side> {
+        match self.box_type {
+            BoxType::AnonymousBlock => None,
+            _ => float_side_of(self.get_style_node()),
+        }
+    }
+
+    /// The sides this box's `clear` names.
+    fn clear_sides(&self) -> Option<Vec<Side>> {
+        let keyword = match self.box_type {
+            BoxType::AnonymousBlock => return None,
+            _ => keyword_of(self.get_style_node().value("clear")?)?,
+        };
+        match keyword.as_str() {
+            "left" => Some(vec![Side::Left]),
+            "right" => Some(vec![Side::Right]),
+            "both" => Some(vec![Side::Left, Side::Right]),
+            _ => None,
         }
     }
 
@@ -986,7 +1051,9 @@ impl<'a> LayoutBox<'a> {
     fn calculate_block_width(&mut self, containing_block: Dimensions) {
         // An out-of-flow box is placed explicitly, so it must not absorb the
         // container's leftover space into its margins the way in-flow blocks do.
-        let out_of_flow = self.is_out_of_flow();
+        // A float is the same: its margin box is what other content sits beside,
+        // and a margin stretched to the container's width leaves room for nothing.
+        let out_of_flow = self.is_out_of_flow() || self.float_side().is_some();
         let style = self.get_style_node();
         let auto = Value::Keyword("auto".to_string());
         let zero = Value::Length(0.0, Unit::Px);
@@ -1107,17 +1174,70 @@ impl<'a> LayoutBox<'a> {
     ) {
         let count = self.children.len();
         let d = &mut self.dimensions;
+        // Floats placed so far, in page coordinates. Every block keeps its own
+        // list, so a float never escapes the box it was declared in.
+        let mut floats: Vec<FloatRect> = Vec::new();
         for (i, child) in self.children.iter_mut().enumerate() {
             if child.is_out_of_flow() {
                 continue; // positioned later, once the container's size is final
             }
-            child.layout(*d, fonts, images);
-            // Grow this box to contain each child's margin box.
-            d.content.height += child.dimensions.margin_box().height;
-            if gap > 0.0 && i + 1 < count {
-                d.content.height += gap;
+            // `clear` drops this child below the floats it names.
+            if let Some(cleared) = child.clear_sides() {
+                let bottom = floats
+                    .iter()
+                    .filter(|f| cleared.contains(&f.side))
+                    .map(|f| f.bottom)
+                    .fold(d.content.y + d.content.height, f32::max);
+                d.content.height = bottom - d.content.y;
             }
+            let top = d.content.y + d.content.height;
+            let (left, right) = free_span(&floats, top, d.content);
+            let mut slot = *d;
+            slot.content.x = left;
+            slot.content.width = (right - left).max(0.0);
+
+            let Some(side) = child.float_side() else {
+                child.layout(slot, fonts, images);
+                // Grow this box to contain each child's margin box.
+                d.content.height += child.dimensions.margin_box().height;
+                if gap > 0.0 && i + 1 < count {
+                    d.content.height += gap;
+                }
+                continue;
+            };
+
+            // A float with no width shrinks to fit its content rather than
+            // filling the line, which is what makes it a float at all.
+            if child.get_style_node().value("width").is_none() {
+                let fit = max_content_width(child.get_style_node(), fonts, images);
+                slot.content.width = fit.min(slot.content.width);
+            }
+            child.layout(slot, fonts, images);
+            if side == Side::Right {
+                // Its own width was only knowable after that first pass.
+                slot.content.x = right - child.dimensions.margin_box().width;
+                child.layout(slot, fonts, images);
+            }
+            let outer = child.dimensions.margin_box();
+            floats.push(FloatRect {
+                side,
+                left: outer.x,
+                right: outer.x + outer.width,
+                bottom: outer.y + outer.height,
+            });
         }
+        // Contain the floats: a box whose only content is floated would
+        // otherwise have no height and let the next block draw on top of it.
+        //
+        // ponytail: CSS only contains floats in a new formatting context
+        // (`overflow: hidden`, a flex item, …). Containing everywhere matches
+        // what the clearfix idiom asks for and never overlaps; the cost is a
+        // float sticking out of a `visible` parent stays inside instead.
+        let bottom = floats
+            .iter()
+            .map(|f| f.bottom)
+            .fold(d.content.y + d.content.height, f32::max);
+        d.content.height = bottom - d.content.y;
     }
 
     /// Single-line flex layout.
@@ -2057,6 +2177,66 @@ mod tests {
 
         let root = layout_tree(&styled, viewport, None, &ImageMap::new());
         assert_eq!(root.dimensions.content.width, 200.0);
+    }
+
+    /// Lay a page out at `width` and return every element box by `id`.
+    fn boxes_by_id(html: &str, css: &str, width: f32) -> HashMap<String, Rect> {
+        let dom = crate::html::parse(html.to_string());
+        let sheet = crate::css::parse(css.to_string());
+        let styled = crate::style::style_tree(&dom, &sheet);
+        let mut viewport: Dimensions = Default::default();
+        viewport.content.width = width;
+        let root = layout_tree(&styled, viewport, None, &ImageMap::new());
+        let mut rects = Vec::new();
+        collect_element_rects(&root, &mut rects);
+        rects
+            .into_iter()
+            .filter(|r| !r.id.is_empty())
+            .map(|r| {
+                (
+                    r.id,
+                    Rect { x: r.x, y: r.y, width: r.width, height: r.height },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn floats_sit_beside_the_content_that_follows_them() {
+        let css = "div { display: block; }
+                   #rail { float: right; width: 200px; height: 100px; }
+                   #logo { float: left; width: 80px; height: 40px; }
+                   #body { height: 300px; }
+                   #below { clear: both; height: 10px; }";
+        let html = "<main><div id=rail></div><div id=logo></div>\
+                    <div id=body></div><div id=below></div></main>";
+        let b = boxes_by_id(html, css, 1000.0);
+
+        // The right float hugs the right edge, the left float the left.
+        assert_eq!(b["rail"].x, 800.0);
+        assert_eq!(b["logo"].x, 0.0);
+        // Both floats start at the top, not stacked below one another.
+        assert_eq!(b["rail"].y, 0.0);
+        assert_eq!(b["logo"].y, 0.0);
+        // The following block is squeezed between them instead of under them.
+        assert_eq!(b["body"].x, 80.0);
+        assert_eq!(b["body"].width, 720.0);
+        assert_eq!(b["body"].y, 0.0);
+        // `clear: both` drops below the taller float, not just below `body`.
+        assert_eq!(b["below"].y, 300.0);
+        assert_eq!(b["below"].x, 0.0);
+    }
+
+    #[test]
+    fn a_box_of_only_floats_still_has_height() {
+        let css = "div, section { display: block; }
+                   #f { float: left; width: 50px; height: 70px; }
+                   #after { height: 10px; }";
+        let html = "<main><section id=head><div id=f></div></section>\
+                    <div id=after></div></main>";
+        let b = boxes_by_id(html, css, 500.0);
+        assert_eq!(b["head"].height, 70.0);
+        assert_eq!(b["after"].y, 70.0);
     }
 
     /// Build a styled node with the given `display`/`width`/`flex-grow`, plus children.
