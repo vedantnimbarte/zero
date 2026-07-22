@@ -103,7 +103,7 @@ forms.
   descendant/child/sibling selectors (`div p`, `>`, `+`, `~`),
   attribute selectors (`[type=text]`, `~=`, `^=`, `$=`, `*=`),
   pseudo-classes (`:hover`, `:nth-child()`, `:first-child`, `:not()`, `:checked`),
-  `visibility`, `opacity`, `z-index`, `transform: translate`,
+  `visibility`, `opacity`, `z-index`, `transform` (translate/scale),
   `overflow` clipping, custom properties (`var()`, defined on `:root`), the cascade with specificity, HTML presentation attributes (`bgcolor`, `width`, `align`),
   named colours, `rgb()`/`hsl()`, alpha
 - **Layout**: block, inline, inline-block, flex (wrap/grow/justify/align), grid

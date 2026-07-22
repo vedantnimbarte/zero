@@ -420,7 +420,7 @@ fn highlight_rects(list: &DisplayList, query: &str) -> Vec<Rect> {
 
 fn build_display_list(layout_root: &LayoutBox) -> DisplayList {
     let mut list = Vec::new();
-    render_layout_box(&mut list, layout_root, UNCLIPPED, 1.0, (0.0, 0.0));
+    render_layout_box(&mut list, layout_root, UNCLIPPED, 1.0, Xf::NONE);
     list
 }
 
@@ -482,7 +482,7 @@ fn clip_command(item: DisplayCommand, clip: Rect) -> Option<DisplayCommand> {
 
 /// The clip a box imposes on its descendants: its padding box, when `overflow`
 /// says content may not escape it.
-fn child_clip(layout_box: &LayoutBox, clip: Rect, offset: (f32, f32)) -> Option<Rect> {
+fn child_clip(layout_box: &LayoutBox, clip: Rect, xf: Xf) -> Option<Rect> {
     let style = match layout_box.box_type {
         BoxType::BlockNode(s) | BoxType::InlineNode(s) => s,
         BoxType::AnonymousBlock => return Some(clip),
@@ -505,9 +505,7 @@ fn child_clip(layout_box: &LayoutBox, clip: Rect, offset: (f32, f32)) -> Option<
         // No scrollbars: a scrollable box shows its first screenful, which is
         // what a collapsed menu or a clipped banner needs.
         "hidden" | "clip" | "auto" | "scroll" => {
-            let box_rect = layout_box.dimensions.padding_box();
-            let mut drawn =
-                Rect { x: box_rect.x + offset.0, y: box_rect.y + offset.1, ..box_rect };
+            let mut drawn = xf.rect(layout_box.dimensions.padding_box());
             // Vertically, only a height the page *stated* is worth clipping to.
             // A content-sized box already wraps its content, so a clip there can
             // only ever hide something this engine mis-measured — which is
@@ -588,26 +586,66 @@ fn fade(item: DisplayCommand, alpha: f32) -> DisplayCommand {
     }
 }
 
-/// How far `transform` moves this box and everything inside it.
+/// A uniform scale and an offset: `p' = p * scale + (dx, dy)`.
 ///
-/// ponytail: `translate` only. Percentages resolve against the box's own border
-/// box, which is what `translate(-50%, -50%)` — the way the web centres things —
-/// needs. `scale`, `rotate` and matrices are ignored rather than approximated:
-/// moving a box is exact, scaling it without resampling its text is not.
-fn translation_of(layout_box: &LayoutBox) -> (f32, f32) {
+/// Every transform this engine honours is of that shape, and two of them
+/// compose into a third — which is what lets a transformed subtree carry its
+/// ancestors' transforms in one value rather than a matrix stack.
+#[derive(Clone, Copy)]
+struct Xf {
+    scale: f32,
+    dx: f32,
+    dy: f32,
+}
+
+impl Xf {
+    const NONE: Xf = Xf { scale: 1.0, dx: 0.0, dy: 0.0 };
+
+    fn is_none(&self) -> bool {
+        self.scale == 1.0 && self.dx == 0.0 && self.dy == 0.0
+    }
+
+    /// `self` applied after `inner`.
+    fn then(self, inner: Xf) -> Xf {
+        Xf {
+            scale: self.scale * inner.scale,
+            dx: self.scale * inner.dx + self.dx,
+            dy: self.scale * inner.dy + self.dy,
+        }
+    }
+
+    fn rect(&self, r: Rect) -> Rect {
+        Rect {
+            x: r.x * self.scale + self.dx,
+            y: r.y * self.scale + self.dy,
+            width: r.width * self.scale,
+            height: r.height * self.scale,
+        }
+    }
+}
+
+/// What `transform` does to this box and everything inside it.
+///
+/// ponytail: `translate` and `scale` only. Percentages resolve against the box's
+/// own border box, which is what `translate(-50%, -50%)` — the way the web
+/// centres things — needs. `rotate`, `skew` and matrices are ignored rather than
+/// approximated: moving and scaling a box is exact, and rotating text would need
+/// the rasterizer to turn glyphs, not just place them.
+fn transform_of(layout_box: &LayoutBox) -> Xf {
     let style = match layout_box.box_type {
         BoxType::BlockNode(s) | BoxType::InlineNode(s) => s,
-        BoxType::AnonymousBlock => return (0.0, 0.0),
+        BoxType::AnonymousBlock => return Xf::NONE,
     };
     let spec = match style.value("transform") {
         Some(Value::Raw(text)) => text,
-        _ => return (0.0, 0.0),
+        _ => return Xf::NONE,
     };
     let box_rect = layout_box.dimensions.border_box();
-    let mut shift = (0.0, 0.0);
+    let mut shift = (0.0f32, 0.0f32);
+    let mut scale = 1.0f32;
     let mut rest = spec.as_str();
-    // A transform list applies right to left, but translations commute, so the
-    // order they are summed in does not matter.
+    // Translations commute and a uniform scale commutes with them up to the
+    // origin, which is handled once at the end — so the list can be summed.
     while let Some(open) = rest.find('(') {
         let name = rest[..open].trim().trim_start_matches(',').trim().to_ascii_lowercase();
         let Some(close) = rest[open..].find(')') else { break };
@@ -618,6 +656,7 @@ fn translation_of(layout_box: &LayoutBox) -> (f32, f32) {
             Some(pct) => pct.trim().parse::<f32>().unwrap_or(0.0) / 100.0 * base,
             None => crate::css::parse_length_token(token, ctx),
         };
+        let number = |token: &str| token.parse::<f32>().ok();
         match name.as_str() {
             "translate" => {
                 shift.0 += px(args[0], box_rect.width);
@@ -627,38 +666,72 @@ fn translation_of(layout_box: &LayoutBox) -> (f32, f32) {
             }
             "translatex" => shift.0 += px(args[0], box_rect.width),
             "translatey" => shift.1 += px(args[0], box_rect.height),
-            _ => {} // scale/rotate/matrix: not modelled
+            // A non-uniform scale would need two factors everywhere below; the
+            // larger of the two is closer than ignoring the transform outright.
+            "scale" => {
+                let x = number(args[0]).unwrap_or(1.0);
+                let y = args.get(1).and_then(|a| number(a)).unwrap_or(x);
+                scale *= x.abs().max(y.abs());
+            }
+            "scalex" | "scaley" => scale *= number(args[0]).unwrap_or(1.0).abs(),
+            _ => {} // rotate/skew/matrix: not modelled
         }
         rest = &rest[open + close + 1..];
     }
-    shift
+    if shift == (0.0, 0.0) && scale == 1.0 {
+        return Xf::NONE;
+    }
+    // Scaling happens about the box's centre, as `transform-origin` defaults to.
+    let centre = (
+        box_rect.x + box_rect.width / 2.0,
+        box_rect.y + box_rect.height / 2.0,
+    );
+    Xf {
+        scale,
+        dx: centre.0 * (1.0 - scale) + shift.0,
+        dy: centre.1 * (1.0 - scale) + shift.1,
+    }
 }
 
-/// Move a command by `(dx, dy)`.
-fn shift(item: DisplayCommand, (dx, dy): (f32, f32)) -> DisplayCommand {
-    let moved = |r: Rect| Rect { x: r.x + dx, y: r.y + dy, ..r };
+/// Move and scale one command.
+fn transform(item: DisplayCommand, xf: Xf) -> DisplayCommand {
+    if xf.is_none() {
+        return item;
+    }
     match item {
-        DisplayCommand::SolidColor(c, rect) => DisplayCommand::SolidColor(c, moved(rect)),
+        DisplayCommand::SolidColor(c, rect) => DisplayCommand::SolidColor(c, xf.rect(rect)),
         DisplayCommand::RoundedColor(c, rect, radius) => {
-            DisplayCommand::RoundedColor(c, moved(rect), radius)
+            DisplayCommand::RoundedColor(c, xf.rect(rect), radius * xf.scale)
         }
         DisplayCommand::Gradient { rect, radius, stops, horizontal } => DisplayCommand::Gradient {
-            rect: moved(rect),
-            radius,
+            rect: xf.rect(rect),
+            radius: radius * xf.scale,
             stops,
             horizontal,
         },
         DisplayCommand::Shadow { rect, radius, blur, color } => DisplayCommand::Shadow {
-            rect: moved(rect),
-            radius,
-            blur,
+            rect: xf.rect(rect),
+            radius: radius * xf.scale,
+            blur: blur * xf.scale,
             color,
         },
-        DisplayCommand::Image(src, rect) => DisplayCommand::Image(src, moved(rect)),
+        DisplayCommand::Image(src, rect) => DisplayCommand::Image(src, xf.rect(rect)),
+        // Glyphs were shaped at `size`, and their offsets are in those units, so
+        // both scale together or the run comes apart.
         DisplayCommand::Text(frag) => DisplayCommand::Text(TextFragment {
-            x: frag.x + dx,
-            y: frag.y + dy,
-            glyphs: frag.glyphs,
+            x: frag.x * xf.scale + xf.dx,
+            y: frag.y * xf.scale + xf.dy,
+            width: frag.width * xf.scale,
+            size: frag.size * xf.scale,
+            glyphs: frag
+                .glyphs
+                .into_iter()
+                .map(|g| crate::text::PositionedGlyph {
+                    x: g.x * xf.scale,
+                    y: g.y * xf.scale,
+                    ..g
+                })
+                .collect(),
             ..frag
         }),
     }
@@ -684,18 +757,18 @@ fn render_layout_box(
     layout_box: &LayoutBox,
     clip: Rect,
     alpha: f32,
-    offset: (f32, f32),
+    outer: Xf,
 ) {
     let alpha = alpha * opacity_of(layout_box);
-    // A transform moves the box and everything inside it, so it accumulates.
-    let own_shift = translation_of(layout_box);
-    let offset = (offset.0 + own_shift.0, offset.1 + own_shift.1);
+    // A transform applies to the box and everything inside it, so it composes
+    // with whatever its ancestors already did.
+    let xf = outer.then(transform_of(layout_box));
     if !is_invisible(layout_box) && alpha > 0.0 {
         let mut own = Vec::new();
         render_own(&mut own, layout_box);
         list.extend(
             own.into_iter()
-                .map(|item| shift(item, offset))
+                .map(|item| transform(item, xf))
                 .filter_map(|item| clip_command(item, clip))
                 .map(|item| fade(item, alpha)),
         );
@@ -703,7 +776,7 @@ fn render_layout_box(
     // This box's own clip comes from where it is *drawn*, not where it was laid
     // out. An empty clip still has to be handed down: a child of a hidden box is
     // hidden too, however visible it declares itself.
-    let inner = child_clip(layout_box, clip, offset).unwrap_or(Rect::default());
+    let inner = child_clip(layout_box, clip, xf).unwrap_or(Rect::default());
     // A higher `z-index` paints later, and equal ones keep document order.
     //
     // ponytail: one flat order rather than real stacking contexts, so a child's
@@ -712,7 +785,7 @@ fn render_layout_box(
     let mut order: Vec<&LayoutBox> = layout_box.children.iter().collect();
     order.sort_by_key(|child| z_index_of(child));
     for child in order {
-        render_layout_box(list, child, inner, alpha, offset);
+        render_layout_box(list, child, inner, alpha, xf);
     }
 }
 

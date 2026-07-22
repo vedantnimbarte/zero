@@ -1275,6 +1275,24 @@ mod tests {
         assert!(!red(85, 65), "the untranslated position must be empty");
     }
 
+    #[test]
+    fn scale_grows_a_box_about_its_own_centre() {
+        let engine = super::Engine::shapes_only();
+        let canvas = engine.render(
+            "<body><div id=\"box\"></div></body>",
+            "#box { position: absolute; left: 40px; top: 40px; width: 20px; height: 20px;
+                    background: #ff0000; transform: scale(2); }",
+            100.0,
+            100.0,
+        );
+        let red = |x: usize, y: usize| canvas.pixels[y * canvas.width + x].r == 255
+            && canvas.pixels[y * canvas.width + x].g == 0;
+        // 20px at (40,40) doubled about its centre (50,50) covers 30..70.
+        assert!(red(50, 50), "the centre stays put");
+        assert!(red(32, 32) && red(67, 67), "the box grew to twice its size");
+        assert!(!red(25, 25), "and no further");
+    }
+
     /// A search box: type into a field nested inside the form, press Enter.
     #[test]
     fn submitting_a_field_builds_a_get_query() {
