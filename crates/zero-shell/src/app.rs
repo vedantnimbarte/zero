@@ -22,6 +22,17 @@ use crate::ai::{Assistant, LocalAssistant, PageContext};
 use crate::net::{load_target, normalize_target, resolve_url, ShellLoader};
 use crate::i18n::{t, t_tip};
 use crate::settings::{self, Rail, Settings, TabLayout, ZOOM_STEPS};
+use crate::renderer;
+
+/// A real renderer spawns a child process, which a unit test's binary can't
+/// point at (see [`renderer::FakeRenderer`] for why) — so tests get an
+/// in-process stand-in with the same inherent methods instead. Every real
+/// run of the browser, and every integration test driving the compiled
+/// binary from outside, uses the real one.
+#[cfg(not(test))]
+type TabRenderer = renderer::TabRenderer;
+#[cfg(test)]
+type TabRenderer = renderer::FakeRenderer;
 use crate::storage;
 use std::num::NonZeroU32;
 use std::rc::Rc;
@@ -43,6 +54,10 @@ const TABSTRIP_H: u32 = 38;
 const TOOLBAR_H: u32 = 48;
 const AI_PANEL_W: u32 = 320;
 const SCROLLBAR_W: u32 = 12;
+/// A placeholder viewport for a tab's very first render, before its real
+/// size is known — `render_pane` asks again at the window's actual size on
+/// the next frame regardless, since `cache_w`/`cache_h` start unset.
+const DEFAULT_VIEWPORT: (f32, f32) = (800.0, 600.0);
 const MENU_W: u32 = 252;
 /// How much horizontal room one toolbar button takes: glyph box plus padding.
 const BUTTON_SPAN: u32 = 40;
@@ -488,8 +503,14 @@ fn initial(label: &str) -> String {
 /// Everything that belongs to one tab, including its own history and render cache.
 struct Tab {
     address: String,
-    /// Owns the parsed DOM and a live JS runtime, so handlers survive between frames.
-    doc: zero_engine::Document,
+    /// A process of its own, holding the parsed DOM and a live JS runtime so
+    /// handlers survive between frames — see `docs/03-ROADMAP.md`'s note on
+    /// why page content no longer runs in this one.
+    renderer: TabRenderer,
+    /// This tab's own title and focus state, cached from the last frame its
+    /// renderer sent back rather than asked for fresh each time.
+    title: String,
+    is_focused: bool,
     element_rects: Vec<ElementRect>,
     history: Vec<String>,
     history_index: usize,
@@ -506,6 +527,10 @@ struct Tab {
     matches: Vec<zero_engine::layout::Rect>,
     /// Whether the last render's stylesheet reacted to the cursor at all.
     uses_hover: bool,
+    /// The page element the cursor was over last, so `update_hover` only
+    /// sends a `hover` message — and pays for a round trip and a repaint —
+    /// when it has actually changed, not on every mouse-move pixel.
+    hovered_node: Option<usize>,
     /// The markup this page was built from, kept for view-source and saving.
     source: String,
     /// Shared with this tab's document so its subresource cache outlives a
@@ -515,21 +540,41 @@ struct Tab {
     cache_h: u32,
 }
 
+/// A tab's own `localStorage`, partitioned by site like cookies — shared by
+/// [`Tab::new`] and [`App::load`], the two places a renderer is spawned.
+fn store_for(address: &str) -> Rc<dyn zero_engine::KeyValueStore> {
+    Rc::new(crate::localstore::SiteStore::for_site(&storage_site(address)))
+}
+
+/// Undo `renderer::write_frame`'s RGBA packing.
+fn canvas_from_frame(frame: &renderer::Frame) -> Canvas {
+    let mut pixels = Vec::with_capacity(frame.width * frame.height);
+    for p in frame.pixels.chunks_exact(4) {
+        pixels.push(zero_engine::Color { r: p[0], g: p[1], b: p[2], a: p[3] });
+    }
+    Canvas { pixels, width: frame.width, height: frame.height }
+}
+
 impl Tab {
     fn new(address: String, html: String, css: String) -> Tab {
         let loader = Rc::new(ShellLoader::new(address.clone()));
         let source = html.clone();
-        let doc = zero_engine::Document::load_hosted(
+        let (renderer, frame) = TabRenderer::spawn(
             &html,
             &css,
-            Some(loader.clone()),
-            Some(Rc::new(crate::localstore::SiteStore::for_site(&storage_site(&address)))),
-        );
-        Tab {
+            DEFAULT_VIEWPORT.0,
+            DEFAULT_VIEWPORT.1,
+            loader.clone(),
+            store_for(&address),
+        )
+        .expect("spawn the tab's renderer process");
+        let mut tab = Tab {
             loader,
             history: vec![address.clone()],
             address,
-            doc,
+            renderer,
+            title: String::new(),
+            is_focused: false,
             element_rects: Vec::new(),
             history_index: 0,
             scroll_y: 0.0,
@@ -541,10 +586,16 @@ impl Tab {
             links: Vec::new(),
             matches: Vec::new(),
             uses_hover: false,
+            hovered_node: None,
             source,
             cache_w: 0,
             cache_h: 0,
-        }
+        };
+        // `cache_w`/`cache_h` stay 0, so the first real `render_pane` call —
+        // at the window's actual size, not this placeholder one — still
+        // finds itself unsettled and asks for a fresh frame.
+        tab.apply_frame(frame, DEFAULT_VIEWPORT.0 as u32, DEFAULT_VIEWPORT.1 as u32);
+        tab
     }
 
     fn blank() -> Tab {
@@ -554,9 +605,40 @@ impl Tab {
         tab
     }
 
+    /// Adopt a frame from this tab's own renderer — every cache the rest of
+    /// `app.rs` reads (compositing, hit-testing, the window title) comes
+    /// from here, so a click, a resize and a navigation all keep them in
+    /// sync the same way rather than each updating a subset by hand.
+    fn apply_frame(&mut self, frame: renderer::Frame, w: u32, h: u32) {
+        self.title = frame.title.clone();
+        self.is_focused = frame.is_focused;
+        self.uses_hover = frame.uses_hover;
+        self.element_rects = frame.element_rects.clone();
+        self.links = frame.links.clone();
+        self.matches = frame.find_matches.clone();
+        self.page_canvas = Some(canvas_from_frame(&frame));
+        self.cache_w = w;
+        self.cache_h = h;
+    }
+
+    /// Replace a dead renderer with a fresh one, reloading the same page the
+    /// tab was already showing — not *recovered* state (typed text, focus,
+    /// running scripts), which a crashed process has no way to hand over,
+    /// but the same navigation, retried silently instead of leaving the tab
+    /// permanently blank after one hung script.
+    fn respawn(&mut self, w: f32, h: f32) -> Option<renderer::Frame> {
+        if self.source.is_empty() {
+            return None; // nothing loaded yet to reload
+        }
+        let (renderer, frame) =
+            TabRenderer::spawn(&self.source, "", w, h, self.loader.clone(), store_for(&self.address))?;
+        self.renderer = renderer;
+        Some(frame)
+    }
+
     /// How the tab names itself in a space `max` characters wide.
     fn label_capped(&self, max: usize) -> String {
-        label_for(&self.doc.title(), &self.address, max)
+        label_for(&self.title, &self.address, max)
     }
 
     /// The rail's width, which is what most of the chrome is sized against.
@@ -660,9 +742,7 @@ pub fn run_window_restoring_session(engine: Engine) -> bool {
         .iter()
         .map(|(url, pinned)| {
             let fetched = load_target(url);
-            let loader = Rc::new(ShellLoader::new(fetched.url.clone()));
-            let mut tab = Tab::new(fetched.url.clone(), String::new(), String::new());
-            tab.doc = zero_engine::Document::load_with(&fetched.body, "", loader);
+            let mut tab = Tab::new(fetched.url.clone(), fetched.body, String::new());
             tab.secure = fetched.secure;
             tab.pinned = *pinned;
             tab
@@ -698,9 +778,6 @@ struct App {
     /// `None` when nothing is moving, so the first frame of an animation starts
     /// from rest instead of jumping by however long the window sat idle.
     last_frame: Option<std::time::Instant>,
-    /// When this window opened. Page transitions run against the time since,
-    /// which is monotonic and shared by every tab.
-    started: std::time::Instant,
     /// Whether a page transition is still running and wants another frame.
     page_animating: bool,
     /// Whether the last frame left something mid-animation and so owes another.
@@ -727,7 +804,6 @@ impl App {
             settings,
             rail_px: rail_target(settings) as f32,
             last_frame: None,
-            started: std::time::Instant::now(),
             page_animating: false,
             animating: false,
             modifiers: ModifiersState::default(),
@@ -847,6 +923,34 @@ impl App {
 
     fn tab_mut(&mut self) -> &mut Tab {
         &mut self.tabs[self.active]
+    }
+
+    /// Adopt whatever frame the active tab's renderer sent back after one
+    /// interaction — the single place every input handler goes through, so
+    /// hit-testing caches, the window's animation flag and the tab's own
+    /// state all stay in step the same way, however small the interaction.
+    ///
+    /// ponytail: `None` (the renderer died or the pipe broke) is silently
+    /// ignored — the tab keeps showing its last good frame rather than
+    /// anything worse. Noticing the death and respawning is its own step,
+    /// not this one.
+    fn adopt(&mut self, frame: Option<renderer::Frame>) -> bool {
+        let Some(frame) = frame else {
+            // A failed call is exactly how a renderer's death is first
+            // noticed (a timeout, or a closed pipe — see `TabRenderer`).
+            // `render_pane` is where recovery actually happens (it checks
+            // `is_dead` and respawns), but only when it runs — so ask for a
+            // redraw here too, or a tab that died on an interaction with no
+            // other reason to repaint would just sit on its last good frame
+            // until something unrelated happened to trigger one.
+            self.request_redraw();
+            return false;
+        };
+        self.page_animating = frame.animating;
+        let tab = self.tab_mut();
+        let (w, h) = (tab.cache_w, tab.cache_h);
+        tab.apply_frame(frame, w, h);
+        true
     }
 
     fn request_redraw(&self) {
@@ -1125,9 +1229,11 @@ impl App {
             self.apply_chrome_field();
             return true;
         }
-        if self.tab().doc.is_focused() && self.tab_mut().doc.insert_text(&typed) {
-            self.tab_mut().page_canvas = None; // field text changed
-            return true;
+        if self.tab().is_focused {
+            let frame = self.tab_mut().renderer.insert_text(&typed);
+            if self.adopt(frame) {
+                return true;
+            }
         }
         self.tab_mut().address.push_str(&typed);
         true
@@ -1158,11 +1264,15 @@ impl App {
             return;
         }
         // A focused page field owns plain typing; chords still reach the browser.
-        if !ctrl && self.tab().doc.is_focused() {
+        if !ctrl && self.tab().is_focused {
             let handled = match event.logical_key {
-                Key::Named(NamedKey::Backspace) => self.tab_mut().doc.backspace(),
+                Key::Named(NamedKey::Backspace) => {
+                    let frame = self.tab_mut().renderer.backspace();
+                    self.adopt(frame)
+                }
                 Key::Named(NamedKey::Escape) => {
-                    self.tab_mut().doc.blur();
+                    let frame = self.tab_mut().renderer.blur();
+                    self.adopt(frame);
                     true
                 }
                 Key::Named(NamedKey::Enter) => {
@@ -1175,7 +1285,6 @@ impl App {
                 },
             };
             if handled {
-                self.tab_mut().page_canvas = None; // field text changed
                 return;
             }
         }
@@ -1298,7 +1407,6 @@ impl App {
         }
 
         let Some((px, py)) = self.page_coords((cx, cy), &regions) else { return };
-        self.tab_mut().doc.blur(); // clicking the page clears focus unless a field is hit
         // Innermost element wins, so a handler on a child beats one on its parent.
         let hit = self
             .tab()
@@ -1307,20 +1415,19 @@ impl App {
             .filter(|r| px >= r.x && px <= r.x + r.width && py >= r.y && py <= r.y + r.height)
             .map(|r| r.node_id)
             .next_back();
-        if let Some(node_id) = hit {
-            let tab = self.tab_mut();
-            // Focus a text field so typing goes to the page instead of the address bar.
-            if tab.doc.focus(node_id) {
-                tab.page_canvas = None;
-                self.request_redraw();
-                return;
-            }
-            tab.doc.blur();
-            if tab.doc.click(node_id) {
-                tab.page_canvas = None; // handler may have changed the DOM
-                self.request_redraw();
-                return;
-            }
+        // Sent even when nothing was hit: `click` always blurs first —
+        // clicking the page clears focus unless the click lands on a field —
+        // which is why this always reaches the renderer rather than being
+        // skipped. `usize::MAX` never names a real node, so the renderer's
+        // own focus/click attempts on it are a harmless no-op and only the
+        // blur takes effect.
+        let frame = self.tab_mut().renderer.click(hit.unwrap_or(usize::MAX));
+        let handled = frame.as_ref().is_some_and(|f| f.click_handled);
+        if self.adopt(frame) {
+            self.request_redraw();
+        }
+        if handled {
+            return;
         }
 
         let href = self
@@ -1464,6 +1571,16 @@ impl App {
     /// Load a target into the active tab without touching history.
     fn load(&mut self, target: String) {
         let fetched = load_target(&target);
+        // Render at the size this tab is already showing, so the new page's
+        // first frame is the real one rather than `DEFAULT_VIEWPORT`
+        // (unknown only on a brand new tab, where `Tab::new` already used it).
+        let (w, h) = {
+            let tab = self.tab();
+            match (tab.cache_w, tab.cache_h) {
+                (0, _) | (_, 0) => DEFAULT_VIEWPORT,
+                (w, h) => (w as f32, h as f32),
+            }
+        };
         let tab = self.tab_mut();
         // An HTTPS upgrade can change the URL, so adopt whatever actually loaded.
         tab.address = fetched.url;
@@ -1471,20 +1588,22 @@ impl App {
         // A new page means a new document and a fresh JS runtime. The loader goes
         // in so page scripts can fetch relative to this URL.
         tab.loader = Rc::new(ShellLoader::new(tab.address.clone()));
-        // localStorage is partitioned by site, like cookies.
-        let store = Rc::new(crate::localstore::SiteStore::for_site(&storage_site(&tab.address)));
-        tab.doc = zero_engine::Document::load_hosted(
+        let (renderer, frame) = TabRenderer::spawn(
             &fetched.body,
             "",
-            Some(tab.loader.clone()),
-            Some(store),
-        );
+            w,
+            h,
+            tab.loader.clone(),
+            store_for(&tab.address),
+        )
+        .expect("spawn the tab's renderer process");
+        tab.renderer = renderer; // dropping the old one kills its process
         tab.source = fetched.body;
         tab.matches.clear();
         tab.scroll_y = 0.0;
-        tab.page_canvas = None; // force re-render of the new page
+        tab.apply_frame(frame, w as u32, h as u32);
         let address = tab.address.clone();
-        let title = tab.doc.title();
+        let title = tab.title.clone();
         // Built-in pages are the browser's own furniture, not places you visited.
         if !crate::internal::is_internal(&address) {
             // History has room for a full title, unlike a tab.
@@ -1504,7 +1623,7 @@ impl App {
     fn save_page(&mut self) {
         let (url, title, source) = {
             let tab = self.tab();
-            (tab.address.clone(), tab.doc.title(), tab.source.clone())
+            (tab.address.clone(), tab.title.clone(), tab.source.clone())
         };
         if source.is_empty() {
             return;
@@ -1529,14 +1648,12 @@ impl App {
 
     /// Build the page context and ask the assistant. Runs on-device by default.
     fn run_assistant(&mut self) {
-        let tab = self.tab();
-        let ctx = PageContext {
-            url: tab.address.clone(),
-            text: tab.doc.page_text(),
-            headings: tab.doc.headings(),
-            blocked_trackers: tab.blocked_count,
-            secure: tab.secure,
+        let (url, blocked_trackers, secure) = {
+            let tab = self.tab();
+            (tab.address.clone(), tab.blocked_count, tab.secure)
         };
+        let Some((text, headings)) = self.tab_mut().renderer.page_text() else { return };
+        let ctx = PageContext { url, text, headings, blocked_trackers, secure };
         let assistant = LocalAssistant;
         self.ai_text = format!("{}\n\n[{}]", assistant.respond(&ctx), assistant.provenance());
     }
@@ -1553,8 +1670,9 @@ impl App {
     /// Enter in a field submits its form, if it is in one; otherwise it just
     /// leaves the field, which is what a lone input does.
     fn submit_focused_form(&mut self) {
-        let sent = self.tab().doc.focused_node().and_then(|id| self.tab().doc.submit(id));
-        self.tab_mut().doc.blur();
+        let frame = self.tab_mut().renderer.submit();
+        let sent = frame.as_ref().and_then(|f| f.submission.clone());
+        self.adopt(frame);
         let Some(sent) = sent else { return };
         let target = submission_url(&self.tab().address, &sent);
         self.go_to(target);
@@ -1581,9 +1699,12 @@ impl App {
                 .map(|r| r.node_id)
                 .next_back()
         });
-        let tab = self.tab_mut();
-        if tab.doc.set_hover(hit) {
-            tab.page_canvas = None;
+        if hit == self.tab().hovered_node {
+            return; // nothing changed; not worth a round trip and a repaint
+        }
+        self.tab_mut().hovered_node = hit;
+        let frame = self.tab_mut().renderer.hover(hit);
+        if self.adopt(frame) {
             self.request_redraw();
         }
     }
@@ -1625,7 +1746,8 @@ impl App {
     fn open_find(&mut self) {
         self.focus = Focus::Find(String::new());
         self.menu_open = false;
-        self.tab_mut().doc.blur(); // typing belongs to the find bar now
+        let frame = self.tab_mut().renderer.blur(); // typing belongs to the find bar now
+        self.adopt(frame);
         self.request_redraw();
     }
 
@@ -1641,14 +1763,15 @@ impl App {
         }
         self.focus = Focus::TabSearch(String::new());
         self.menu_open = false;
-        self.tab_mut().doc.blur();
+        let frame = self.tab_mut().renderer.blur();
+        self.adopt(frame);
         self.request_redraw();
     }
 
     fn close_chrome_field(&mut self) {
         if matches!(self.focus, Focus::Find(_)) {
-            self.tab_mut().doc.set_find(None);
-            self.tab_mut().page_canvas = None; // drop the highlights
+            let frame = self.tab_mut().renderer.find(None); // drop the highlights
+            self.adopt(frame);
         }
         self.focus = Focus::Address;
     }
@@ -1657,9 +1780,8 @@ impl App {
     fn apply_chrome_field(&mut self) {
         if let Focus::Find(query) = &self.focus {
             let query = query.clone();
-            let tab = self.tab_mut();
-            tab.doc.set_find(Some(query));
-            tab.page_canvas = None; // highlights are painted, so re-render
+            let frame = self.tab_mut().renderer.find(Some(&query)); // highlights are painted, so re-render
+            self.adopt(frame);
         }
         // Tab search needs nothing: the rail is rebuilt from the query each frame.
     }
@@ -2200,36 +2322,40 @@ impl App {
     /// Lay out and paint one tab at the given size, reusing its cached canvas
     /// when nothing about the page or the space it has changed.
     fn render_pane(&mut self, index: usize, w: f32, h: f32) {
-        let now = self.started.elapsed().as_secs_f32() * 1000.0;
         let animating = self.page_animating;
-        let engine = &self.engine;
         let tab = &mut self.tabs[index];
         let settled = tab.page_canvas.is_some()
             && tab.cache_w == w as u32
             && tab.cache_h == h as u32
-            && !animating;
+            && !animating
+            // A renderer found dead by some other call (a click, typing, ...)
+            // must not stay "settled" on its last good frame forever — this
+            // is the one call site every unsettled tab passes through, so it
+            // has to be where a dead renderer gets noticed and retried.
+            && !tab.renderer.is_dead();
         if settled {
             return;
         }
-        tab.doc.set_time(now);
-        let loader = tab.loader.clone();
         let render_start = std::time::Instant::now();
-        let page = engine.render_document(&mut tab.doc, w, h, loader.as_ref());
+        // `resize` doubles as "give me an updated frame at this size" even
+        // when the size hasn't changed — the renderer's own clock (see
+        // `renderer::Session::created`) is what actually advances a
+        // transition between calls, not anything this message carries.
+        //
+        // A renderer a previous call already gave up on (`is_dead`) is
+        // reloaded from scratch here rather than asked again — this is the
+        // one call site every unsettled tab passes through on its own, no
+        // matter which interaction found the renderer dead, so it is the
+        // natural place to notice and recover rather than every call site
+        // trying to.
+        let frame = if tab.renderer.is_dead() { tab.respawn(w, h) } else { tab.renderer.resize(w, h) };
+        let Some(frame) = frame else { return };
         if timing_wanted() {
             eprintln!("page render {:?}", render_start.elapsed());
         }
-        tab.blocked_count = loader.blocked.get();
-        for line in &page.console {
-            eprintln!("[js] {line}");
-        }
-        let page_animating = page.animating;
-        tab.page_canvas = Some(page.canvas);
-        tab.links = page.links;
-        tab.matches = page.find_matches;
-        tab.uses_hover = page.uses_hover;
-        tab.element_rects = page.element_rects;
-        tab.cache_w = w as u32;
-        tab.cache_h = h as u32;
+        tab.blocked_count = tab.loader.blocked.get();
+        let page_animating = frame.animating;
+        tab.apply_frame(frame, w as u32, h as u32);
         self.page_animating = page_animating;
     }
 
