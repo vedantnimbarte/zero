@@ -552,7 +552,13 @@ impl Document {
 }
 
 /// Minimal user-agent stylesheet: gives real documents sane default display
-/// (block for structural tags, none for head/script/style) so they lay out.
+/// (block for structural tags, none for head/script/style), and the default
+/// look a handful of tags need to be legible with no page CSS at all —
+/// heading sizes, `<b>`/`<i>`, paragraph and list spacing, link colour.
+///
+/// ponytail: no `list-style` marker glyphs (bullets/numbers) — that needs
+/// generated-content infrastructure this engine doesn't have yet, so `<li>`
+/// renders as an unmarked block rather than a half-built one.
 const USER_AGENT_CSS: &str = "
     html, body, div, p, h1, h2, h3, h4, h5, h6, ul, ol, li, section, article,
     header, footer, nav, main, aside, figure, figcaption, blockquote, pre,
@@ -575,6 +581,22 @@ const USER_AGENT_CSS: &str = "
     marker, stop, lineargradient, radialgradient, clippath, mask, pattern,
     text, tspan, textpath, desc, filter, feoffset, fegaussianblur, femerge,
     femergenode, fecolormatrix, animate, animatetransform { display: none; }
+
+    h1 { font-size: 2em; font-weight: bold; margin: 0.67em 0; }
+    h2 { font-size: 1.5em; font-weight: bold; margin: 0.75em 0; }
+    h3 { font-size: 1.17em; font-weight: bold; margin: 0.83em 0; }
+    h4 { font-size: 1em; font-weight: bold; margin: 1.12em 0; }
+    h5 { font-size: 0.83em; font-weight: bold; margin: 1.5em 0; }
+    h6 { font-size: 0.75em; font-weight: bold; margin: 1.67em 0; }
+    b, strong { font-weight: bold; }
+    i, em, cite, var, dfn { font-style: italic; }
+    small { font-size: 0.83em; }
+    p, dl, figure { margin: 1em 0; }
+    ul, ol { margin: 1em 0; padding-left: 40px; }
+    dd { margin-left: 40px; }
+    blockquote { margin: 1em 40px; }
+    hr { height: 1px; background: #cccccc; margin: 0.5em 0; }
+    a { color: #0000ee; text-decoration: underline; }
 ";
 
 /// One loaded font: the rasterizer plus the raw bytes a shaping face is built from.
@@ -1056,7 +1078,7 @@ fn ancestor_chain(root: &Node, node_id: usize) -> style::HoverChain {
 
 /// Where a submitted form wants to go. The action is whatever the markup said,
 /// so the embedder still has to resolve it against the page URL.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Submission {
     pub action: String,
     pub query: String,
@@ -1201,6 +1223,122 @@ mod tests {
         let canvas = engine.render("<div></div>", "div { background: #112233; }", 40.0, 30.0);
         assert_eq!((canvas.width, canvas.height), (40, 30));
         assert_eq!(canvas.pixels.len(), 40 * 30);
+    }
+
+    #[test]
+    fn box_sizing_border_box_keeps_the_declared_width_including_padding_and_border() {
+        let engine = super::Engine::shapes_only();
+        let at = |c: &super::Canvas, x: usize, y: usize| c.pixels[y * c.width + x];
+        let rgb = |c: crate::css::Color| (c.r, c.g, c.b);
+        const WHITE: (u8, u8, u8) = (255, 255, 255);
+
+        // Content-box (the default): 40px content + 20px padding + 4px border
+        // paints 64px wide, so x=50 is already back to the page background.
+        // Wrapped in <body> so #a's own background doesn't flood the canvas
+        // the way a root element's background legitimately does.
+        let content_box = engine.render(
+            "<body><div id=a></div></body>",
+            "#a { width: 40px; height: 10px; padding: 10px; border: 2px solid #ff0000; \
+                  background: #0000ff; }",
+            80.0,
+            20.0,
+        );
+        assert_eq!(rgb(at(&content_box, 50, 5)), (0, 0, 255));
+
+        // border-box: the declared 40px *is* the painted width, edges and all,
+        // so x=50 has fallen off the box and back onto the page background.
+        let border_box = engine.render(
+            "<body><div id=a></div></body>",
+            "#a { box-sizing: border-box; width: 40px; height: 10px; padding: 10px; \
+                  border: 2px solid #ff0000; background: #0000ff; }",
+            80.0,
+            20.0,
+        );
+        assert_eq!(rgb(at(&border_box, 50, 5)), WHITE);
+        assert_eq!(rgb(at(&border_box, 20, 5)), (0, 0, 255)); // still paints inside it
+    }
+
+    #[test]
+    fn max_width_shrinks_the_box_and_auto_margins_still_centre_it() {
+        let engine = super::Engine::shapes_only();
+        let canvas = engine.render(
+            "<body><div id=a></div></body>",
+            "#a { max-width: 200px; height: 10px; margin: 0 auto; background: #ff0000; }",
+            600.0,
+            20.0,
+        );
+        let rgb = |c: crate::css::Color| (c.r, c.g, c.b);
+        let at = |x: usize, y: usize| canvas.pixels[y * canvas.width + x];
+        const WHITE: (u8, u8, u8) = (255, 255, 255);
+        // Centred in a 600px page: red from x=200 to x=400, white outside it.
+        assert_eq!(rgb(at(199, 5)), WHITE);
+        assert_eq!(rgb(at(300, 5)), (255, 0, 0));
+        assert_eq!(rgb(at(400, 5)), WHITE);
+    }
+
+    #[test]
+    fn min_and_max_height_clamp_a_box_that_would_otherwise_fit_its_content() {
+        let engine = super::Engine::shapes_only();
+        let rgb = |c: crate::css::Color| (c.r, c.g, c.b);
+        const WHITE: (u8, u8, u8) = (255, 255, 255);
+
+        // No content at all: min-height still paints the box.
+        let tall = engine.render(
+            "<body><div id=a></div></body>",
+            "#a { min-height: 30px; width: 10px; background: #ff0000; }",
+            10.0,
+            40.0,
+        );
+        let at_tall = |x: usize, y: usize| tall.pixels[y * tall.width + x];
+        assert_eq!(rgb(at_tall(5, 25)), (255, 0, 0));
+
+        // A tall child would push this box past 20px; max-height cuts it off.
+        let short = engine.render(
+            "<body><div id=a><div id=b></div></div></body>",
+            "#a { max-height: 20px; width: 10px; overflow: hidden; background: #ff0000; } \
+             #b { height: 100px; }",
+            10.0,
+            40.0,
+        );
+        let at_short = |x: usize, y: usize| short.pixels[y * short.width + x];
+        assert_eq!(rgb(at_short(5, 10)), (255, 0, 0));
+        assert_eq!(rgb(at_short(5, 25)), WHITE);
+    }
+
+    #[test]
+    fn border_style_none_suppresses_a_border_a_less_specific_rule_set() {
+        let engine = super::Engine::shapes_only();
+        let canvas = engine.render(
+            "<div id=a></div>",
+            "#a { width: 20px; height: 20px; border: 4px solid #ff0000; border-style: none; }",
+            20.0,
+            20.0,
+        );
+        let rgb = |c: crate::css::Color| (c.r, c.g, c.b);
+        // The border strip would be the outer 4px; with it suppressed the
+        // whole box is background, not red.
+        assert_eq!(rgb(canvas.pixels[0]), (255, 255, 255));
+    }
+
+    #[test]
+    fn outline_paints_outside_the_border_box_without_changing_its_size() {
+        let engine = super::Engine::shapes_only();
+        let canvas = engine.render(
+            "<body><div id=a></div></body>",
+            "#a { width: 10px; height: 10px; background: #0000ff; \
+                  outline: 2px solid #ff0000; }",
+            20.0,
+            20.0,
+        );
+        let rgb = |c: crate::css::Color| (c.r, c.g, c.b);
+        let at = |x: usize, y: usize| canvas.pixels[y * canvas.width + x];
+
+        // The box itself, unchanged: 10x10 of blue starting at the origin.
+        assert_eq!(rgb(at(5, 5)), (0, 0, 255));
+        // The outline ring sits *outside* that box, not inside it.
+        assert_eq!(rgb(at(11, 5)), (255, 0, 0));
+        // And it does not push the box's own content anywhere: still blue at 9.
+        assert_eq!(rgb(at(9, 5)), (0, 0, 255));
     }
 
     #[test]

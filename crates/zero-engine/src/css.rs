@@ -522,6 +522,110 @@ fn classify_value(s: &str) -> Option<Value> {
     None
 }
 
+/// The `<width> <style> <color>` grammar `border` and `outline` share, picked
+/// out of `tokens` by which [`Value`] variant each one classifies as rather
+/// than by position — CSS allows any order.
+fn border_like_longhands(
+    tokens: &[&str],
+    width_name: &str,
+    color_name: &str,
+    style_name: &str,
+) -> Option<Vec<Declaration>> {
+    let mut width = None;
+    let mut color = None;
+    let mut style = None;
+    for token in tokens {
+        match classify_value(token) {
+            Some(v @ (Value::Length(..) | Value::Number(_))) if width.is_none() => width = Some(v),
+            Some(v @ Value::ColorValue(_)) if color.is_none() => color = Some(v),
+            Some(v @ Value::Keyword(_)) if style.is_none() => style = Some(v),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    if let Some(v) = width {
+        out.push(Declaration { name: width_name.to_string(), value: v });
+    }
+    if let Some(v) = color {
+        out.push(Declaration { name: color_name.to_string(), value: v });
+    }
+    if let Some(v) = style {
+        out.push(Declaration { name: style_name.to_string(), value: v });
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// Split a multi-token shorthand into the longhands the rest of the engine
+/// already reads. Only reached once [`classify_value`] has failed on the whole
+/// string, so the common single-token case (`padding: 10px`, `flex: 1`) is
+/// untouched and keeps working exactly as it did.
+///
+/// ponytail: `font` is not expanded — nothing reads `font-family`/`font-weight`
+/// yet, so there is no consumer to feed. Add it alongside that support instead
+/// of guessing its shape now.
+fn expand_shorthand(name: &str, raw: &str) -> Option<Vec<Declaration>> {
+    let tokens: Vec<&str> = raw.split_whitespace().collect();
+    if tokens.len() < 2 {
+        return None;
+    }
+    match name {
+        "padding" | "margin" => {
+            let values: Vec<Value> =
+                tokens.iter().map(|t| classify_value(t)).collect::<Option<_>>()?;
+            let (top, right, bottom, left) = match values.as_slice() {
+                [all] => (all.clone(), all.clone(), all.clone(), all.clone()),
+                [v, h] => (v.clone(), h.clone(), v.clone(), h.clone()),
+                [t, h, b] => (t.clone(), h.clone(), b.clone(), h.clone()),
+                [t, r, b, l] => (t.clone(), r.clone(), b.clone(), l.clone()),
+                _ => return None,
+            };
+            Some(vec![
+                Declaration { name: format!("{name}-top"), value: top },
+                Declaration { name: format!("{name}-right"), value: right },
+                Declaration { name: format!("{name}-bottom"), value: bottom },
+                Declaration { name: format!("{name}-left"), value: left },
+            ])
+        }
+        // Uniform on every side, which is the overwhelming common case
+        // (`border: 1px solid #ccc`) — the per-side longhands already fall
+        // back to `border-width`, so setting it once covers all four.
+        "border" => border_like_longhands(&tokens, "border-width", "border-color", "border-style"),
+        // `outline` has the same three-part grammar as `border` and no sides
+        // to distribute over (it is drawn outside the box, not part of it).
+        "outline" => {
+            border_like_longhands(&tokens, "outline-width", "outline-color", "outline-style")
+        }
+        "flex" => {
+            let values: Vec<Value> =
+                tokens.iter().map(|t| classify_value(t)).collect::<Option<_>>()?;
+            let names = ["flex-grow", "flex-shrink", "flex-basis"];
+            Some(
+                values
+                    .into_iter()
+                    .zip(names)
+                    .map(|(value, name)| Declaration { name: name.to_string(), value })
+                    .collect(),
+            )
+        }
+        "background" => {
+            let mut out = Vec::new();
+            for token in &tokens {
+                if token.starts_with("url(") || token.starts_with("linear-gradient(") {
+                    out.push(Declaration {
+                        name: "background-image".to_string(),
+                        value: Value::Raw(token.to_string()),
+                    });
+                } else if let Some(v @ Value::ColorValue(_)) = classify_value(token) {
+                    out.push(Declaration { name: "background-color".to_string(), value: v });
+                }
+                // position/size/repeat keywords: no reader yet (Track A6), dropped.
+            }
+            (!out.is_empty()).then_some(out)
+        }
+        _ => None,
+    }
+}
+
 /// Parse a bare hex colour body (no leading `#`).
 pub fn parse_color_token(hex: &str) -> Option<Value> {
     parse_hex_color(hex)
@@ -921,16 +1025,15 @@ impl Parser {
                 // A custom property is whatever text it was given, and a value
                 // that mentions one cannot be understood until styling resolves
                 // it against the element's inherited variables.
-                let value = if name.starts_with("--")
+                if name.starts_with("--")
                     || raw.contains("var(")
                     || RAW_VALUE_PROPERTIES.contains(&name.as_str())
                 {
-                    Some(Value::Raw(raw.to_string()))
-                } else {
-                    classify_value(raw)
-                };
-                if let Some(value) = value {
+                    declarations.push(Declaration { name, value: Value::Raw(raw.to_string()) });
+                } else if let Some(value) = classify_value(raw) {
                     declarations.push(Declaration { name, value });
+                } else if let Some(expanded) = expand_shorthand(&name, raw) {
+                    declarations.extend(expanded);
                 }
             }
         }
@@ -1112,6 +1215,73 @@ mod tests {
         assert_eq!(d[2].value, Value::Length(2.0, Unit::Rem));
         assert_eq!(d[3].value, Value::Number(2.0));
         assert_eq!(d[4].value, Value::Number(1.4));
+    }
+
+    #[test]
+    fn multi_value_shorthands_expand_into_the_longhands_layout_reads() {
+        let find = |d: &[Declaration], name: &str| {
+            d.iter().find(|decl| decl.name == name).map(|decl| decl.value.clone())
+        };
+
+        let s = parse(".a { padding: 10px 20px; }".to_string());
+        let d = &s.rules[0].declarations;
+        assert_eq!(find(d, "padding-top"), Some(Value::Length(10.0, Unit::Px)));
+        assert_eq!(find(d, "padding-right"), Some(Value::Length(20.0, Unit::Px)));
+        assert_eq!(find(d, "padding-bottom"), Some(Value::Length(10.0, Unit::Px)));
+        assert_eq!(find(d, "padding-left"), Some(Value::Length(20.0, Unit::Px)));
+
+        let s = parse(".a { margin: 0 auto; }".to_string());
+        let d = &s.rules[0].declarations;
+        assert_eq!(find(d, "margin-top"), Some(Value::Number(0.0)));
+        assert_eq!(find(d, "margin-right"), Some(Value::Keyword("auto".to_string())));
+        assert_eq!(find(d, "margin-left"), Some(Value::Keyword("auto".to_string())));
+
+        let s = parse(".a { margin: 1px 2px 3px 4px; }".to_string());
+        let d = &s.rules[0].declarations;
+        assert_eq!(find(d, "margin-top"), Some(Value::Length(1.0, Unit::Px)));
+        assert_eq!(find(d, "margin-right"), Some(Value::Length(2.0, Unit::Px)));
+        assert_eq!(find(d, "margin-bottom"), Some(Value::Length(3.0, Unit::Px)));
+        assert_eq!(find(d, "margin-left"), Some(Value::Length(4.0, Unit::Px)));
+
+        let s = parse(".a { border: 1px solid #cccccc; }".to_string());
+        let d = &s.rules[0].declarations;
+        assert_eq!(find(d, "border-width"), Some(Value::Length(1.0, Unit::Px)));
+        assert_eq!(find(d, "border-style"), Some(Value::Keyword("solid".to_string())));
+        assert_eq!(
+            find(d, "border-color"),
+            Some(Value::ColorValue(Color { r: 0xcc, g: 0xcc, b: 0xcc, a: 255 }))
+        );
+
+        let s = parse(".a { flex: 1 1 0; }".to_string());
+        let d = &s.rules[0].declarations;
+        assert_eq!(find(d, "flex-grow"), Some(Value::Number(1.0)));
+        assert_eq!(find(d, "flex-shrink"), Some(Value::Number(1.0)));
+        assert_eq!(find(d, "flex-basis"), Some(Value::Number(0.0)));
+
+        let s = parse(".a { background: #ffffff url(bg.png) no-repeat; }".to_string());
+        let d = &s.rules[0].declarations;
+        assert_eq!(
+            find(d, "background-color"),
+            Some(Value::ColorValue(Color { r: 0xff, g: 0xff, b: 0xff, a: 255 }))
+        );
+        assert_eq!(find(d, "background-image"), Some(Value::Raw("url(bg.png)".to_string())));
+
+        let s = parse(".a { outline: 3px dashed #00ff00; }".to_string());
+        let d = &s.rules[0].declarations;
+        assert_eq!(find(d, "outline-width"), Some(Value::Length(3.0, Unit::Px)));
+        assert_eq!(find(d, "outline-style"), Some(Value::Keyword("dashed".to_string())));
+        assert_eq!(
+            find(d, "outline-color"),
+            Some(Value::ColorValue(Color { r: 0x00, g: 0xff, b: 0x00, a: 255 }))
+        );
+
+        // A single-token shorthand is untouched by expansion.
+        let s = parse(".a { padding: 10px; }".to_string());
+        assert_eq!(s.rules[0].declarations[0].value, Value::Length(10.0, Unit::Px));
+
+        // An unknown multi-token property still drops, as before.
+        let s = parse(".a { unknown-thing: 1px 2px; }".to_string());
+        assert!(s.rules[0].declarations.is_empty());
     }
 
     #[test]

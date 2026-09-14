@@ -42,6 +42,19 @@ impl<'a> StyledNode<'a> {
         }
     }
 
+    /// The element's line height in px: a bare number and a percentage are both
+    /// relative to its own font size, a length resolves as usual, and the
+    /// absence of the property falls back to the engine's long-standing
+    /// `size * 1.25`.
+    pub fn line_height(&self) -> f32 {
+        let font_size = self.font_size();
+        match self.specified_values.get("line-height") {
+            Some(Value::Number(n)) => n * font_size,
+            Some(v @ Value::Length(..)) => v.resolve(self.length_context(font_size)),
+            _ => font_size * 1.25, // absent, or a keyword (`normal`) we don't special-case
+        }
+    }
+
     /// Length context for this element: percentages against `percent_base`,
     /// `em` against this element's own font size.
     pub fn length_context(&self, percent_base: f32) -> LengthContext {
@@ -525,8 +538,24 @@ fn resolve_vars(values: &mut PropertyMap, vars: &PropertyMap) {
 
 /// Properties that flow from parent to child when the child doesn't set them.
 /// Text nodes have no rules of their own, so this is how they get color/size.
-const INHERITED_PROPERTIES: [&str; 5] =
-    ["color", "font-size", "text-align", "white-space", "visibility"];
+///
+/// `line-height` is inherited per spec. `text-decoration` technically is not —
+/// real browsers instead paint an ancestor's line across descendants that
+/// never declared it — but a text node here reads its own value with no such
+/// propagation mechanism, so treating it as inherited is what makes
+/// `p { text-decoration: underline }` reach the text at all.
+const INHERITED_PROPERTIES: [&str; 10] = [
+    "color",
+    "font-size",
+    "text-align",
+    "white-space",
+    "visibility",
+    "line-height",
+    "text-decoration",
+    "letter-spacing",
+    "font-weight",
+    "font-style",
+];
 
 pub fn style_tree<'a>(root: &'a Node, stylesheet: &'a Stylesheet) -> StyledNode<'a> {
     style_tree_with_hover(root, stylesheet, &HoverChain::new())
@@ -723,6 +752,22 @@ mod tests {
         for child in &mut node.children {
             number_elements(child, next);
         }
+    }
+
+    #[test]
+    fn line_height_reads_a_number_a_length_or_falls_back_to_the_font_ratio() {
+        let html = "<body><p id=a>x</p><p id=b>x</p><p id=c>x</p></body>";
+        let css = "#a { line-height: 2; font-size: 20px; } \
+                   #b { line-height: 30px; } \
+                   #c { font-size: 40px; }"; // no line-height at all
+        let dom = crate::html::parse(html.to_string());
+        let sheet = crate::css::parse(css.to_string());
+        let styled = style_tree(&dom, &sheet);
+        let by_id = elements(&styled);
+
+        assert_eq!(by_id[0].line_height(), 40.0); // 2 * its own 20px font-size
+        assert_eq!(by_id[1].line_height(), 30.0); // an absolute length, untouched
+        assert_eq!(by_id[2].line_height(), 50.0); // absent: the 1.25 fallback
     }
 
     #[test]

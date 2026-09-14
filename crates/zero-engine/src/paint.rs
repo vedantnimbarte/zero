@@ -246,6 +246,13 @@ impl Canvas {
             .map_or(frag.size, |m| m.ascent);
         let baseline = frag.y + ascent;
 
+        // No bold/italic font file is loaded (Track D4), so a heavier weight
+        // and a slant are synthesized here instead of picked from a face:
+        // bold redraws each row a pixel wider, italic shears columns toward
+        // the top by `row`'s distance from the baseline.
+        let stroke = if frag.bold { (frag.size / 24.0).max(1.0).round() as i32 } else { 0 };
+        let shear = if frag.italic { 0.22 } else { 0.0 };
+
         for glyph in &frag.glyphs {
             let (m, coverage) = font.rasterize_indexed(glyph.id, frag.size);
             // fontdue gives per-pixel coverage (0..=255); place relative to the baseline.
@@ -253,20 +260,37 @@ impl Canvas {
             let gy = (baseline - glyph.y - m.ymin as f32 - m.height as f32).round() as i32;
 
             for row in 0..m.height {
+                let row_shear = (shear * (m.height - row) as f32).round() as i32;
+                let py = gy + row as i32;
+                if py < 0 || py >= self.height as i32 {
+                    continue;
+                }
                 for col in 0..m.width {
                     let a = coverage[row * m.width + col];
                     if a == 0 {
                         continue;
                     }
-                    let px = gx + col as i32;
-                    let py = gy + row as i32;
-                    if px < 0 || py < 0 || px >= self.width as i32 || py >= self.height as i32 {
-                        continue;
+                    for dx in 0..=stroke {
+                        let px = gx + col as i32 + row_shear + dx;
+                        if px < 0 || px >= self.width as i32 {
+                            continue;
+                        }
+                        let idx = py as usize * self.width + px as usize;
+                        self.pixels[idx] = blend(self.pixels[idx], frag.color, a);
                     }
-                    let idx = py as usize * self.width + px as usize;
-                    self.pixels[idx] = blend(self.pixels[idx], frag.color, a);
                 }
             }
+        }
+
+        // A stroke's own thickness, not part of any glyph's rasterized coverage.
+        let stroke = (frag.size / 16.0).max(1.0);
+        if frag.underline {
+            let y = baseline + stroke;
+            self.paint_solid(frag.color, Rect { x: frag.x, y, width: frag.width, height: stroke });
+        }
+        if frag.strikethrough {
+            let y = baseline - frag.size * 0.3;
+            self.paint_solid(frag.color, Rect { x: frag.x, y, width: frag.width, height: stroke });
         }
     }
 
@@ -723,6 +747,7 @@ fn transform(item: DisplayCommand, xf: Xf) -> DisplayCommand {
             y: frag.y * xf.scale + xf.dy,
             width: frag.width * xf.scale,
             size: frag.size * xf.scale,
+            line_height: frag.line_height * xf.scale,
             glyphs: frag
                 .glyphs
                 .into_iter()
@@ -793,6 +818,7 @@ fn render_own(list: &mut DisplayList, layout_box: &LayoutBox) {
     render_shadow(list, layout_box);
     render_background(list, layout_box);
     render_borders(list, layout_box);
+    render_outline(list, layout_box);
     if let Some(src) = image_src(layout_box) {
         list.push(DisplayCommand::Image(src, layout_box.dimensions.content));
     }
@@ -999,6 +1025,18 @@ fn border_radius(layout_box: &LayoutBox, box_rect: Rect) -> f32 {
 }
 
 fn render_borders(list: &mut DisplayList, layout_box: &LayoutBox) {
+    // `border: none` (or `border-style: none`/`hidden`) suppresses the border
+    // outright, whatever width or colour another rule gave it — the common
+    // case being one rule setting a border and a more specific one turning it
+    // off. Every other style (solid, dashed, ...) paints as a solid strip:
+    // the engine doesn't model dash patterns, and solid is the closer
+    // approximation than not drawing anything.
+    if let BoxType::BlockNode(style) | BoxType::InlineNode(style) = layout_box.box_type {
+        if matches!(style.value("border-style"), Some(Value::Keyword(k)) if k == "none" || k == "hidden")
+        {
+            return;
+        }
+    }
     let color = match get_color(layout_box, "border-color") {
         Some(color) => color,
         None => return,
@@ -1043,6 +1081,54 @@ fn render_borders(list: &mut DisplayList, layout_box: &LayoutBox) {
             height: d.border.bottom,
         },
     ));
+}
+
+/// Unlike a border, an outline takes no layout space — it is drawn one ring
+/// further out, around the border box rather than inside it.
+///
+/// ponytail: `outline-offset` is not modelled (always 0), and `outline-style:
+/// auto` (the focus-ring default) paints as a solid ring rather than the
+/// platform's own focus indicator.
+fn render_outline(list: &mut DisplayList, layout_box: &LayoutBox) {
+    let (BoxType::BlockNode(style) | BoxType::InlineNode(style)) = layout_box.box_type else {
+        return;
+    };
+    match style.value("outline-style") {
+        None => return,
+        Some(Value::Keyword(k)) if k == "none" => return,
+        _ => {}
+    }
+    let width = match style.value("outline-width") {
+        Some(v @ (Value::Length(..) | Value::Number(_))) => v.resolve(style.length_context(0.0)),
+        _ => return,
+    };
+    if width <= 0.0 {
+        return;
+    }
+    let color = match style.value("outline-color") {
+        Some(Value::ColorValue(c)) => c,
+        // No colour named: outline still has to be visible, so fall back to
+        // the element's own text colour, the way a real focus ring would.
+        _ => match get_color(layout_box, "color") {
+            Some(c) => c,
+            None => return,
+        },
+    };
+    let b = layout_box.dimensions.border_box();
+    let outer = Rect {
+        x: b.x - width,
+        y: b.y - width,
+        width: b.width + width * 2.0,
+        height: b.height + width * 2.0,
+    };
+    for strip in [
+        Rect { x: outer.x, y: outer.y, width: outer.width, height: width },
+        Rect { x: outer.x, y: outer.y + outer.height - width, width: outer.width, height: width },
+        Rect { x: outer.x, y: outer.y, width, height: outer.height },
+        Rect { x: outer.x + outer.width - width, y: outer.y, width, height: outer.height },
+    ] {
+        list.push(DisplayCommand::SolidColor(color, strip));
+    }
 }
 
 /// The colour that propagates to the canvas: the root element's own background,

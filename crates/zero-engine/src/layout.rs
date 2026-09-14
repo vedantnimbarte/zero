@@ -29,7 +29,16 @@ pub struct TextFragment {
     /// Top of the line box (baseline is derived at paint time from font ascent).
     pub y: f32,
     pub size: f32,
+    /// This run's `line-height`, in px — what the line box was sized against,
+    /// not a fixed multiple of `size`.
+    pub line_height: f32,
     pub color: Color,
+    pub underline: bool,
+    pub strikethrough: bool,
+    /// Synthesized at paint time — no bold/italic font file is loaded, so a
+    /// heavier stroke and a sheared blit stand in for a real second face.
+    pub bold: bool,
+    pub italic: bool,
     /// Which font in the [`FontSet`] shaped this run (fallback picks per word).
     pub font_index: usize,
 }
@@ -888,7 +897,7 @@ impl<'a> LayoutBox<'a> {
                 InlinePiece::Text(piece) => piece,
             };
 
-            let word_height = piece.size * 1.25;
+            let word_height = piece.line_height;
             let (_, space_w) = shape_run(&fonts.entries[0], " ", piece.size);
 
             // `white-space: pre` keeps the text exactly as written: newlines end
@@ -918,7 +927,9 @@ impl<'a> LayoutBox<'a> {
                         continue; // a blank line still occupies its height
                     }
                     let font_index = fonts.pick(line);
-                    let (glyphs, width) = shape_run(&fonts.entries[font_index], line, piece.size);
+                    let (mut glyphs, width) =
+                        shape_run(&fonts.entries[font_index], line, piece.size);
+                    let width = width + spread_glyphs(&mut glyphs, piece.letter_spacing);
                     fragments.push(TextFragment {
                         glyphs,
                         text: line.to_string(),
@@ -926,7 +937,12 @@ impl<'a> LayoutBox<'a> {
                         x: cursor_x,
                         y: cursor_y,
                         size: piece.size,
+                        line_height: piece.line_height,
                         color: piece.color,
+                        underline: piece.underline,
+                        strikethrough: piece.strikethrough,
+                        bold: piece.bold,
+                        italic: piece.italic,
                         font_index,
                     });
                     if let Some(href) = &piece.href {
@@ -951,7 +967,9 @@ impl<'a> LayoutBox<'a> {
                 // Pick a font that can draw this word, then shape it: this is where
                 // Indic reordering/conjuncts happen.
                 let font_index = fonts.pick(word);
-                let (glyphs, word_w) = shape_run(&fonts.entries[font_index], word, piece.size);
+                let (mut glyphs, word_w) =
+                    shape_run(&fonts.entries[font_index], word, piece.size);
+                let word_w = word_w + spread_glyphs(&mut glyphs, piece.letter_spacing);
                 let mut lead = if pending_space && cursor_x > start_x {
                     space_w
                 } else {
@@ -985,7 +1003,12 @@ impl<'a> LayoutBox<'a> {
                     x: cursor_x,
                     y: cursor_y,
                     size: piece.size,
+                    line_height: piece.line_height,
                     color: piece.color,
+                    underline: piece.underline,
+                    strikethrough: piece.strikethrough,
+                    bold: piece.bold,
+                    italic: piece.italic,
                     font_index,
                 });
                 if let Some(href) = &piece.href {
@@ -1091,6 +1114,29 @@ impl<'a> LayoutBox<'a> {
         let border_right = style.lookup("border-right-width", "border-width", &zero);
         let padding_left = style.lookup("padding-left", "padding", &zero);
         let padding_right = style.lookup("padding-right", "padding", &zero);
+        // `margin: 0 auto` is the case worth getting right: both sides start
+        // auto, and a later min/max clamp below has to split the same slack
+        // between them the way this function already does for an unclamped box.
+        let (left_was_auto, right_was_auto) = (margin_left == auto, margin_right == auto);
+
+        let border_box = matches!(
+            style.value("box-sizing"),
+            Some(Value::Keyword(ref k)) if k == "border-box"
+        );
+        let edges: f32 =
+            [&border_left, &border_right, &padding_left, &padding_right]
+                .iter()
+                .map(|v| v.resolve(ctx))
+                .sum();
+        // `width`/`min-width`/`max-width` name the border box under border-box
+        // sizing; subtract the edges once here so the rest of this function —
+        // written for content-box — never has to know the difference.
+        let to_content = |px: f32| if border_box { (px - edges).max(0.0) } else { px };
+        if let Value::Length(..) = width {
+            width = Value::Length(to_content(width.resolve(ctx)), Unit::Px);
+        }
+        let min_width = style.value("min-width").map(|v| to_content(v.resolve(ctx)));
+        let max_width = style.value("max-width").map(|v| to_content(v.resolve(ctx)));
 
         let total: f32 = [
             &margin_left,
@@ -1155,6 +1201,29 @@ impl<'a> LayoutBox<'a> {
         d.border.right = border_right.resolve(ctx);
         d.margin.left = margin_left.resolve(ctx);
         d.margin.right = margin_right.resolve(ctx);
+
+        if let Some(min) = min_width {
+            d.content.width = d.content.width.max(min);
+        }
+        if let Some(max) = max_width {
+            if d.content.width > max {
+                // Shrinking below what the earlier pass computed leaves slack
+                // that has to land somewhere — split between auto margins
+                // (`margin: 0 auto`, a centred container) exactly as an
+                // unclamped auto-width box would have, else give it to
+                // whichever margin was already carrying the auto slack.
+                let slack = d.content.width - max;
+                d.content.width = max;
+                match (left_was_auto, right_was_auto) {
+                    (true, true) => {
+                        d.margin.left += slack / 2.0;
+                        d.margin.right += slack / 2.0;
+                    }
+                    (true, false) => d.margin.left += slack,
+                    _ => d.margin.right += slack,
+                }
+            }
+        }
     }
 
     fn calculate_block_position(&mut self, containing_block: Dimensions) {
@@ -1425,10 +1494,32 @@ impl<'a> LayoutBox<'a> {
         // An explicit height overrides the content-derived height.
         let style = self.get_style_node();
         let ctx = style.length_context(containing_block.content.height);
+        let border_box = matches!(
+            style.value("box-sizing"),
+            Some(Value::Keyword(ref k)) if k == "border-box"
+        );
+        let zero = Value::Length(0.0, Unit::Px);
+        let edges: f32 = [
+            style.lookup("border-top-width", "border-width", &zero),
+            style.lookup("border-bottom-width", "border-width", &zero),
+            style.lookup("padding-top", "padding", &zero),
+            style.lookup("padding-bottom", "padding", &zero),
+        ]
+        .iter()
+        .map(|v| v.resolve(ctx))
+        .sum();
+        let to_content = |px: f32| if border_box { (px - edges).max(0.0) } else { px };
+
         if let Some(value) = style.value("height") {
             if matches!(value, Value::Length(..)) {
-                self.dimensions.content.height = value.resolve(ctx);
+                self.dimensions.content.height = to_content(value.resolve(ctx));
             }
+        }
+        if let Some(min) = style.value("min-height").map(|v| to_content(v.resolve(ctx))) {
+            self.dimensions.content.height = self.dimensions.content.height.max(min);
+        }
+        if let Some(max) = style.value("max-height").map(|v| to_content(v.resolve(ctx))) {
+            self.dimensions.content.height = self.dimensions.content.height.min(max);
         }
     }
 
@@ -1466,8 +1557,26 @@ pub fn layout_tree<'a>(
 struct TextPiece {
     text: String,
     size: f32,
+    line_height: f32,
+    letter_spacing: f32,
     color: Color,
+    underline: bool,
+    strikethrough: bool,
+    bold: bool,
+    italic: bool,
     href: Option<String>,
+}
+
+/// Push `spacing` px of extra room after each glyph — shaping only knows a
+/// font's own advances, and `letter-spacing` is not one of them.
+fn spread_glyphs(glyphs: &mut [PositionedGlyph], spacing: f32) -> f32 {
+    if spacing == 0.0 {
+        return 0.0;
+    }
+    for (i, g) in glyphs.iter_mut().enumerate() {
+        g.x += spacing * i as f32;
+    }
+    spacing * glyphs.len() as f32
 }
 
 /// Style an inline element paints with, captured when layout enters it.
@@ -1558,10 +1667,29 @@ fn collect_inline_text(
                     a: 255,
                 },
             };
+            let decoration = match styled.value("text-decoration") {
+                Some(Value::Keyword(k)) => k,
+                _ => String::new(),
+            };
+            let bold = match styled.value("font-weight") {
+                Some(Value::Keyword(k)) => k == "bold" || k == "bolder",
+                Some(Value::Number(n)) => n >= 600.0,
+                _ => false,
+            };
+            let italic = matches!(
+                styled.value("font-style"),
+                Some(Value::Keyword(k)) if k == "italic" || k == "oblique"
+            );
             out.push(InlinePiece::Text(TextPiece {
                 text: t.clone(),
                 size,
+                line_height: styled.line_height(),
+                letter_spacing: styled.px("letter-spacing", 0.0).unwrap_or(0.0),
                 color,
+                underline: decoration == "underline",
+                strikethrough: decoration == "line-through",
+                bold,
+                italic,
                 href: current_href.clone(),
             }));
         }
@@ -2020,7 +2148,7 @@ pub fn content_bottom(bx: &LayoutBox) -> f32 {
     let own = bx.dimensions.margin_box();
     let mut bottom = own.y + own.height;
     for frag in &bx.text_fragments {
-        bottom = bottom.max(frag.y + frag.size * 1.25);
+        bottom = bottom.max(frag.y + frag.line_height);
     }
     for child in &bx.children {
         bottom = bottom.max(content_bottom(child));
@@ -2158,6 +2286,25 @@ mod tests {
     use crate::css::{Unit, Value};
     use crate::dom;
     use std::collections::HashMap;
+
+    #[test]
+    fn letter_spacing_pushes_each_glyph_past_the_last_and_widens_the_run() {
+        let mut glyphs = vec![
+            PositionedGlyph { id: 1, x: 0.0, y: 0.0 },
+            PositionedGlyph { id: 2, x: 10.0, y: 0.0 },
+            PositionedGlyph { id: 3, x: 18.0, y: 0.0 },
+        ];
+        let extra = spread_glyphs(&mut glyphs, 5.0);
+        assert_eq!(extra, 15.0); // 5px after each of the 3 glyphs
+        assert_eq!(glyphs[0].x, 0.0); // the first glyph never moves
+        assert_eq!(glyphs[1].x, 15.0); // 10 + 1*5
+        assert_eq!(glyphs[2].x, 28.0); // 18 + 2*5
+
+        // No spacing: nothing moves, nothing is added.
+        let mut untouched = vec![PositionedGlyph { id: 1, x: 3.0, y: 0.0 }];
+        assert_eq!(spread_glyphs(&mut untouched, 0.0), 0.0);
+        assert_eq!(untouched[0].x, 3.0);
+    }
 
     #[test]
     fn named_areas_place_items_by_name() {
