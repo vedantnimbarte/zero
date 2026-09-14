@@ -65,6 +65,76 @@ mod tests {
     }
 
     #[test]
+    fn break_leaves_the_loop_continue_skips_to_the_next_iteration() {
+        // `for (var i ...)` scopes `i` to the loop itself in this engine —
+        // `var`/`let` aren't distinguished yet — so the last value it reached
+        // is captured from inside the loop, not read back after it.
+        let out = run(
+            "var seen = '';
+             var last = -1;
+             for (var i = 0; i < 10; i++) {
+                 if (i == 5) { break; }
+                 last = i;
+                 if (i % 2 == 0) { continue; }
+                 seen += i;
+             }
+             console.log(seen);
+             console.log(last);",
+        );
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        // 0,2,4 skipped by `continue`; 5 and up never reached because of `break`.
+        assert_eq!(out.console, vec!["13", "4"]);
+    }
+
+    #[test]
+    fn continue_in_a_for_loop_still_runs_the_step() {
+        // If `continue` skipped the increment too, this would loop forever
+        // (i never reaches 3) and hit the interpreter's own runaway-loop guard.
+        let out = run(
+            "var count = 0;
+             for (var i = 0; i < 3; i++) {
+                 if (i == 1) { continue; }
+                 count++;
+             }
+             console.log(count);",
+        );
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(out.console, vec!["2"]); // i=0 and i=2 counted; i=1 skipped
+    }
+
+    #[test]
+    fn break_and_continue_unwind_through_nested_blocks_but_not_nested_loops() {
+        let out = run(
+            "var log = '';
+             while (true) {
+                 // A block, then an if, then another block — break has to
+                 // unwind through all of it to reach this loop, not the
+                 // (nonexistent) one around it.
+                 {
+                     if (true) {
+                         log += 'x';
+                         break;
+                     }
+                 }
+                 log += 'unreachable';
+             }
+             console.log(log);
+
+             // An inner loop's own break must not escape the outer one.
+             var rows = '';
+             for (var r = 0; r < 2; r++) {
+                 for (var c = 0; c < 5; c++) {
+                     if (c == 2) { break; }
+                     rows += r + '' + c;
+                 }
+             }
+             console.log(rows);",
+        );
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(out.console, vec!["x", "00011011"]);
+    }
+
+    #[test]
     fn closures_capture_their_defining_scope() {
         let out = run("function counter() {
                  var n = 0;
@@ -173,6 +243,59 @@ mod tests {
         let out = run("try { missing(); } catch (e) { console.log('recovered'); }");
         assert!(out.errors.is_empty(), "{:?}", out.errors);
         assert_eq!(out.console, vec!["recovered"]);
+    }
+
+    #[test]
+    fn catch_receives_the_real_thrown_value_not_a_stringified_message() {
+        // A thrown object arrives in `catch` as that same object — its own
+        // fields intact — not flattened into a string first.
+        let out = run(
+            "try {
+                 throw { code: 42, note: 'custom' };
+             } catch (e) {
+                 console.log(e.code);
+                 console.log(e.note);
+             }",
+        );
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(out.console, vec!["42", "custom"]);
+    }
+
+    #[test]
+    fn runtime_faults_catch_as_real_error_objects_with_name_and_message() {
+        // Calling something undefined used to hand `catch` a bare message
+        // string; it now raises the same shape of object `throw new
+        // Error(...)` would (`.name`, `.message`) — a real `ReferenceError`,
+        // not a string that happens to describe one.
+        let out = run(
+            "try {
+                 nope();
+             } catch (e) {
+                 console.log(e.name);
+                 console.log(e.message);
+             }",
+        );
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(out.console, vec!["ReferenceError", "nope is not defined"]);
+    }
+
+    #[test]
+    fn an_uncaught_error_reports_as_name_colon_message() {
+        let out = run("nope();");
+        assert_eq!(out.errors, vec!["ReferenceError: nope is not defined"]);
+    }
+
+    #[test]
+    fn new_error_and_its_named_variants_are_real_constructors() {
+        let out = run(
+            "try { throw new TypeError('bad input'); }
+             catch (e) { console.log(e.name); console.log(e.message); }
+
+             try { throw new Error('plain'); }
+             catch (e) { console.log(e.name); console.log(e.message); }",
+        );
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(out.console, vec!["TypeError", "bad input", "Error", "plain"]);
     }
 
     #[test]

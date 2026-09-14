@@ -23,9 +23,6 @@ use std::rc::Rc;
 
 type EnvRef = Rc<RefCell<Env>>;
 
-/// Marks an error as a JS `throw` (catchable) rather than an engine failure.
-const THROW_TAG: &str = "\u{1}throw\u{1}";
-
 /// Hidden slot holding a class's parent method table, for `super`.
 const SUPER_KEY: &str = "\u{1}super";
 
@@ -143,9 +140,9 @@ fn promise(value: Value, rejected: bool) -> Value {
 
 /// What a value settles to: a promise's contents, or the value itself. A
 /// rejected promise settles by throwing, exactly as `await` would.
-fn settled(value: &Value) -> Result<Value, String> {
+fn settled(value: &Value) -> Result<Value, Thrown> {
     match unwrap_promise(value) {
-        Some((inner, true)) => Err(inner.to_display()),
+        Some((inner, true)) => Err(Thrown(inner)),
         Some((inner, false)) => Ok(inner),
         None => Ok(value.clone()),
     }
@@ -234,14 +231,61 @@ impl Value {
     }
 }
 
-/// What a statement did: fall through, or return from the enclosing function.
+/// What a statement did: fall through, return from the enclosing function, or
+/// unwind to the nearest loop. `Break`/`Continue` propagate up through
+/// `exec_body` exactly like `Return` does — a block or an `if` doesn't
+/// consume them, only a loop does — so a `break` three blocks deep still
+/// reaches the loop it means to leave.
 enum Flow {
     Normal,
     Return(Value),
+    Break,
+    Continue,
 }
 
-/// A JavaScript exception travelling up the stack, distinct from an engine error.
+/// A JavaScript exception travelling up the stack — the value a script threw
+/// itself, or one this interpreter constructs for its own faults. Either way
+/// `catch` receives it as-is, the same as a real engine raising a
+/// `TypeError`/`ReferenceError` the same way a script's own `throw` does.
 pub struct Thrown(pub Value);
+
+/// What `new` recognizes as an error constructor — both the JS-visible name
+/// and the `.name` an instance gets, which are the same word.
+const ERROR_KINDS: [&str; 5] =
+    ["Error", "TypeError", "RangeError", "SyntaxError", "ReferenceError"];
+
+/// An error object shaped like `new Error(message)` produces: `.name` and
+/// `.message`, and nothing else — this engine has no prototype chain for
+/// `instanceof` or `.stack` to hang off yet.
+fn make_error(kind: &str, message: impl Into<String>) -> Value {
+    let mut map = HashMap::new();
+    map.insert("name".to_string(), Value::Str(kind.to_string()));
+    map.insert("message".to_string(), Value::Str(message.into()));
+    Value::Object(Rc::new(RefCell::new(map)))
+}
+
+impl Thrown {
+    /// Build the exception this interpreter raises for its own faults — the
+    /// same shape `new Error(...)` produces, so `catch (e) { e.message }`
+    /// reads the same whether the page threw it or this interpreter did.
+    fn new(kind: &str, message: impl Into<String>) -> Thrown {
+        Thrown(make_error(kind, message))
+    }
+
+    /// How an uncaught exception reads in `Output.errors` — `name: message`
+    /// for one of this interpreter's own error objects, or the value's plain
+    /// display otherwise (a script can `throw "a string"` or `throw 42` just
+    /// as validly as `throw new Error(...)`).
+    fn describe(&self) -> String {
+        if let Value::Object(map) = &self.0 {
+            let map = map.borrow();
+            if let (Some(name), Some(message)) = (map.get("name"), map.get("message")) {
+                return format!("{}: {}", name.to_display(), message.to_display());
+            }
+        }
+        self.0.to_display()
+    }
+}
 
 #[derive(Default)]
 pub struct Output {
@@ -294,6 +338,12 @@ impl Interp {
         );
         Env::define(&env, "setTimeout".into(), Value::Native("setTimeout"));
         Env::define(&env, "fetch".into(), Value::Native("fetch"));
+        // `new Error(msg)` and friends: constructible via `construct`'s own
+        // native-tag case, which is what actually shapes the object — these
+        // bindings just make the names resolve to something `new` can call.
+        for kind in ERROR_KINDS {
+            Env::define(&env, kind.to_string(), Value::Native(kind));
+        }
         Env::define(
             &env,
             "JSON".into(),
@@ -377,9 +427,12 @@ impl Interp {
         for stmt in program {
             match self.exec(stmt) {
                 Ok(Flow::Return(_)) => break,
-                Ok(Flow::Normal) => {}
+                // A stray `break`/`continue` outside any loop is a syntax
+                // error in real JS; tolerated here rather than treated as
+                // fatal, same as everything else this parser doesn't reject.
+                Ok(Flow::Normal | Flow::Break | Flow::Continue) => {}
                 Err(e) => {
-                    self.out.errors.push(e);
+                    self.out.errors.push(e.describe());
                     break; // stop at the first error, like a thrown exception
                 }
             }
@@ -412,7 +465,7 @@ impl Interp {
             None => return false,
         };
         if let Err(e) = self.call(handler, Vec::new()) {
-            self.out.errors.push(e);
+            self.out.errors.push(e.describe());
         }
         true
     }
@@ -460,7 +513,7 @@ impl Interp {
         due.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
         for (_, _, callback) in due {
             if let Err(e) = self.call(callback, Vec::new()) {
-                self.out.errors.push(e);
+                self.out.errors.push(e.describe());
             }
         }
         true
@@ -493,7 +546,7 @@ impl Interp {
         cond: Option<&Expr>,
         step: Option<&Expr>,
         body: &Stmt,
-    ) -> Result<Flow, String> {
+    ) -> Result<Flow, Thrown> {
         if let Some(init) = init {
             self.exec(init)?;
         }
@@ -506,8 +559,13 @@ impl Interp {
             if !keep_going {
                 return Ok(Flow::Normal);
             }
-            if let Flow::Return(v) = self.exec(body)? {
-                return Ok(Flow::Return(v));
+            match self.exec(body)? {
+                Flow::Return(v) => return Ok(Flow::Return(v)),
+                Flow::Break => return Ok(Flow::Normal),
+                // `continue` in a `for` loop still runs the step — it skips
+                // only the rest of the body, not the increment — so it falls
+                // through here rather than returning.
+                Flow::Continue | Flow::Normal => {}
             }
             if let Some(step) = step {
                 self.eval(step)?;
@@ -515,12 +573,12 @@ impl Interp {
             guard += 1;
             // A page that loops forever must not take the browser with it.
             if guard > 1_000_000 {
-                return Err("loop iteration limit exceeded".into());
+                return Err(Thrown::new("RangeError", "loop iteration limit exceeded"));
             }
         }
     }
 
-    fn exec(&mut self, stmt: &Stmt) -> Result<Flow, String> {
+    fn exec(&mut self, stmt: &Stmt) -> Result<Flow, Thrown> {
         match stmt {
             Stmt::VarDecl { names } => {
                 for (name, init) in names {
@@ -564,12 +622,14 @@ impl Interp {
             Stmt::While { cond, body } => {
                 let mut guard = 0;
                 while self.eval(cond)?.truthy() {
-                    if let Flow::Return(v) = self.exec(body)? {
-                        return Ok(Flow::Return(v));
+                    match self.exec(body)? {
+                        Flow::Return(v) => return Ok(Flow::Return(v)),
+                        Flow::Break => break,
+                        Flow::Continue | Flow::Normal => {}
                     }
                     guard += 1;
                     if guard > 1_000_000 {
-                        return Err("loop iteration limit exceeded".into());
+                        return Err(Thrown::new("RangeError", "loop iteration limit exceeded"));
                     }
                 }
                 Ok(Flow::Normal)
@@ -593,6 +653,8 @@ impl Interp {
                 };
                 Ok(Flow::Return(v))
             }
+            Stmt::Break => Ok(Flow::Break),
+            Stmt::Continue => Ok(Flow::Continue),
             Stmt::FuncDecl { name, params, body } => {
                 let f = self.make_function(params.clone(), body.clone());
                 Env::define(&self.env, name.clone(), f);
@@ -600,8 +662,10 @@ impl Interp {
             }
             Stmt::Throw(expr) => {
                 let v = self.eval(expr)?;
-                // Exceptions ride the error channel, tagged so `catch` can recover.
-                Err(format!("{THROW_TAG}{}", v.to_display()))
+                // The error channel *is* the exception now — no tagging or
+                // stringifying needed to tell a `throw` apart from anything
+                // else that propagates through `?`, because nothing else does.
+                Err(Thrown(v))
             }
             Stmt::Try {
                 body,
@@ -611,12 +675,14 @@ impl Interp {
             } => {
                 let result = self.exec_body(body);
                 let outcome = match result {
-                    Err(e) => {
-                        let message = e.strip_prefix(THROW_TAG).unwrap_or(&e).to_string();
+                    Err(Thrown(value)) => {
                         let saved = self.env.clone();
                         self.env = Env::child(&saved);
                         if let Some(name) = param {
-                            Env::define(&self.env, name.clone(), Value::Str(message));
+                            // The real thrown value, not a message reparsed
+                            // out of it — `catch (e)` sees whatever was
+                            // actually thrown, object or string or number.
+                            Env::define(&self.env, name.clone(), value);
                         }
                         let caught = self.exec_body(catch);
                         self.env = saved;
@@ -646,7 +712,7 @@ impl Interp {
                             map.extend(base.borrow().iter().map(|(k, v)| (k.clone(), v.clone())));
                             parent_table = Some(Value::Object(base.clone()));
                         }
-                        _ => return Err(format!("{parent_name} is not a class")),
+                        _ => return Err(Thrown::new("TypeError", format!("{parent_name} is not a class"))),
                     }
                 }
                 // Methods capture a scope where `super` is *this* class's parent.
@@ -675,30 +741,37 @@ impl Interp {
         }
     }
 
-    fn exec_body(&mut self, body: &[Stmt]) -> Result<Flow, String> {
+    fn exec_body(&mut self, body: &[Stmt]) -> Result<Flow, Thrown> {
         for stmt in body {
-            if let Flow::Return(v) = self.exec(stmt)? {
-                return Ok(Flow::Return(v));
+            match self.exec(stmt)? {
+                Flow::Normal => {}
+                // Anything else unwinds the rest of this block — a `return`,
+                // `break` or `continue` three statements in means the fourth
+                // never runs, whether this block is a loop body, an `if`
+                // arm, or nested another level inside either.
+                other => return Ok(other),
             }
         }
         Ok(Flow::Normal)
     }
 
-    fn eval(&mut self, expr: &Expr) -> Result<Value, String> {
+    fn eval(&mut self, expr: &Expr) -> Result<Value, Thrown> {
         match expr {
             Expr::Num(n) => Ok(Value::Num(*n)),
             Expr::Regex { pattern, flags } => match super::regex::Regex::new(pattern, flags) {
                 Some(re) => Ok(Value::Regex(Rc::new(re))),
                 // Refusing is better than matching the wrong thing silently.
-                None => Err(format!("unsupported regular expression /{pattern}/{flags}")),
+                None => Err(Thrown::new(
+                    "SyntaxError",
+                    format!("unsupported regular expression /{pattern}/{flags}"),
+                )),
             },
             Expr::Str(s) => Ok(Value::Str(s.clone())),
             Expr::Bool(b) => Ok(Value::Bool(*b)),
             Expr::Null => Ok(Value::Null),
             Expr::Undefined => Ok(Value::Undefined),
-            Expr::Ident(name) => {
-                Env::get(&self.env, name).ok_or_else(|| format!("{name} is not defined"))
-            }
+            Expr::Ident(name) => Env::get(&self.env, name)
+                .ok_or_else(|| Thrown::new("ReferenceError", format!("{name} is not defined"))),
             Expr::Func { params, body } => Ok(self.make_function(params.clone(), body.clone())),
             Expr::This => Ok(Env::get(&self.env, "this").unwrap_or(Value::Undefined)),
             Expr::Super => Ok(Env::get(&self.env, SUPER_KEY).unwrap_or(Value::Undefined)),
@@ -742,7 +815,7 @@ impl Interp {
             Expr::Unary { op, expr } if op == "await" => {
                 let value = self.eval(expr)?;
                 match unwrap_promise(&value) {
-                    Some((inner, true)) => Err(format!("{THROW_TAG}{}", inner.to_display())),
+                    Some((inner, true)) => Err(Thrown(inner)),
                     Some((inner, false)) => Ok(inner),
                     None => Ok(value),
                 }
@@ -867,7 +940,7 @@ impl Interp {
         }
     }
 
-    fn assign_to(&mut self, target: &Expr, v: Value) -> Result<(), String> {
+    fn assign_to(&mut self, target: &Expr, v: Value) -> Result<(), Thrown> {
         match target {
             Expr::Ident(name) => {
                 if !Env::set(&self.env, name, v.clone()) {
@@ -941,7 +1014,7 @@ impl Interp {
                 }
                 Ok(())
             }
-            _ => Err("invalid assignment target".into()),
+            _ => Err(Thrown::new("SyntaxError", "invalid assignment target")),
         }
     }
 
@@ -965,7 +1038,7 @@ impl Interp {
         receiver: &Value,
         method: &str,
         args: &[Value],
-    ) -> Result<Option<Value>, String> {
+    ) -> Result<Option<Value>, Thrown> {
         // Promise plumbing first: `.then` on a settled promise is just a call,
         // and a script may chain it on anything an async function returned.
         //
@@ -1109,10 +1182,18 @@ impl Interp {
 
     /// `new C(...)`: copy the class's methods onto a fresh object, bind `this`,
     /// then run `constructor` if present.
-    fn construct(&mut self, class: Value, args: Vec<Value>) -> Result<Value, String> {
+    fn construct(&mut self, class: Value, args: Vec<Value>) -> Result<Value, Thrown> {
+        if let Value::Native(kind) = class {
+            if ERROR_KINDS.contains(&kind) {
+                let message = args.first().map(Value::to_display).unwrap_or_default();
+                return Ok(make_error(kind, message));
+            }
+        }
         let methods = match class {
             Value::Object(ref map) => map.borrow().clone(),
-            other => return Err(format!("{} is not a constructor", other.to_display())),
+            other => {
+                return Err(Thrown::new("TypeError", format!("{} is not a constructor", other.to_display())))
+            }
         };
         let instance = Value::Object(Rc::new(RefCell::new(HashMap::new())));
         if let Value::Object(ref map) = instance {
@@ -1133,7 +1214,7 @@ impl Interp {
         Ok(instance)
     }
 
-    fn call(&mut self, callee: Value, args: Vec<Value>) -> Result<Value, String> {
+    fn call(&mut self, callee: Value, args: Vec<Value>) -> Result<Value, Thrown> {
         match callee {
             Value::Native(name) => {
                 let text = args
@@ -1207,7 +1288,7 @@ impl Interp {
                     "JSON.parse" => {
                         let text = args.first().map(Value::to_display).unwrap_or_default();
                         return parse_json(&text)
-                            .ok_or_else(|| "SyntaxError: bad JSON".to_string());
+                            .ok_or_else(|| Thrown::new("SyntaxError", "bad JSON"));
                     }
                     "JSON.stringify" => {
                         return Ok(Value::Str(
@@ -1269,13 +1350,13 @@ impl Interp {
                             None => Value::Null,
                         })
                     }
-                    _ => return Err(format!("unknown builtin {name}")),
+                    _ => return Err(Thrown::new("TypeError", format!("unknown builtin {name}"))),
                 }
                 Ok(Value::Undefined)
             }
             Value::Func(f) => {
                 if self.depth > 200 {
-                    return Err("maximum call depth exceeded".into());
+                    return Err(Thrown::new("RangeError", "maximum call depth exceeded"));
                 }
                 // Calls run in a child of the *defining* scope, not the calling one.
                 let saved = self.env.clone();
@@ -1296,10 +1377,13 @@ impl Interp {
                 self.env = saved;
                 match result? {
                     Flow::Return(v) => Ok(v),
-                    Flow::Normal => Ok(Value::Undefined),
+                    // A `break`/`continue` that reached here without a loop
+                    // to catch it is invalid JS this parser doesn't reject;
+                    // tolerated the same way a function simply ending is.
+                    Flow::Normal | Flow::Break | Flow::Continue => Ok(Value::Undefined),
                 }
             }
-            other => Err(format!("{} is not a function", other.to_display())),
+            other => Err(Thrown::new("TypeError", format!("{} is not a function", other.to_display()))),
         }
     }
 }

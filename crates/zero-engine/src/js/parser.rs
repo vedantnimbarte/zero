@@ -88,6 +88,9 @@ pub enum Stmt {
     },
     Block(Vec<Stmt>),
     Return(Option<Expr>),
+    /// Unlabeled only — see the parser's note on `break`/`continue`.
+    Break,
+    Continue,
     FuncDecl {
         name: String,
         params: Vec<String>,
@@ -306,6 +309,17 @@ impl Parser {
             };
             self.eat_op(";");
             return Ok(Stmt::Return(value));
+        }
+        // ponytail: unlabeled only — `break foo;`/`continue foo;` targeting an
+        // outer loop by name is real JS, just rare enough that a bare
+        // `break`/`continue` covers the common case for now.
+        if self.eat_kw(Kw::Break) {
+            self.eat_op(";");
+            return Ok(Stmt::Break);
+        }
+        if self.eat_kw(Kw::Continue) {
+            self.eat_op(";");
+            return Ok(Stmt::Continue);
         }
         if self.eat_kw(Kw::If) {
             self.expect_op("(")?;
