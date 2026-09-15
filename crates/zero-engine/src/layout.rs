@@ -157,6 +157,13 @@ struct FloatRect {
     bottom: f32,
 }
 
+/// `position: relative` on a styled node — offset in place, still in flow.
+/// A free function for the same reason `float_side_of` is: needed before a
+/// [`LayoutBox`] exists to call it on.
+fn is_relatively_positioned(style: &StyledNode) -> bool {
+    matches!(style.value("position"), Some(Value::Keyword(ref k)) if k == "relative")
+}
+
 /// `float: left | right` on a styled node. Lives outside [`LayoutBox`] because
 /// [`StyledNode::display`] needs it too — a float is block-level whatever its
 /// own `display` says.
@@ -1253,6 +1260,28 @@ impl<'a> LayoutBox<'a> {
             + d.margin.top
             + d.border.top
             + d.padding.top;
+
+        // `position: relative` shifts the box — and, since children are laid
+        // out against `d.content` below, everything inside it — from where
+        // normal flow put it, without changing how much space it reserves
+        // there: a later sibling still lands exactly where it would if this
+        // box had never moved, because the parent's flow cursor only ever
+        // reads `margin_box().height`, a size, never `content.x`/`content.y`.
+        if is_relatively_positioned(style) {
+            let cb = containing_block.content;
+            let ctx_x = style.length_context(cb.width);
+            let ctx_y = style.length_context(cb.height);
+            match (style.value("left"), style.value("right")) {
+                (Some(left), _) => d.content.x += left.resolve(ctx_x),
+                (None, Some(right)) => d.content.x -= right.resolve(ctx_x),
+                (None, None) => {}
+            }
+            match (style.value("top"), style.value("bottom")) {
+                (Some(top), _) => d.content.y += top.resolve(ctx_y),
+                (None, Some(bottom)) => d.content.y -= bottom.resolve(ctx_y),
+                (None, None) => {}
+            }
+        }
     }
 
     fn layout_block_children(&mut self, fonts: Option<&FontSet>, images: &ImageMap) {
@@ -2669,6 +2698,51 @@ mod tests {
         let placed = laid.children[0].dimensions.margin_box();
         assert_eq!(placed.x, 900.0 - 20.0 - 100.0); // right edge is 20 from the container's
         assert_eq!(placed.y, 200.0 - 10.0 - 40.0); // bottom edge is 10 from the container's
+    }
+
+    #[test]
+    fn relative_offset_moves_the_box_without_disturbing_its_siblings() {
+        let node = dom::elem("div".into(), HashMap::new(), vec![]);
+        let mut first_values = HashMap::new();
+        first_values.insert("display".to_string(), Value::Keyword("block".into()));
+        first_values.insert("position".to_string(), Value::Keyword("relative".into()));
+        first_values.insert("top".to_string(), Value::Length(15.0, Unit::Px));
+        first_values.insert("left".to_string(), Value::Length(30.0, Unit::Px));
+        first_values.insert("height".to_string(), Value::Length(50.0, Unit::Px));
+        let first = StyledNode {
+            node: &node,
+            specified_values: first_values,
+            children: vec![],
+        };
+        let mut second_values = HashMap::new();
+        second_values.insert("display".to_string(), Value::Keyword("block".into()));
+        second_values.insert("height".to_string(), Value::Length(20.0, Unit::Px));
+        let second = StyledNode {
+            node: &node,
+            specified_values: second_values,
+            children: vec![],
+        };
+
+        let mut root_values = HashMap::new();
+        root_values.insert("display".to_string(), Value::Keyword("block".into()));
+        let root = StyledNode {
+            node: &node,
+            specified_values: root_values,
+            children: vec![first, second],
+        };
+
+        let mut viewport: Dimensions = Default::default();
+        viewport.content.width = 400.0;
+        let laid = layout_tree(&root, viewport, None, &ImageMap::new());
+
+        // The box itself moved by (left, top) from where flow would have put it.
+        let placed = laid.children[0].dimensions.content;
+        assert_eq!(placed.x, 30.0);
+        assert_eq!(placed.y, 15.0);
+        // Its sibling lands exactly where it would if the first box had never
+        // moved — the 50px it reserved in flow is untouched by the offset.
+        let sibling = laid.children[1].dimensions.content;
+        assert_eq!(sibling.y, 50.0);
     }
 
     #[test]

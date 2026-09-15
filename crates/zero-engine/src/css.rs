@@ -678,30 +678,33 @@ fn parse_hex_color(hex: &str) -> Option<Value> {
     Some(Value::ColorValue(color))
 }
 
-/// Whether a rule applies at this viewport width. `None` (no media block)
+/// Whether a rule applies at this viewport size. `None` (no media block)
 /// always applies.
 ///
-/// Understands media types and width features, which is what responsive layout
-/// actually turns on. A feature we don't understand makes the block *not*
-/// match, so an unsupported condition leaves the page at its base styling
-/// rather than applying rules meant for some other context.
-pub fn media_matches(condition: Option<&str>, viewport_width: f32) -> bool {
+/// Understands media types, width/height features, `orientation`, `hover`/
+/// `pointer`, and `prefers-color-scheme`. A feature we don't understand makes
+/// the block *not* match, so an unsupported condition leaves the page at its
+/// base styling rather than applying rules meant for some other context.
+pub fn media_matches(condition: Option<&str>, viewport_width: f32, viewport_height: f32) -> bool {
     let Some(condition) = condition else { return true };
     // Commas are "or": any branch matching is enough.
     condition.split(',').any(|branch| {
         let branch = branch.trim().to_lowercase();
-        !branch.is_empty() && branch.split(" and ").all(|term| term_matches(term.trim(), viewport_width))
+        !branch.is_empty()
+            && branch
+                .split(" and ")
+                .all(|term| term_matches(term.trim(), viewport_width, viewport_height))
     })
 }
 
-fn term_matches(term: &str, viewport_width: f32) -> bool {
+fn term_matches(term: &str, width: f32, height: f32) -> bool {
     match term {
         "screen" | "all" => return true,
         "print" | "speech" | "only print" => return false,
         _ => {}
     }
     if let Some(rest) = term.strip_prefix("only ") {
-        return term_matches(rest.trim(), viewport_width);
+        return term_matches(rest.trim(), width, height);
     }
     let Some(inner) = term.strip_prefix('(').and_then(|t| t.strip_suffix(')')) else {
         return false; // an unknown bare term
@@ -709,10 +712,32 @@ fn term_matches(term: &str, viewport_width: f32) -> bool {
     let Some((feature, value)) = inner.split_once(':') else {
         return false; // a bare feature test like `(hover)`
     };
-    let Some(px) = parse_px(value.trim()) else { return false };
+    let value = value.trim();
     match feature.trim() {
-        "min-width" => viewport_width >= px,
-        "max-width" => viewport_width <= px,
+        "min-width" | "max-width" | "min-height" | "max-height" => {
+            let Some(px) = parse_px(value) else { return false };
+            match feature.trim() {
+                "min-width" => width >= px,
+                "max-width" => width <= px,
+                "min-height" => height >= px,
+                "max-height" => height <= px,
+                _ => unreachable!(),
+            }
+        }
+        "orientation" => match value {
+            "landscape" => width >= height,
+            "portrait" => width < height,
+            _ => false,
+        },
+        // No touch input path exists anywhere in this engine — mouse and
+        // keyboard only — so a fine pointer that can hover is simply always
+        // true here, not a cut corner.
+        "hover" | "any-hover" => value == "hover",
+        "pointer" | "any-pointer" => value == "fine",
+        // ponytail: no OS/shell theme signal is threaded in yet — the shell
+        // has no dark-mode setting of its own (see Track F/G) — so this is
+        // always "light" until one exists to report.
+        "prefers-color-scheme" => value == "light",
         _ => false,
     }
 }
@@ -1308,7 +1333,7 @@ mod tests {
             sheet
                 .rules
                 .iter()
-                .filter(|r| media_matches(r.media.as_deref(), width))
+                .filter(|r| media_matches(r.media.as_deref(), width, 600.0))
                 .map(|r| r.media.clone())
                 .collect()
         };
@@ -1374,18 +1399,52 @@ mod tests {
 
     #[test]
     fn media_conditions_are_evaluated() {
-        assert!(media_matches(None, 400.0)); // no block: always on
-        assert!(media_matches(Some("screen"), 400.0));
-        assert!(!media_matches(Some("print"), 400.0));
-        assert!(media_matches(Some("(max-width: 600px)"), 400.0));
-        assert!(!media_matches(Some("(max-width: 600px)"), 900.0));
+        assert!(media_matches(None, 400.0, 800.0)); // no block: always on
+        assert!(media_matches(Some("screen"), 400.0, 800.0));
+        assert!(!media_matches(Some("print"), 400.0, 800.0));
+        assert!(media_matches(Some("(max-width: 600px)"), 400.0, 800.0));
+        assert!(!media_matches(Some("(max-width: 600px)"), 900.0, 800.0));
         // `and` requires both; a comma is `or`.
-        assert!(!media_matches(Some("screen and (min-width: 900px)"), 400.0));
-        assert!(media_matches(Some("print, screen"), 400.0));
+        assert!(!media_matches(Some("screen and (min-width: 900px)"), 400.0, 800.0));
+        assert!(media_matches(Some("print, screen"), 400.0, 800.0));
         // em/rem conditions resolve against the initial font size.
-        assert!(media_matches(Some("(min-width: 20em)"), 400.0));
+        assert!(media_matches(Some("(min-width: 20em)"), 400.0, 800.0));
         // A feature we cannot judge must not switch styles on.
-        assert!(!media_matches(Some("(prefers-color-scheme: dark)"), 400.0));
+        assert!(!media_matches(Some("(prefers-color-scheme: dark)"), 400.0, 800.0));
+    }
+
+    #[test]
+    fn height_features_read_the_viewport_height_not_the_width() {
+        assert!(media_matches(Some("(min-height: 500px)"), 400.0, 600.0));
+        assert!(!media_matches(Some("(min-height: 700px)"), 400.0, 600.0));
+        assert!(media_matches(Some("(max-height: 700px)"), 400.0, 600.0));
+    }
+
+    #[test]
+    fn orientation_compares_width_against_height() {
+        assert!(media_matches(Some("(orientation: landscape)"), 800.0, 600.0));
+        assert!(!media_matches(Some("(orientation: portrait)"), 800.0, 600.0));
+        assert!(media_matches(Some("(orientation: portrait)"), 400.0, 800.0));
+        // Square counts as landscape (width >= height), matching browser behavior.
+        assert!(media_matches(Some("(orientation: landscape)"), 500.0, 500.0));
+    }
+
+    #[test]
+    fn hover_and_pointer_report_a_mouse_and_keyboard_browser() {
+        // No touch input path exists anywhere in this engine — always a fine
+        // pointer that can hover, never a coarse touch pointer.
+        assert!(media_matches(Some("(hover: hover)"), 400.0, 800.0));
+        assert!(!media_matches(Some("(hover: none)"), 400.0, 800.0));
+        assert!(media_matches(Some("(pointer: fine)"), 400.0, 800.0));
+        assert!(!media_matches(Some("(pointer: coarse)"), 400.0, 800.0));
+        assert!(media_matches(Some("(any-hover: hover)"), 400.0, 800.0));
+        assert!(media_matches(Some("(any-pointer: fine)"), 400.0, 800.0));
+    }
+
+    #[test]
+    fn prefers_color_scheme_reports_light_until_a_real_theme_signal_exists() {
+        assert!(media_matches(Some("(prefers-color-scheme: light)"), 400.0, 800.0));
+        assert!(!media_matches(Some("(prefers-color-scheme: dark)"), 400.0, 800.0));
     }
 
     #[test]

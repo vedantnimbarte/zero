@@ -80,7 +80,7 @@ pub struct Document {
     find: Option<String>,
     /// The parsed stylesheet, kept between renders, keyed by the source text and
     /// the viewport width it was filtered for.
-    sheet: Option<((u64, u32), css::Stylesheet, style::RuleIndex)>,
+    sheet: Option<((u64, u32, u32), css::Stylesheet, style::RuleIndex)>,
     /// The element under the cursor, plus its ancestors — `:hover` applies to
     /// the whole chain, not just the innermost element.
     hovered: style::HoverChain,
@@ -694,11 +694,13 @@ impl Engine {
 
         // Parsing a real site's CSS costs more than styling, layout and paint
         // together, and it is the same text on every render — so reuse it unless
-        // the text or the viewport width (which decides @media) has changed.
-        let key = (hash_of(&source), width.to_bits());
+        // the text or the viewport size (which decides @media) has changed.
+        let key = (hash_of(&source), width.to_bits(), height.to_bits());
         if doc.sheet.as_ref().map(|(cached, ..)| *cached) != Some(key) {
             let mut parsed = css::parse(source);
-            parsed.rules.retain(|rule| css::media_matches(rule.media.as_deref(), width));
+            parsed
+                .rules
+                .retain(|rule| css::media_matches(rule.media.as_deref(), width, height));
             let index = style::RuleIndex::build(&parsed);
             doc.sheet = Some((key, parsed, index));
         }
