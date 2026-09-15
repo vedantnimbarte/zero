@@ -19,6 +19,8 @@ pub enum Tok {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Kw {
     Var,
+    Let,
+    Const,
     Function,
     Return,
     If,
@@ -47,6 +49,8 @@ pub enum Kw {
 pub fn keyword_name(kw: Kw) -> &'static str {
     match kw {
         Kw::Var => "var",
+        Kw::Let => "let",
+        Kw::Const => "const",
         Kw::Function => "function",
         Kw::Return => "return",
         Kw::If => "if",
@@ -73,8 +77,9 @@ pub fn keyword_name(kw: Kw) -> &'static str {
 
 fn keyword(word: &str) -> Option<Kw> {
     Some(match word {
-        // `let`/`const` behave like `var` here — no block-scoping yet.
-        "var" | "let" | "const" => Kw::Var,
+        "var" => Kw::Var,
+        "let" => Kw::Let,
+        "const" => Kw::Const,
         "function" => Kw::Function,
         "return" => Kw::Return,
         "if" => Kw::If,

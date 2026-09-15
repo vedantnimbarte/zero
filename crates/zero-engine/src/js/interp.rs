@@ -15,7 +15,7 @@
 //! slow. No prototypes either: objects are plain maps with a few built-ins.
 
 use super::dom::{DomView, Mutation};
-use super::parser::{Expr, Stmt};
+use super::parser::{DeclKind, Expr, Stmt};
 use crate::resource::{KeyValueStore, ResourceLoader};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -69,6 +69,12 @@ pub type NameMap<V> = HashMap<String, V, NameHasher>;
 pub struct Env {
     vars: NameMap<Value>,
     parent: Option<EnvRef>,
+    /// Whether `var` stops climbing here rather than continuing past it —
+    /// set for a function call's own scope and the global root, so a `var`
+    /// declared inside a nested `if`/`for`/block still lands in the function
+    /// it's part of (real hoisting), while `let`/`const` land exactly where
+    /// `Env::define` is called, which is always the block that declared them.
+    is_function_scope: bool,
 }
 
 impl Env {
@@ -76,13 +82,28 @@ impl Env {
         Rc::new(RefCell::new(Env {
             vars: NameMap::default(),
             parent: None,
+            is_function_scope: true,
         }))
     }
 
+    /// An ordinary block scope (`if`, `for`, `{ ... }`) — `var` skips past
+    /// these looking for a function boundary; `let`/`const` stop here.
     fn child(parent: &EnvRef) -> EnvRef {
         Rc::new(RefCell::new(Env {
             vars: NameMap::default(),
             parent: Some(parent.clone()),
+            is_function_scope: false,
+        }))
+    }
+
+    /// A function call's own scope — where its parameters live, and where
+    /// `var` declared anywhere in its body (however deeply nested in blocks)
+    /// actually ends up.
+    fn function_child(parent: &EnvRef) -> EnvRef {
+        Rc::new(RefCell::new(Env {
+            vars: NameMap::default(),
+            parent: Some(parent.clone()),
+            is_function_scope: true,
         }))
     }
 
@@ -114,6 +135,28 @@ impl Env {
 
     fn define(env: &EnvRef, name: String, value: Value) {
         env.borrow_mut().vars.insert(name, value);
+    }
+
+    /// `var`'s own binding rule: walk up past every ordinary block scope and
+    /// land in the nearest function (or global) scope. `env` itself is
+    /// where the *lookup* starts, not necessarily where the value ends up —
+    /// exactly what lets `if (x) { var y = 1; }` make `y` visible after the
+    /// `if`, which `Env::define` alone cannot.
+    fn define_var(env: &EnvRef, name: String, value: Value) {
+        let (is_boundary, parent) = {
+            let e = env.borrow();
+            (e.is_function_scope, e.parent.clone())
+        };
+        if is_boundary {
+            env.borrow_mut().vars.insert(name, value);
+        } else if let Some(parent) = parent {
+            Env::define_var(&parent, name, value);
+        } else {
+            // No boundary found before running out of scopes — cannot
+            // happen (the root is always one) — fall back to defining here
+            // rather than silently dropping the declaration.
+            env.borrow_mut().vars.insert(name, value);
+        }
     }
 }
 
@@ -580,13 +623,24 @@ impl Interp {
 
     fn exec(&mut self, stmt: &Stmt) -> Result<Flow, Thrown> {
         match stmt {
-            Stmt::VarDecl { names } => {
+            Stmt::VarDecl { kind, names } => {
                 for (name, init) in names {
                     let value = match init {
                         Some(e) => self.eval(e)?,
                         None => Value::Undefined,
                     };
-                    Env::define(&self.env, name.clone(), value);
+                    match kind {
+                        // Real hoisting: lands in the nearest function (or
+                        // global) scope, not the block this `var` happens to
+                        // be written in.
+                        DeclKind::Var => Env::define_var(&self.env, name.clone(), value),
+                        // `let`/`const` stay exactly where they're written —
+                        // already what `Env::define` does, since a block that
+                        // declares anything already gets its own scope.
+                        DeclKind::Let | DeclKind::Const => {
+                            Env::define(&self.env, name.clone(), value)
+                        }
+                    }
                 }
                 Ok(Flow::Normal)
             }
@@ -1359,8 +1413,10 @@ impl Interp {
                     return Err(Thrown::new("RangeError", "maximum call depth exceeded"));
                 }
                 // Calls run in a child of the *defining* scope, not the calling one.
+                // A function boundary: where this call's own `var`s land,
+                // however many blocks deep inside the body they're written.
                 let saved = self.env.clone();
-                self.env = Env::child(&f.closure);
+                self.env = Env::function_child(&f.closure);
                 if let Some(receiver) = &f.this {
                     Env::define(&self.env, "this".into(), (**receiver).clone());
                 }

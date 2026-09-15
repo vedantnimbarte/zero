@@ -65,25 +65,82 @@ mod tests {
     }
 
     #[test]
+    fn var_hoists_past_blocks_but_let_and_const_stay_inside_them() {
+        let out = run(
+            "function f() {
+                 if (true) {
+                     var hoisted = 'v';
+                     let blocked = 'l';
+                 }
+                 console.log(hoisted); // var: visible outside the if
+                 console.log(typeof blocked); // let: gone with the block
+             }
+             f();",
+        );
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(out.console, vec!["v", "undefined"]);
+    }
+
+    #[test]
+    fn referencing_a_block_scoped_name_outside_its_block_is_a_real_reference_error() {
+        // Not just "reads as undefined" (that's `typeof`'s special case) —
+        // actually naming it should fail the same way an undeclared
+        // variable does, proving `blocked` truly left scope with its block
+        // rather than merely losing its value.
+        let out = run("{ let blocked = 1; } blocked;");
+        assert_eq!(out.errors, vec!["ReferenceError: blocked is not defined"]);
+    }
+
+    #[test]
+    fn const_is_still_readable_and_block_scoped_the_same_as_let() {
+        let out = run(
+            "if (true) {
+                 const x = 42;
+                 console.log(x);
+             }",
+        );
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(out.console, vec!["42"]);
+    }
+
+    #[test]
+    fn a_var_inside_a_loop_body_also_hoists_to_the_function_it_is_part_of() {
+        // The same hoisting rule applies whether the block is an `if`, a
+        // loop body, or nested several deep — `var` always climbs to the
+        // nearest function (or global) scope, not just the block right
+        // around it.
+        let out = run(
+            "function f() {
+                 for (var i = 0; i < 3; i++) {
+                     if (i == 1) {
+                         var found = 'yes';
+                     }
+                 }
+                 return found;
+             }
+             console.log(f());",
+        );
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(out.console, vec!["yes"]);
+    }
+
+    #[test]
     fn break_leaves_the_loop_continue_skips_to_the_next_iteration() {
-        // `for (var i ...)` scopes `i` to the loop itself in this engine —
-        // `var`/`let` aren't distinguished yet — so the last value it reached
-        // is captured from inside the loop, not read back after it.
+        // `for (var i ...)` hoists `i` to the function/global scope, so it's
+        // still readable after the loop — real `var` semantics.
         let out = run(
             "var seen = '';
-             var last = -1;
              for (var i = 0; i < 10; i++) {
                  if (i == 5) { break; }
-                 last = i;
                  if (i % 2 == 0) { continue; }
                  seen += i;
              }
              console.log(seen);
-             console.log(last);",
+             console.log(i);",
         );
         assert!(out.errors.is_empty(), "{:?}", out.errors);
         // 0,2,4 skipped by `continue`; 5 and up never reached because of `break`.
-        assert_eq!(out.console, vec!["13", "4"]);
+        assert_eq!(out.console, vec!["13", "5"]);
     }
 
     #[test]

@@ -63,11 +63,29 @@ pub enum Expr {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DeclKind {
+    /// Hoists to the nearest function (or global) scope, ignoring the block
+    /// it's actually written in — real `var` hoisting.
+    Var,
+    /// Scoped to the block it's written in, same as the interpreter already
+    /// does for every declaration today.
+    ///
+    /// ponytail: `Let` and `Const` are the same statement — nothing yet stops
+    /// a `const` from being reassigned. Enforcing that is a small, separate
+    /// addition (checking a per-binding flag in `assign_to`) worth doing
+    /// when a real page's `const` relies on the error rather than just its
+    /// documentation value, which most code doesn't.
+    Let,
+    Const,
+}
+
 #[derive(Debug, Clone)]
 pub enum Stmt {
     /// One `var`/`let`/`const` statement, which may declare several names:
     /// `var a = 1, b;` is a single declaration with two declarators.
     VarDecl {
+        kind: DeclKind,
         names: Vec<(String, Option<Expr>)>,
     },
     ExprStmt(Expr),
@@ -221,7 +239,16 @@ impl Parser {
             }
             return Ok(Stmt::Block(body));
         }
-        if self.eat_kw(Kw::Var) {
+        let kind = if self.eat_kw(Kw::Var) {
+            Some(DeclKind::Var)
+        } else if self.eat_kw(Kw::Let) {
+            Some(DeclKind::Let)
+        } else if self.eat_kw(Kw::Const) {
+            Some(DeclKind::Const)
+        } else {
+            None
+        };
+        if let Some(kind) = kind {
             let mut names = Vec::new();
             loop {
                 let name = self.expect_ident()?;
@@ -236,7 +263,7 @@ impl Parser {
                 }
             }
             self.eat_op(";");
-            return Ok(Stmt::VarDecl { names });
+            return Ok(Stmt::VarDecl { kind, names });
         }
         // `async function f() {}` at statement level.
         let async_decl = self.eat_async();
@@ -676,7 +703,7 @@ mod tests {
         let ast = parse(tokenize("var x = 1 + 2 * 3;").unwrap()).unwrap();
         // Should nest as 1 + (2 * 3), not (1 + 2) * 3.
         match &ast[0] {
-            Stmt::VarDecl { names } => match &names[0].1 {
+            Stmt::VarDecl { names, .. } => match &names[0].1 {
                 Some(Expr::Binary { op, right, .. }) => {
                     assert_eq!(op, "+");
                     assert!(matches!(**right, Expr::Binary { .. }));
@@ -692,11 +719,11 @@ mod tests {
         let ast = parse(tokenize("var a = [1, 2]; var o = {x: 1}; a[0]; o.x;").unwrap()).unwrap();
         assert!(matches!(
             &ast[0],
-            Stmt::VarDecl { names } if matches!(names[0].1, Some(Expr::ArrayLit(_)))
+            Stmt::VarDecl { names, .. } if matches!(names[0].1, Some(Expr::ArrayLit(_)))
         ));
         assert!(matches!(
             &ast[1],
-            Stmt::VarDecl { names } if matches!(names[0].1, Some(Expr::ObjectLit(_)))
+            Stmt::VarDecl { names, .. } if matches!(names[0].1, Some(Expr::ObjectLit(_)))
         ));
         assert!(matches!(ast[2], Stmt::ExprStmt(Expr::Index { .. })));
         assert!(matches!(ast[3], Stmt::ExprStmt(Expr::Member { .. })));
