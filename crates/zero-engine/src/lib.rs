@@ -725,6 +725,10 @@ impl Engine {
         let mut images = ImageMap::new();
         collect_and_load_images(root, loader, &mut images);
         rasterize_inline_svg(root, &mut images);
+        // `background-image: url(...)` is a style, not a DOM attribute, so it
+        // can only be found by walking the *styled* tree, once the cascade has
+        // matched rules to elements — batched the same way `<img src>` is.
+        collect_and_load_background_images(&style_root, loader, &mut images);
 
         let mut viewport: layout::Dimensions = Default::default();
         viewport.content.width = width;
@@ -893,6 +897,35 @@ fn collect_and_load_images(node: &Node, loader: &dyn ResourceLoader, out: &mut I
         if let Some(img) = bytes.and_then(|b| resource::decode_image(&b)) {
             out.insert(src.clone(), img);
         }
+    }
+}
+
+/// Every `background-image: url(...)` in the styled tree, fetched the same
+/// batched way `<img src>` is — a page with several background images costs
+/// one round trip, not one per element. `or_insert` rather than overwriting:
+/// an `<img>` and a background rule naming the same URL share one fetch.
+fn collect_and_load_background_images(
+    style_root: &style::StyledNode,
+    loader: &dyn ResourceLoader,
+    out: &mut ImageMap,
+) {
+    let mut srcs = Vec::new();
+    collect_background_image_srcs(style_root, &mut srcs);
+    for (src, bytes) in srcs.iter().zip(loader.load_all(&srcs)) {
+        if let Some(img) = bytes.and_then(|b| resource::decode_image(&b)) {
+            out.entry(src.clone()).or_insert(img);
+        }
+    }
+}
+
+fn collect_background_image_srcs(style_node: &style::StyledNode, out: &mut Vec<String>) {
+    if let Some(src) = paint::background_image_src(style_node) {
+        if !out.contains(&src) {
+            out.push(src);
+        }
+    }
+    for child in &style_node.children {
+        collect_background_image_srcs(child, out);
     }
 }
 
@@ -1624,5 +1657,106 @@ p { color: #0000ff }", &Sheets, &mut out, 0);
         assert_eq!(super::percent_encode("hindi-~_."), "hindi-~_.");
         // Non-ASCII goes out as UTF-8 bytes.
         assert_eq!(super::percent_encode("हि"), "%E0%A4%B9%E0%A4%BF");
+    }
+
+    /// A loader serving one fixed image per URL, via the SVG decode path — a
+    /// solid-colour rect is a cheap, exact fixture with no PNG encoder needed.
+    struct FixedImages(&'static [(&'static str, &'static str)]);
+    impl super::ResourceLoader for FixedImages {
+        fn load(&self, url: &str) -> Option<Vec<u8>> {
+            self.0
+                .iter()
+                .find(|(u, _)| *u == url)
+                .map(|(_, svg)| svg.as_bytes().to_vec())
+        }
+    }
+
+    #[test]
+    fn background_repeat_tiles_the_image_but_no_repeat_paints_it_once() {
+        const RED: &str = r##"<svg width="10" height="10"><rect width="10" height="10" fill="#ff0000"/></svg>"##;
+        let engine = super::Engine::shapes_only();
+        let red_at = |canvas: &super::Canvas, x: usize, y: usize| {
+            let p = canvas.pixels[y * canvas.width + x];
+            p.r == 255 && p.g == 0 && p.b == 0
+        };
+
+        let tiled = engine.render_page(
+            "<body><div id=\"box\"></div></body>",
+            "#box { width: 30px; height: 30px; background-color: #ffffff;
+                    background-image: url(red.svg); }",
+            30.0,
+            30.0,
+            &FixedImages(&[("red.svg", RED)]),
+        );
+        assert!(red_at(&tiled.canvas, 5, 5), "the first tile paints at the box's origin");
+        assert!(red_at(&tiled.canvas, 25, 5), "repeat (the default) tiles across the box");
+        assert!(red_at(&tiled.canvas, 5, 25), "and down it");
+
+        let once = engine.render_page(
+            "<body><div id=\"box\"></div></body>",
+            "#box { width: 30px; height: 30px; background-color: #ffffff;
+                    background-image: url(red.svg); background-repeat: no-repeat; }",
+            30.0,
+            30.0,
+            &FixedImages(&[("red.svg", RED)]),
+        );
+        assert!(red_at(&once.canvas, 5, 5), "still paints once at the origin");
+        assert!(!red_at(&once.canvas, 25, 5), "no-repeat must not tile a second copy");
+    }
+
+    #[test]
+    fn background_size_and_position_place_the_image_inside_its_box() {
+        const RED: &str = r##"<svg width="10" height="10"><rect width="10" height="10" fill="#ff0000"/></svg>"##;
+        let engine = super::Engine::shapes_only();
+        let page = engine.render_page(
+            "<body><div id=\"box\"></div></body>",
+            "#box { width: 30px; height: 30px; background-color: #ffffff;
+                    background-image: url(red.svg); background-repeat: no-repeat;
+                    background-size: 20px 20px; background-position: right bottom; }",
+            30.0,
+            30.0,
+            &FixedImages(&[("red.svg", RED)]),
+        );
+        let red_at = |x: usize, y: usize| {
+            let p = page.canvas.pixels[y * page.canvas.width + x];
+            p.r == 255 && p.g == 0 && p.b == 0
+        };
+        // A 20x20 image pinned to the bottom-right of a 30x30 box covers 10..30.
+        assert!(!red_at(5, 5), "the top-left corner is outside the sized, positioned image");
+        assert!(red_at(15, 15), "the middle of the box is covered");
+        assert!(red_at(25, 25), "so is the bottom-right corner it was pinned to");
+    }
+
+    #[test]
+    fn object_fit_contain_letterboxes_instead_of_stretching() {
+        // Wider than it is tall, dropped into a square box.
+        const WIDE: &str = r##"<svg width="20" height="10"><rect width="20" height="10" fill="#0000ff"/></svg>"##;
+        let engine = super::Engine::shapes_only();
+        let loader = FixedImages(&[("wide.svg", WIDE)]);
+
+        let stretched = engine.render_page(
+            "<body><img id=\"pic\" src=\"wide.svg\"></body>",
+            "#pic { display: block; width: 20px; height: 20px; }",
+            20.0,
+            20.0,
+            &loader,
+        );
+        let contained = engine.render_page(
+            "<body><img id=\"pic\" src=\"wide.svg\"></body>",
+            "#pic { display: block; width: 20px; height: 20px; object-fit: contain; }",
+            20.0,
+            20.0,
+            &loader,
+        );
+        let blue_at = |canvas: &super::Canvas, x: usize, y: usize| {
+            let p = canvas.pixels[y * canvas.width + x];
+            p.b == 255 && p.r == 0
+        };
+        // Default `fill` stretches the 20x10 image to fill the whole 20x20 box.
+        assert!(blue_at(&stretched.canvas, 10, 2), "fill stretches to the box's full height");
+        // `contain` keeps the image's own aspect ratio, so it letterboxes
+        // instead — top and bottom stay the canvas's white, not blue.
+        assert!(!blue_at(&contained.canvas, 10, 2), "contain must not stretch past the image's own ratio");
+        assert!(blue_at(&contained.canvas, 10, 10), "the fitted image still covers the box's middle");
     }
 }

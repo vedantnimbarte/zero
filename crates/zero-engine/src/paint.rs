@@ -9,7 +9,7 @@
 //! than to a composited layer. Rasterizing is on the CPU — no GPU compositor
 //! yet (docs/01-ARCHITECTURE.md §3 [6]-[7]).
 
-use crate::css::{Color, Value};
+use crate::css::{Color, LengthContext, Value};
 use crate::dom::NodeType;
 use crate::layout::{BoxType, LayoutBox, Rect, TextFragment};
 use crate::resource::{DecodedImage, ImageMap};
@@ -40,7 +40,55 @@ enum DisplayCommand {
         color: Color,
     },
     Text(TextFragment),
-    Image(String, Rect), // image src, destination content box
+    /// image src, destination content box, and how it fits that box.
+    Image(String, Rect, ObjectFit),
+    /// `background-image: url(...)`, resolved and tiled at paint time once the
+    /// image's own intrinsic size is known — see `Canvas::paint_background_image`.
+    BackgroundImage {
+        src: String,
+        rect: Rect,
+        size: BgSize,
+        position: (BgAxis, BgAxis),
+        repeat: BgRepeat,
+    },
+}
+
+/// `object-fit` on a replaced element (`<img>`, inline `<svg>`).
+#[derive(Clone, Copy, PartialEq)]
+enum ObjectFit {
+    Fill,
+    Contain,
+    Cover,
+    None,
+    ScaleDown,
+}
+
+/// `background-size`. Percentages/lengths are resolved to px against the box
+/// at display-list build time; `None` on an axis means "auto" — the intrinsic
+/// size for that axis, only knowable once the image itself is decoded.
+#[derive(Clone, Copy, PartialEq)]
+enum BgSize {
+    Auto,
+    Cover,
+    Contain,
+    Explicit(Option<f32>, Option<f32>),
+}
+
+/// One axis of `background-position`.
+#[derive(Clone, Copy, PartialEq)]
+enum BgAxis {
+    /// A fraction of `(box size - image size)` — `center` is `Percent(0.5)`.
+    Percent(f32),
+    /// A literal offset from the box's edge, independent of the image size.
+    Px(f32),
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum BgRepeat {
+    Repeat,
+    RepeatX,
+    RepeatY,
+    NoRepeat,
 }
 
 type DisplayList = Vec<DisplayCommand>;
@@ -294,23 +342,28 @@ impl Canvas {
         }
     }
 
-    /// Blit a decoded image into `dest`, nearest-neighbor scaled and alpha-blended.
-    fn paint_image(&mut self, img: &DecodedImage, dest: Rect) {
+    /// Blit a *sub-rectangle* of a decoded image (`src_rect`, in the image's own
+    /// pixel space) into `dest`, nearest-neighbor scaled and alpha-blended. The
+    /// one blit primitive both a whole `<img>` and a background tile use: an
+    /// `<img>` samples the whole image into `dest`; a background tile that hangs
+    /// off the box's edge samples only the visible slice of it, so it shows the
+    /// right pixels instead of being squeezed to fit the clipped area.
+    fn paint_image_region(&mut self, img: &DecodedImage, dest: Rect, src_rect: Rect) {
         let (dw, dh) = (dest.width as i32, dest.height as i32);
         if dw <= 0 || dh <= 0 || img.width == 0 || img.height == 0 {
             return;
         }
         let (x0, y0) = (dest.x as i32, dest.y as i32);
         for dy in 0..dh {
-            let sy = ((dy as f32 / dh as f32) * img.height as f32) as usize;
-            let sy = sy.min(img.height - 1);
+            let sy = src_rect.y + (dy as f32 / dh as f32) * src_rect.height;
+            let sy = (sy as usize).min(img.height - 1);
             let py = y0 + dy;
             if py < 0 || py >= self.height as i32 {
                 continue;
             }
             for dx in 0..dw {
-                let sx = ((dx as f32 / dw as f32) * img.width as f32) as usize;
-                let sx = sx.min(img.width - 1);
+                let sx = src_rect.x + (dx as f32 / dw as f32) * src_rect.width;
+                let sx = (sx as usize).min(img.width - 1);
                 let px = x0 + dx;
                 if px < 0 || px >= self.width as i32 {
                     continue;
@@ -320,6 +373,140 @@ impl Canvas {
                 self.pixels[idx] = blend(self.pixels[idx], src, src.a);
             }
         }
+    }
+
+    /// Draw `img` into `dest` per `object-fit`.
+    fn paint_fitted_image(&mut self, img: &DecodedImage, dest: Rect, fit: ObjectFit) {
+        if dest.width <= 0.0 || dest.height <= 0.0 || img.width == 0 || img.height == 0 {
+            return;
+        }
+        let natural = (img.width as f32, img.height as f32);
+        if fit == ObjectFit::Fill {
+            let full_src = Rect { x: 0.0, y: 0.0, width: natural.0, height: natural.1 };
+            return self.paint_image_region(img, dest, full_src);
+        }
+        let cover = (dest.width / natural.0).max(dest.height / natural.1);
+        let contain = (dest.width / natural.0).min(dest.height / natural.1);
+        let scale = match fit {
+            ObjectFit::Cover => cover,
+            ObjectFit::Contain => contain,
+            // Shrink to fit like `contain`, but never enlarge past natural size.
+            ObjectFit::ScaleDown => contain.min(1.0),
+            ObjectFit::None => 1.0,
+            ObjectFit::Fill => unreachable!(),
+        };
+        let (fw, fh) = (natural.0 * scale, natural.1 * scale);
+        let tile = Rect {
+            x: dest.x + (dest.width - fw) / 2.0,
+            y: dest.y + (dest.height - fh) / 2.0,
+            width: fw,
+            height: fh,
+        };
+        // `cover` overflows `dest` on one axis and gets cropped by the
+        // intersection; `contain`/`scale-down`/`none` are letterboxed instead,
+        // since `tile` is the smaller of the two rects there.
+        if let Some(clipped) = intersect(tile, dest) {
+            let src = Rect {
+                x: (clipped.x - tile.x) * (natural.0 / fw),
+                y: (clipped.y - tile.y) * (natural.1 / fh),
+                width: clipped.width * (natural.0 / fw),
+                height: clipped.height * (natural.1 / fh),
+            };
+            self.paint_image_region(img, clipped, src);
+        }
+    }
+
+    /// Tile `img` across `rect` per `background-size`/`-position`/`-repeat`.
+    fn paint_background_image(
+        &mut self,
+        img: &DecodedImage,
+        rect: Rect,
+        size: BgSize,
+        position: (BgAxis, BgAxis),
+        repeat: BgRepeat,
+    ) {
+        if rect.width <= 0.0 || rect.height <= 0.0 || img.width == 0 || img.height == 0 {
+            return;
+        }
+        let natural = (img.width as f32, img.height as f32);
+        let (iw, ih) = resolve_bg_size(size, natural, rect);
+        if iw <= 0.0 || ih <= 0.0 {
+            return;
+        }
+        let (ax, ay) = position;
+        let ox = resolve_bg_axis(ax, rect.width, iw);
+        let oy = resolve_bg_axis(ay, rect.height, ih);
+        let (repeat_x, repeat_y) = match repeat {
+            BgRepeat::Repeat => (true, true),
+            BgRepeat::RepeatX => (true, false),
+            BgRepeat::RepeatY => (false, true),
+            BgRepeat::NoRepeat => (false, false),
+        };
+        // Step back from the first tile's offset to the tile that first
+        // touches the box, so a tile only partly inside the top/left edge is
+        // still drawn (just clipped), not skipped.
+        let start_x = if repeat_x { rect.x + ox - (ox / iw).ceil() * iw } else { rect.x + ox };
+        let start_y = if repeat_y { rect.y + oy - (oy / ih).ceil() * ih } else { rect.y + oy };
+        let (scale_x, scale_y) = (natural.0 / iw, natural.1 / ih);
+
+        let mut y = start_y;
+        loop {
+            let mut x = start_x;
+            loop {
+                let tile = Rect { x, y, width: iw, height: ih };
+                if let Some(dest) = intersect(tile, rect) {
+                    let src = Rect {
+                        x: (dest.x - tile.x) * scale_x,
+                        y: (dest.y - tile.y) * scale_y,
+                        width: dest.width * scale_x,
+                        height: dest.height * scale_y,
+                    };
+                    self.paint_image_region(img, dest, src);
+                }
+                x += iw;
+                if !repeat_x || x >= rect.x + rect.width {
+                    break;
+                }
+            }
+            y += ih;
+            if !repeat_y || y >= rect.y + rect.height {
+                break;
+            }
+        }
+    }
+}
+
+/// Resolve `background-size` to a concrete (width, height) in px, given the
+/// image's own natural size and the box it's painted into.
+fn resolve_bg_size(size: BgSize, natural: (f32, f32), rect: Rect) -> (f32, f32) {
+    let (nw, nh) = natural;
+    if nw <= 0.0 || nh <= 0.0 {
+        return (0.0, 0.0);
+    }
+    match size {
+        BgSize::Cover => {
+            let scale = (rect.width / nw).max(rect.height / nh);
+            (nw * scale, nh * scale)
+        }
+        BgSize::Contain => {
+            let scale = (rect.width / nw).min(rect.height / nh);
+            (nw * scale, nh * scale)
+        }
+        BgSize::Auto => (nw, nh),
+        // One axis given, `auto` on the other: keep the image's own aspect ratio.
+        BgSize::Explicit(Some(w), Some(h)) => (w, h),
+        BgSize::Explicit(Some(w), None) => (w, w * nh / nw),
+        BgSize::Explicit(None, Some(h)) => (h * nw / nh, h),
+        BgSize::Explicit(None, None) => (nw, nh),
+    }
+}
+
+/// Resolve one axis of `background-position` against how much room the box
+/// leaves once the (already-sized) image is placed in it.
+fn resolve_bg_axis(axis: BgAxis, box_dim: f32, image_dim: f32) -> f32 {
+    match axis {
+        BgAxis::Percent(f) => (box_dim - image_dim) * f,
+        BgAxis::Px(v) => v,
     }
 }
 
@@ -385,9 +572,14 @@ pub fn paint(
                         canvas.paint_text(frag, fonts);
                     }
                 }
-                DisplayCommand::Image(src, rect) => {
+                DisplayCommand::Image(src, rect, fit) => {
                     if let Some(img) = images.get(src) {
-                        canvas.paint_image(img, *rect);
+                        canvas.paint_fitted_image(img, *rect, *fit);
+                    }
+                }
+                DisplayCommand::BackgroundImage { src, rect, size, position, repeat } => {
+                    if let Some(img) = images.get(src) {
+                        canvas.paint_background_image(img, *rect, *size, *position, *repeat);
                     }
                 }
             }
@@ -489,7 +681,9 @@ fn clip_command(item: DisplayCommand, clip: Rect) -> Option<DisplayCommand> {
             intersect(rect, clip)?;
             DisplayCommand::RoundedColor(color, rect, radius)
         }
-        DisplayCommand::Image(src, rect) => DisplayCommand::Image(src, intersect(rect, clip)?),
+        DisplayCommand::Image(src, rect, fit) => {
+            DisplayCommand::Image(src, intersect(rect, clip)?, fit)
+        }
         DisplayCommand::Text(frag) => {
             let rect = Rect {
                 x: frag.x,
@@ -739,7 +933,31 @@ fn transform(item: DisplayCommand, xf: Xf) -> DisplayCommand {
             blur: blur * xf.scale,
             color,
         },
-        DisplayCommand::Image(src, rect) => DisplayCommand::Image(src, xf.rect(rect)),
+        DisplayCommand::Image(src, rect, fit) => DisplayCommand::Image(src, xf.rect(rect), fit),
+        DisplayCommand::BackgroundImage { src, rect, size, position, repeat } => {
+            // `cover`/`contain`/percentages are resolved from `rect` at paint
+            // time, so they already track a scaled box for free; an explicit
+            // px size/offset was baked in before this transform ran, so it
+            // needs the same scale applied here or it would stay fixed size
+            // while the box around it grows or shrinks.
+            let size = match size {
+                BgSize::Explicit(w, h) => {
+                    BgSize::Explicit(w.map(|v| v * xf.scale), h.map(|v| v * xf.scale))
+                }
+                other => other,
+            };
+            let scale_axis = |axis: BgAxis| match axis {
+                BgAxis::Px(v) => BgAxis::Px(v * xf.scale),
+                percent => percent,
+            };
+            DisplayCommand::BackgroundImage {
+                src,
+                rect: xf.rect(rect),
+                size,
+                position: (scale_axis(position.0), scale_axis(position.1)),
+                repeat,
+            }
+        }
         // Glyphs were shaped at `size`, and their offsets are in those units, so
         // both scale together or the run comes apart.
         DisplayCommand::Text(frag) => DisplayCommand::Text(TextFragment {
@@ -820,7 +1038,11 @@ fn render_own(list: &mut DisplayList, layout_box: &LayoutBox) {
     render_borders(list, layout_box);
     render_outline(list, layout_box);
     if let Some(src) = image_src(layout_box) {
-        list.push(DisplayCommand::Image(src, layout_box.dimensions.content));
+        list.push(DisplayCommand::Image(
+            src,
+            layout_box.dimensions.content,
+            object_fit_of(layout_box),
+        ));
     }
     // Inline element backgrounds sit under their own text but over the block's.
     for inline in &layout_box.inline_boxes {
@@ -863,6 +1085,23 @@ fn render_own(list: &mut DisplayList, layout_box: &LayoutBox) {
     // Text sits above this box's background/borders.
     for frag in &layout_box.text_fragments {
         list.push(DisplayCommand::Text(frag.clone()));
+    }
+}
+
+fn object_fit_of(layout_box: &LayoutBox) -> ObjectFit {
+    let style = match layout_box.box_type {
+        BoxType::BlockNode(s) | BoxType::InlineNode(s) => s,
+        BoxType::AnonymousBlock => return ObjectFit::Fill,
+    };
+    match style.value("object-fit") {
+        Some(Value::Keyword(k)) => match k.as_str() {
+            "contain" => ObjectFit::Contain,
+            "cover" => ObjectFit::Cover,
+            "none" => ObjectFit::None,
+            "scale-down" => ObjectFit::ScaleDown,
+            _ => ObjectFit::Fill,
+        },
+        _ => ObjectFit::Fill,
     }
 }
 
@@ -925,44 +1164,158 @@ fn render_shadow(list: &mut DisplayList, layout_box: &LayoutBox) {
 }
 
 fn render_background(list: &mut DisplayList, layout_box: &LayoutBox) {
-    // A gradient wins over a flat colour, like `background-image` over `background-color`.
-    if let Some(style) = match layout_box.box_type {
-        BoxType::BlockNode(s) | BoxType::InlineNode(s) => Some(s),
-        BoxType::AnonymousBlock => None,
-    } {
-        let spec = style
-            .value("background-image")
-            .or_else(|| style.value("background"))
-            .and_then(|v| match v {
-                Value::Raw(spec) => Some(spec),
-                _ => None,
-            });
-        if let Some(spec) = spec {
-            if let Some((stops, horizontal)) = parse_gradient(&spec) {
-                let rect = layout_box.dimensions.border_box();
-                let radius = border_radius(layout_box, rect);
-                list.push(DisplayCommand::Gradient {
-                    rect,
-                    radius,
-                    stops,
-                    horizontal,
-                });
-                return;
-            }
-        }
-    }
-    let color = match get_color(layout_box, "background")
-        .or_else(|| get_color(layout_box, "background-color"))
-    {
-        Some(c) => c,
-        None => return,
+    let style = match layout_box.box_type {
+        BoxType::BlockNode(s) | BoxType::InlineNode(s) => s,
+        BoxType::AnonymousBlock => return,
     };
     let box_rect = layout_box.dimensions.border_box();
     let radius = border_radius(layout_box, box_rect);
-    if radius > 0.0 {
-        list.push(DisplayCommand::RoundedColor(color, box_rect, radius));
-    } else {
-        list.push(DisplayCommand::SolidColor(color, box_rect));
+
+    let spec = background_spec(style);
+    // A gradient fully covers the box, the same as `background-image` wins
+    // over `background-color` in a real cascade — nothing paints beneath it.
+    if let Some(spec) = &spec {
+        if let Some((stops, horizontal)) = parse_gradient(spec) {
+            list.push(DisplayCommand::Gradient { rect: box_rect, radius, stops, horizontal });
+            return;
+        }
+    }
+    // `background-color` still paints first when there's a `url()` image on
+    // top, so a transparent PNG (or one still loading) shows something.
+    if let Some(color) = get_color(layout_box, "background")
+        .or_else(|| get_color(layout_box, "background-color"))
+    {
+        if radius > 0.0 {
+            list.push(DisplayCommand::RoundedColor(color, box_rect, radius));
+        } else {
+            list.push(DisplayCommand::SolidColor(color, box_rect));
+        }
+    }
+    // ponytail: unlike the solid/gradient paths above, a background image
+    // isn't rounded to the box's `border-radius` — square corners on a
+    // rounded box — matching the same gap `<img>` already has (`Image` isn't
+    // masked either). Needs a per-pixel radius test in `paint_image_region`
+    // to fix for both at once.
+    if let Some(src) = spec.as_deref().and_then(|s| bg_url(s)) {
+        let ctx_w = style.length_context(box_rect.width);
+        let ctx_h = style.length_context(box_rect.height);
+        list.push(DisplayCommand::BackgroundImage {
+            src,
+            rect: box_rect,
+            size: parse_bg_size(style.value("background-size"), ctx_w, ctx_h),
+            position: parse_bg_position(style.value("background-position"), ctx_w, ctx_h),
+            repeat: parse_bg_repeat(style.value("background-repeat")),
+        });
+    }
+}
+
+/// `url(...)` (optionally quoted) out of a `background`/`background-image` spec.
+/// The raw `background-image`/`background` spec text, if either sets a
+/// `url()` or `linear-gradient()` — shared by the paint path below and by
+/// image collection (`lib.rs`), so both agree on what counts as one.
+fn background_spec(style: &crate::style::StyledNode) -> Option<String> {
+    style
+        .value("background-image")
+        .or_else(|| style.value("background"))
+        .and_then(|v| match v {
+            Value::Raw(spec) => Some(spec),
+            _ => None,
+        })
+}
+
+fn bg_url(spec: &str) -> Option<String> {
+    let inner = spec.trim().strip_prefix("url(")?.strip_suffix(')')?;
+    Some(inner.trim().trim_matches(|c| c == '"' || c == '\'').to_string())
+}
+
+/// The `url(...)` this styled node's background paints, if it has one — used
+/// to batch-fetch background images alongside `<img src>` before paint runs.
+pub(crate) fn background_image_src(style: &crate::style::StyledNode) -> Option<String> {
+    background_spec(style).as_deref().and_then(bg_url)
+}
+
+fn parse_bg_repeat(value: Option<Value>) -> BgRepeat {
+    match value {
+        Some(Value::Keyword(k)) => match k.as_str() {
+            "no-repeat" => BgRepeat::NoRepeat,
+            "repeat-x" => BgRepeat::RepeatX,
+            "repeat-y" => BgRepeat::RepeatY,
+            _ => BgRepeat::Repeat,
+        },
+        _ => BgRepeat::Repeat,
+    }
+}
+
+fn parse_bg_size(value: Option<Value>, ctx_w: LengthContext, ctx_h: LengthContext) -> BgSize {
+    let raw = match value {
+        Some(Value::Keyword(k)) => k,
+        Some(Value::Raw(s)) => s,
+        _ => return BgSize::Auto,
+    };
+    let raw = raw.as_str();
+    match raw.trim() {
+        "cover" => return BgSize::Cover,
+        "contain" => return BgSize::Contain,
+        "auto" => return BgSize::Auto,
+        _ => {}
+    }
+    let axis = |t: &str, ctx: LengthContext| -> Option<f32> {
+        (t != "auto").then(|| crate::css::parse_length_token(t, ctx))
+    };
+    match raw.split_whitespace().collect::<Vec<_>>().as_slice() {
+        [w] => BgSize::Explicit(axis(w, ctx_w), None),
+        [w, h] => BgSize::Explicit(axis(w, ctx_w), axis(h, ctx_h)),
+        _ => BgSize::Auto,
+    }
+}
+
+/// A single `background-position` keyword, if it names a fixed edge (`left`,
+/// `top`, ...) rather than a length. `center` is handled by the caller: it is
+/// the same 50% on either axis, so it carries no axis of its own.
+fn position_keyword(token: &str) -> Option<f32> {
+    match token {
+        "left" | "top" => Some(0.0),
+        "right" | "bottom" => Some(1.0),
+        _ => None,
+    }
+}
+
+fn parse_bg_axis(token: &str, ctx: LengthContext) -> BgAxis {
+    if token == "center" {
+        return BgAxis::Percent(0.5);
+    }
+    if let Some(f) = position_keyword(token) {
+        return BgAxis::Percent(f);
+    }
+    if let Some(pct) = token.strip_suffix('%') {
+        if let Ok(v) = pct.trim().parse::<f32>() {
+            return BgAxis::Percent(v / 100.0);
+        }
+    }
+    BgAxis::Px(crate::css::parse_length_token(token, ctx))
+}
+
+fn parse_bg_position(
+    value: Option<Value>,
+    ctx_x: LengthContext,
+    ctx_y: LengthContext,
+) -> (BgAxis, BgAxis) {
+    let top_left = (BgAxis::Percent(0.0), BgAxis::Percent(0.0));
+    let raw = match value {
+        Some(Value::Keyword(k)) => k,
+        Some(Value::Raw(s)) => s,
+        _ => return top_left,
+    };
+    let raw = raw.as_str();
+    match raw.split_whitespace().collect::<Vec<_>>().as_slice() {
+        // A lone `top`/`bottom` names the Y axis and centers X; everything
+        // else (`left`/`right`/`center`/a length) names X and centers Y.
+        [one] if matches!(*one, "top" | "bottom") => {
+            (BgAxis::Percent(0.5), parse_bg_axis(one, ctx_y))
+        }
+        [one] => (parse_bg_axis(one, ctx_x), BgAxis::Percent(0.5)),
+        [x, y] => (parse_bg_axis(x, ctx_x), parse_bg_axis(y, ctx_y)),
+        _ => top_left,
     }
 }
 

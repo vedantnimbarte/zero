@@ -306,6 +306,9 @@ const RAW_VALUE_PROPERTIES: &[&str] = &[
     "grid-template",
     "box-shadow",
     "background-image",
+    // Both can be one or two space-separated tokens (`center bottom`, `50% 50%`).
+    "background-position",
+    "background-size",
     // `overflow: hidden auto` sets the two axes at once.
     "overflow",
     // `translate(-50%, -50%)`, read at paint time.
@@ -608,17 +611,40 @@ fn expand_shorthand(name: &str, raw: &str) -> Option<Vec<Declaration>> {
             )
         }
         "background" => {
+            // ponytail: the `<position> / <size>` slash syntax inside the
+            // shorthand (`center / cover`) is not split out — write
+            // `background-size` as its own declaration instead. Every other
+            // token order this grammar allows is understood.
+            const REPEAT_KEYWORDS: [&str; 6] =
+                ["repeat", "no-repeat", "repeat-x", "repeat-y", "space", "round"];
             let mut out = Vec::new();
+            let mut position_tokens: Vec<&str> = Vec::new();
             for token in &tokens {
                 if token.starts_with("url(") || token.starts_with("linear-gradient(") {
                     out.push(Declaration {
                         name: "background-image".to_string(),
                         value: Value::Raw(token.to_string()),
                     });
+                } else if REPEAT_KEYWORDS.contains(token) {
+                    out.push(Declaration {
+                        name: "background-repeat".to_string(),
+                        value: Value::Keyword(token.to_string()),
+                    });
                 } else if let Some(v @ Value::ColorValue(_)) = classify_value(token) {
                     out.push(Declaration { name: "background-color".to_string(), value: v });
+                } else if matches!(
+                    token.to_ascii_lowercase().as_str(),
+                    "left" | "right" | "top" | "bottom" | "center"
+                ) || matches!(classify_value(token), Some(Value::Length(..)))
+                {
+                    position_tokens.push(token);
                 }
-                // position/size/repeat keywords: no reader yet (Track A6), dropped.
+            }
+            if !position_tokens.is_empty() {
+                out.push(Declaration {
+                    name: "background-position".to_string(),
+                    value: Value::Raw(position_tokens.join(" ")),
+                });
             }
             (!out.is_empty()).then_some(out)
         }
