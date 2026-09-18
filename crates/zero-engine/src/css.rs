@@ -63,12 +63,23 @@ pub enum Combinator {
 
 #[derive(Debug, PartialEq)]
 pub struct SimpleSelector {
+    /// `::before` or `::after`, when the selector is aiming at generated
+    /// content rather than at the element itself.
+    pub pseudo_element: Option<PseudoElement>,
     pub tag_name: Option<String>,
     pub id: Option<String>,
     pub class: Vec<String>,
     pub attrs: Vec<AttrTest>,
     /// `:hover`, `:nth-child(2n)`, `:not(.x)` … all of which must hold.
     pub pseudos: Vec<Pseudo>,
+}
+
+/// A box a rule asks the engine to make, which no element in the document
+/// stands for.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PseudoElement {
+    Before,
+    After,
 }
 
 /// A pseudo-class condition. Unknown ones never reach here — the parser drops
@@ -551,6 +562,9 @@ const RAW_VALUE_PROPERTIES: &[&str] = &[
     // `@font-face`'s file list: `url(a.woff2) format("woff2"), url(a.ttf)`.
     // Nothing classifies as a value, so it would be dropped outright.
     "src",
+    // Generated content: a quoted string, kept exactly as written so an
+    // escape or a leading space survives to be unquoted at use.
+    "content",
 ];
 
 /// The named colours worth carrying, plus `transparent`.
@@ -1206,6 +1220,7 @@ impl Parser {
 
     fn parse_simple_selector(&mut self) -> SimpleSelector {
         let mut selector = SimpleSelector {
+            pseudo_element: None,
             tag_name: None,
             id: None,
             class: Vec::new(),
@@ -1249,11 +1264,23 @@ impl Parser {
     fn parse_pseudo(&mut self, selector: &mut SimpleSelector) -> bool {
         let start = self.pos;
         self.consume_char(); // ':'
-        // `::before` and friends are elements, not classes, and we generate no
-        // content — the rule has to go.
+        // A pseudo-*element* is a box the page is asking the engine to make,
+        // not a condition on this one. `::before`/`::after` carry real content
+        // on real sites — bullets, quote marks, disclosure arrows — so they are
+        // recorded and generated. Anything else is still a selector we would
+        // only half understand, and the rule goes.
         if self.next_char_or('\0') == ':' {
-            self.pos = start;
-            return false;
+            self.consume_char();
+            let name = self.parse_identifier().to_ascii_lowercase();
+            selector.pseudo_element = match name.as_str() {
+                "before" => Some(PseudoElement::Before),
+                "after" => Some(PseudoElement::After),
+                _ => {
+                    self.pos = start;
+                    return false;
+                }
+            };
+            return true;
         }
         let name = self.parse_identifier().to_ascii_lowercase();
         let args = match self.next_char_or('\0') {
@@ -1747,10 +1774,13 @@ mod tests {
              div:has(> p) { color: red; }"
                 .to_string(),
         );
-        // The four we can honour exactly; `::before` and `:has()` are dropped
-        // rather than applied to everything.
-        assert_eq!(s.rules.len(), 4);
+        // The four pseudo-classes we can honour exactly, plus `::before`, which
+        // now names a box to generate rather than being thrown away. `:has()`
+        // is still dropped rather than applied to everything.
+        assert_eq!(s.rules.len(), 5);
         let subject = |i: usize| s.rules[i].selectors[0].subject().unwrap();
+        assert_eq!(subject(4).pseudo_element, Some(PseudoElement::Before));
+        assert_eq!(subject(4).tag_name.as_deref(), Some("p"));
         assert_eq!(subject(0).pseudos, vec![Pseudo::NthChild(2, 1)]);
         assert_eq!(subject(2).pseudos, vec![Pseudo::AttrPresent("checked")]);
         assert_eq!(subject(3).pseudos, vec![Pseudo::Never]);

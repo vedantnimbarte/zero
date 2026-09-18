@@ -1,8 +1,8 @@
 //! Style: match CSS rules to DOM nodes and produce a styled tree (the cascade).
 
 use crate::css::{
-    Combinator, LengthContext, Pseudo, Rule, Selector, SelectorPart, SimpleSelector, Specificity,
-    Stylesheet, Unit, Value, DEFAULT_FONT_SIZE,
+    Combinator, LengthContext, Pseudo, PseudoElement, Rule, Selector, SelectorPart, SimpleSelector,
+    Specificity, Stylesheet, Unit, Value, DEFAULT_FONT_SIZE,
 };
 use crate::dom::{ElementData, Node, NodeType};
 use std::collections::HashMap;
@@ -365,7 +365,7 @@ impl RuleIndex {
 
 /// (specificity, document order, rule) — order breaks specificity ties, so a
 /// bucketed sweep cascades exactly like a linear one.
-type MatchedRule<'a> = (Specificity, usize, &'a Rule);
+type MatchedRule<'a> = (Specificity, usize, &'a Rule, Option<PseudoElement>);
 
 fn match_rule<'a>(
     cursor: &Cursor<ElementData>,
@@ -377,7 +377,13 @@ fn match_rule<'a>(
     rule.selectors
         .iter()
         .find(|selector| matches(cursor, ancestors, selector, hovered))
-        .map(|selector| (selector.specificity(), order, rule))
+        .map(|selector| {
+            // Which selector matched decides whether these declarations style
+            // the element or a box generated beside it — `p::before, div { }`
+            // is one rule doing both.
+            let generated = selector.parts.last().and_then(|p| p.simple.pseudo_element);
+            (selector.specificity(), order, rule, generated)
+        })
 }
 
 fn matching_rules<'a>(
@@ -407,10 +413,18 @@ fn specified_values(
     let mut rules = matching_rules(cursor, ancestors, stylesheet, index, hovered);
     // Apply low specificity first so high specificity overrides it, and let
     // document order settle ties.
-    rules.sort_by(|&(a, ai, _), &(b, bi, _)| a.cmp(&b).then(ai.cmp(&bi)));
-    for (_, _, rule) in rules {
+    rules.sort_by(|&(a, ai, ..), &(b, bi, ..)| a.cmp(&b).then(ai.cmp(&bi)));
+    for (_, _, rule, generated) in rules {
+        // A `::before` rule styles a box that does not exist yet, so its
+        // declarations are kept aside under a name no property can collide
+        // with rather than applied to the element they were hung off.
+        let prefix = match generated {
+            Some(PseudoElement::Before) => "::before:",
+            Some(PseudoElement::After) => "::after:",
+            None => "",
+        };
         for declaration in &rule.declarations {
-            values.insert(declaration.name.clone(), declaration.value.clone());
+            values.insert(format!("{prefix}{}", declaration.name), declaration.value.clone());
         }
     }
     // An inline `style` attribute is the last word in the cascade, whatever any

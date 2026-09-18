@@ -2155,6 +2155,41 @@ p { color: #0000ff }", &Sheets, &mut out, 0);
     }
 
     #[test]
+    fn a_pseudo_element_rule_is_kept_for_its_own_box_and_not_applied_to_the_element() {
+        // These rules used to be dropped whole, which is why bullets, quote
+        // marks and disclosure arrows were simply absent. They are kept now —
+        // under a name no property can collide with, so that a `::before`'s
+        // `content` and `color` never land on the element they hang off.
+        let sheet = crate::css::parse(
+            "li::before { content: '\\2022  '; color: #ff0000; } li { color: #00ff00; }"
+                .to_string(),
+        );
+        assert_eq!(sheet.rules.len(), 2, "the pseudo rule is no longer thrown away");
+
+        let dom = crate::html::parse("<body><li>x</li></body>".to_string());
+        let styled = crate::style::style_tree(&dom, &sheet);
+        fn find<'a>(
+            node: &'a crate::style::StyledNode<'a>,
+            tag: &str,
+        ) -> Option<&'a crate::style::StyledNode<'a>> {
+            if let crate::dom::NodeType::Element(ref e) = node.node.node_type {
+                if e.tag_name == tag {
+                    return Some(node);
+                }
+            }
+            node.children.iter().find_map(|c| find(c, tag))
+        }
+        let li = find(&styled, "li").expect("the list item");
+        assert!(li.value("::before:content").is_some());
+        assert!(li.value("content").is_none(), "content must not leak onto the element");
+        // The element keeps its *own* colour, not the pseudo-element's.
+        assert_eq!(
+            li.value("color"),
+            Some(crate::css::Value::ColorValue(crate::Color { r: 0, g: 255, b: 0, a: 255 }))
+        );
+    }
+
+    #[test]
     fn a_sticky_box_waits_where_flow_put_it_and_is_then_pinned() {
         let engine = super::Engine::shapes_only();
         let css = "body { margin: 0; }
