@@ -1,10 +1,17 @@
-//! `localStorage` for pages, partitioned by site.
+//! `localStorage` and `sessionStorage` for pages, partitioned by origin.
 //!
-//! Each site gets its own file, so one origin can never read another's keys —
-//! the same partitioning rule the cookie jar follows.
+//! Each origin gets its own file, so one can never read another's keys.
+//! Deliberately *not* the cookie jar's rule: a cookie is scoped by host and
+//! one set over https is readable over http, but a storage area is scoped by
+//! scheme, host and port together. Sharing an area across schemes would let
+//! anything able to tamper with a plain-HTTP page read and rewrite what the
+//! secure origin stored.
 //!
-//! ponytail: written eagerly on every `setItem` (fine at these sizes) and
-//! unbounded — no quota is enforced. Encrypted at rest via [`crate::crypto`].
+//! Both areas are capped at [`QUOTA`]; a write past it is refused so the
+//! caller can raise the `QuotaExceededError` the web throws, rather than
+//! dropping data a page believes it saved. `localStorage` is written eagerly
+//! on every `setItem` (fine at these sizes) and encrypted at rest via
+//! [`crate::crypto`]; `sessionStorage` never reaches disk at all.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -265,7 +272,7 @@ impl Stores {
 /// per `Document`, and a fresh process per web page — and the whole point of
 /// `sessionStorage` is that it survives exactly that and nothing more.
 ///
-/// ponytail: unbounded, like [`SiteStore`]. Never touches disk, so there is
+/// Capped at [`QUOTA`], like [`SiteStore`]. Never touches disk, so there is
 /// nothing to encrypt and nothing to clean up.
 #[derive(Default)]
 pub struct TabSessions {
