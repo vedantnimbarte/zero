@@ -687,7 +687,7 @@ fn expand_background_shorthand(raw: &str) -> Option<Vec<Declaration>> {
 /// Like `str::split_whitespace`, but text inside a balanced `(...)` counts as
 /// one token even if it has spaces of its own — `rgb(0 0 0 / 50%)`,
 /// `linear-gradient(to right, red, blue)`.
-fn split_top_level_whitespace(s: &str) -> Vec<&str> {
+pub(crate) fn split_top_level_whitespace(s: &str) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut depth = 0;
     let mut start: Option<usize> = None;

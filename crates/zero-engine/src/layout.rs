@@ -620,8 +620,9 @@ impl<'a> LayoutBox<'a> {
             _ => Default::default(),
         };
 
-        // Assign every in-flow item a (row, column, span), honouring `grid-column`.
-        let mut placements: Vec<(usize, usize, usize, usize)> = Vec::new(); // (index,row,col,span)
+        // Assign every in-flow item a (row, column, colspan, rowspan), honouring
+        // `grid-column`/`grid-row`.
+        let mut placements: Vec<(usize, usize, usize, usize, usize)> = Vec::new();
         let mut occupied: Vec<Vec<bool>> = Vec::new();
         let (mut row, mut col) = (0usize, 0usize);
 
@@ -629,41 +630,69 @@ impl<'a> LayoutBox<'a> {
             if self.children[index].is_out_of_flow() {
                 continue;
             }
-            // A named area pins the item outright; otherwise fall back to
-            // `grid-column` and auto-placement.
+            // A named area pins the item outright (columns only — see
+            // `parse_grid_areas`); otherwise fall back to `grid-column`/
+            // `grid-row` and auto-placement.
             let placed_area = match self.children[index].box_type {
                 BoxType::AnonymousBlock => None,
                 _ => named_area(self.children[index].get_style_node(), &areas),
             };
-            let (explicit_col, span) = match placed_area {
+            let (explicit_col, colspan, explicit_row, rowspan) = match placed_area {
                 Some((area_row, area_col, area_span)) => {
-                    row = area_row;
-                    (Some(area_col), area_span)
+                    (Some(area_col), area_span, Some(area_row), 1)
                 }
                 None => match self.children[index].box_type {
-                    BoxType::AnonymousBlock => (None, 1),
-                    _ => parse_grid_span(self.children[index].get_style_node(), columns.len()),
+                    BoxType::AnonymousBlock => (None, 1, None, 1),
+                    _ => {
+                        let style = self.children[index].get_style_node();
+                        let (c, cspan) = parse_grid_span(style, "grid-column", columns.len());
+                        // Rows have no fixed track count to bound a start line
+                        // against, unlike columns.
+                        let (r, rspan) = parse_grid_span(style, "grid-row", usize::MAX);
+                        (c, cspan, r, rspan)
+                    }
                 },
             };
-            let span = span.clamp(1, columns.len());
+            let colspan = colspan.clamp(1, columns.len());
+            let rowspan = rowspan.max(1);
 
-            // Find the next free slot that fits the span.
+            // A fully explicit row is pinned outright — nothing to search for.
+            if let Some(r) = explicit_row {
+                while occupied.len() < r + rowspan {
+                    occupied.push(vec![false; columns.len()]);
+                }
+                let c = explicit_col
+                    .unwrap_or(0)
+                    .min(columns.len().saturating_sub(colspan));
+                for rr in r..r + rowspan {
+                    for cc in c..(c + colspan).min(columns.len()) {
+                        occupied[rr][cc] = true;
+                    }
+                }
+                placements.push((index, r, c, colspan, rowspan));
+                continue;
+            }
+
+            // Otherwise, search forward from the auto-placement cursor —
+            // a spanning item reserves that many rows going forward.
             loop {
-                while occupied.len() <= row {
+                while occupied.len() < row + rowspan {
                     occupied.push(vec![false; columns.len()]);
                 }
                 let start = explicit_col.unwrap_or(col);
-                let fits = start + span <= columns.len()
-                    && (start..start + span).all(|c| !occupied[row][c]);
+                let fits = start + colspan <= columns.len()
+                    && (row..row + rowspan).all(|r| (start..start + colspan).all(|c| !occupied[r][c]));
                 if fits {
-                    for c in start..start + span {
-                        occupied[row][c] = true;
+                    for r in row..row + rowspan {
+                        for c in start..start + colspan {
+                            occupied[r][c] = true;
+                        }
                     }
-                    placements.push((index, row, start, span));
+                    placements.push((index, row, start, colspan, rowspan));
                     col = if explicit_col.is_some() {
                         col
                     } else {
-                        start + span
+                        start + colspan
                     };
                     if col >= columns.len() {
                         row += 1;
@@ -674,16 +703,18 @@ impl<'a> LayoutBox<'a> {
                 // Slot taken or item too wide for the remainder: try the next row.
                 row += 1;
                 col = 0;
-                if explicit_col.is_none() && span > columns.len() {
+                if explicit_col.is_none() && colspan > columns.len() {
                     break; // cannot ever fit
                 }
             }
         }
 
-        // Lay each item out in its cell, then size rows to their tallest member.
+        // Lay each item out in its cell, then size rows to their tallest
+        // single-row member — a spanning item is attributed to the rows it
+        // covers only once their own heights are known, below.
         let mut row_heights: Vec<f32> = vec![0.0; occupied.len()];
-        for &(index, r, c, span) in &placements {
-            let width = columns[c..c + span].iter().sum::<f32>() + gap * (span - 1) as f32;
+        for &(index, r, c, colspan, rowspan) in &placements {
+            let width = columns[c..c + colspan].iter().sum::<f32>() + gap * (colspan - 1) as f32;
             let x = container.x + columns[..c].iter().sum::<f32>() + gap * c as f32;
             let mut slot: Dimensions = Default::default();
             slot.content = Rect {
@@ -693,9 +724,11 @@ impl<'a> LayoutBox<'a> {
                 height: 0.0,
             };
             self.children[index].layout(slot, fonts, images);
-            let h = self.children[index].dimensions.margin_box().height;
-            if r < row_heights.len() {
-                row_heights[r] = row_heights[r].max(h);
+            if rowspan == 1 {
+                let h = self.children[index].dimensions.margin_box().height;
+                if r < row_heights.len() {
+                    row_heights[r] = row_heights[r].max(h);
+                }
             }
         }
         for (r, height) in row_heights.iter_mut().enumerate() {
@@ -705,11 +738,23 @@ impl<'a> LayoutBox<'a> {
                 }
             }
         }
+        // A spanning item only needs the rows it covers to add up to its
+        // height — grow the last covered row if they don't, the same
+        // attribution `layout_table_children` uses for a rowspan cell.
+        for &(index, r, _, _, rowspan) in placements.iter().filter(|p| p.4 > 1) {
+            let last = (r + rowspan - 1).min(row_heights.len().saturating_sub(1));
+            let covered: f32 =
+                row_heights[r..=last].iter().sum::<f32>() + gap * (last - r) as f32;
+            let needed = self.children[index].dimensions.margin_box().height;
+            if needed > covered {
+                row_heights[last] += needed - covered;
+            }
+        }
 
         // Re-run each item now that its row's y position is known.
-        for &(index, r, c, span) in &placements {
+        for &(index, r, c, colspan, rowspan) in &placements {
             let y = container.y + row_heights[..r].iter().sum::<f32>() + gap * r as f32;
-            let width = columns[c..c + span].iter().sum::<f32>() + gap * (span - 1) as f32;
+            let width = columns[c..c + colspan].iter().sum::<f32>() + gap * (colspan - 1) as f32;
             let x = container.x + columns[..c].iter().sum::<f32>() + gap * c as f32;
             let mut slot: Dimensions = Default::default();
             slot.content = Rect {
@@ -719,7 +764,17 @@ impl<'a> LayoutBox<'a> {
                 height: 0.0,
             };
             self.children[index].layout(slot, fonts, images);
-            if let Some(explicit) = row_sizes.get(r) {
+            let last = (r + rowspan - 1).min(row_heights.len().saturating_sub(1));
+            if rowspan > 1 {
+                // Nothing else sizes a spanning item to the rows it covers —
+                // a single-row item gets there via its own row's height, but
+                // a span has no one row to pull that from.
+                let covered: f32 =
+                    row_heights[r..=last].iter().sum::<f32>() + gap * (last - r) as f32;
+                self.children[index].dimensions.content.height = covered
+                    - self.children[index].dimensions.padding.top
+                    - self.children[index].dimensions.padding.bottom;
+            } else if let Some(explicit) = row_sizes.get(r) {
                 if *explicit > 0.0 {
                     self.children[index].dimensions.content.height = *explicit
                         - self.children[index].dimensions.padding.top
@@ -1916,9 +1971,6 @@ fn align_cross_axis(
     }
 }
 
-/// Read `grid-column` as (zero-based start, span).
-///
-/// Accepts `span N`, `A / B`, `A / span N`, and a bare line number `A`.
 #[derive(Clone, Copy, PartialEq)]
 enum Axis {
     Rows,
@@ -1985,8 +2037,11 @@ fn named_area(style: &StyledNode, areas: &std::collections::HashMap<String, Area
     }
 }
 
-fn parse_grid_span(style: &StyledNode, columns: usize) -> (Option<usize>, usize) {
-    let spec = match style.value("grid-column") {
+/// Read `grid-column` or `grid-row` as (zero-based start, span). `track_count`
+/// bounds a valid start line — pass `usize::MAX` for `grid-row`, since rows
+/// have no fixed count the way `grid-template-columns` gives columns one.
+fn parse_grid_span(style: &StyledNode, property: &str, track_count: usize) -> (Option<usize>, usize) {
+    let spec = match style.value(property) {
         Some(Value::Raw(spec)) => spec,
         Some(Value::Number(n)) => return (Some((n as usize).saturating_sub(1)), 1),
         _ => return (None, 1),
@@ -2007,7 +2062,7 @@ fn parse_grid_span(style: &StyledNode, columns: usize) -> (Option<usize>, usize)
     };
     let start = start
         .map(|line| line.saturating_sub(1))
-        .filter(|s| *s < columns);
+        .filter(|s| *s < track_count);
     (start, span.max(1))
 }
 
@@ -2021,18 +2076,46 @@ pub fn resolve_tracks(spec: &str, available: f32, gap: f32, ctx: LengthContext) 
     while !rest.is_empty() {
         // Flatten `repeat(count, pattern)` into plain tokens.
         if let Some(after) = rest.strip_prefix("repeat(") {
-            if let Some(close) = after.find(')') {
+            // Depth-aware: `after.find(')')` would stop at the *first* `)` —
+            // the one closing a nested `minmax(...)`, not repeat's own — and
+            // leave the pattern truncated.
+            if let Some(close) = find_matching_close_paren(after) {
                 let (inside, tail) = after.split_at(close);
                 let mut parts = inside.splitn(2, ',');
-                let count = parts
-                    .next()
-                    .unwrap_or("")
-                    .trim()
-                    .parse::<usize>()
-                    .unwrap_or(0);
-                let pattern: Vec<&str> = parts.next().unwrap_or("").split_whitespace().collect();
+                let count_spec = parts.next().unwrap_or("").trim();
+                // Paren-aware: a plain whitespace split would tear
+                // `minmax(200px, 1fr)` apart at its own internal comma-space.
+                let pattern: Vec<&str> =
+                    crate::css::split_top_level_whitespace(parts.next().unwrap_or(""));
+                let count = match count_spec {
+                    "auto-fit" | "auto-fill" => {
+                        // As many copies of the pattern as fit the available
+                        // space, sized by its own minimum track size.
+                        //
+                        // ponytail: `auto-fit` and `auto-fill` are sized
+                        // identically — real `auto-fit` additionally collapses
+                        // *empty* trailing tracks when there are fewer grid
+                        // items than columns, which needs the item count this
+                        // function never receives. Covers the common case
+                        // (enough items to fill every computed column).
+                        let pattern_min: f32 =
+                            pattern.iter().map(|t| track_min_size(t, ctx)).sum();
+                        let pattern_gap = gap * pattern.len().saturating_sub(1) as f32;
+                        let span = pattern_min + pattern_gap + gap; // plus the gap before a repeat
+                        if span > 0.0 {
+                            (((available + gap) / span).floor() as usize).max(1)
+                        } else {
+                            1
+                        }
+                    }
+                    _ => count_spec.parse::<usize>().unwrap_or(0),
+                };
+                // `minmax(min, max)` inside the pattern sizes as its max, same
+                // as a bare `minmax()` track does below — the tracks this
+                // produces must be plain lengths/`fr` units, since that's all
+                // the flattened `tokens` list is ever read back as.
                 for _ in 0..count.min(1000) {
-                    tokens.extend(pattern.iter().map(|p| p.to_string()));
+                    tokens.extend(pattern.iter().map(|p| minmax_max(p).to_string()));
                 }
                 rest = tail[1..].trim_start();
                 continue;
@@ -2091,6 +2174,49 @@ pub fn resolve_tracks(spec: &str, available: f32, gap: f32, ctx: LengthContext) 
             None => fixed[i],
         })
         .collect()
+}
+
+/// The index of the `)` matching an already-consumed `(`, honouring any
+/// parens nested inside (`repeat(3, minmax(100px, 1fr))`'s own close, not
+/// `minmax(...)`'s).
+fn find_matching_close_paren(s: &str) -> Option<usize> {
+    let mut depth = 1;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// `minmax(min, max)`'s max argument, which is what a track resolves to — or
+/// the token itself, unchanged, if it isn't a `minmax()`.
+fn minmax_max(token: &str) -> &str {
+    match token.strip_prefix("minmax(").and_then(|s| s.strip_suffix(')')) {
+        Some(inside) => inside.rsplit(',').next().unwrap_or("").trim(),
+        None => token,
+    }
+}
+
+/// A track's own minimum size, for counting how many `auto-fit`/`auto-fill`
+/// repetitions fit — `minmax(min, max)`'s first argument, or the token's own
+/// length if it isn't a `minmax()` (an `fr` token has no defined floor here,
+/// so it contributes 0 and doesn't limit the count).
+fn track_min_size(token: &str, ctx: LengthContext) -> f32 {
+    if let Some(after) = token.strip_prefix("minmax(") {
+        if let Some(inner) = after.strip_suffix(')') {
+            let min = inner.split(',').next().unwrap_or("").trim();
+            return parse_track_length(min, ctx);
+        }
+    }
+    parse_track_length(token, ctx)
 }
 
 fn parse_track_length(token: &str, ctx: LengthContext) -> f32 {
@@ -2591,6 +2717,31 @@ mod tests {
     }
 
     #[test]
+    fn auto_fill_and_auto_fit_repeat_as_many_tracks_as_fit() {
+        let ctx = crate::css::LengthContext::default();
+        // Each track needs at least 200px; 600px fits exactly 3, each then
+        // sharing the space evenly as its own `1fr` maximum.
+        assert_eq!(
+            resolve_tracks("repeat(auto-fill, minmax(200px, 1fr))", 600.0, 0.0, ctx),
+            vec![200.0, 200.0, 200.0]
+        );
+        assert_eq!(
+            resolve_tracks("repeat(auto-fit, minmax(200px, 1fr))", 600.0, 0.0, ctx),
+            vec![200.0, 200.0, 200.0]
+        );
+        // A tighter space fits fewer, wider tracks.
+        assert_eq!(
+            resolve_tracks("repeat(auto-fill, minmax(200px, 1fr))", 450.0, 0.0, ctx),
+            vec![225.0, 225.0]
+        );
+        // Never fewer than one column, even if nothing fits at its minimum.
+        assert_eq!(
+            resolve_tracks("repeat(auto-fill, minmax(200px, 1fr))", 50.0, 0.0, ctx),
+            vec![50.0]
+        );
+    }
+
+    #[test]
     fn span_width_absorbs_the_gaps_it_covers() {
         let widths = [100.0, 150.0, 200.0];
         assert_eq!(span_width(&widths, 0, 1, 10.0), 100.0);
@@ -2730,6 +2881,51 @@ mod tests {
         assert_eq!(ys[3], 50.0, "second row starts below a 50px first row");
         // The container must report both rows, or following content overlaps it.
         assert_eq!(laid.dimensions.content.height, 100.0);
+    }
+
+    #[test]
+    fn grid_row_span_covers_multiple_rows_and_explicit_row_pins_placement() {
+        let node = dom::elem("div".into(), HashMap::new(), vec![]);
+        let cell = |grid_column: &str, grid_row: &str, height: f32| {
+            let mut v = HashMap::new();
+            v.insert("display".to_string(), Value::Keyword("block".into()));
+            v.insert("height".to_string(), Value::Length(height, Unit::Px));
+            v.insert("grid-column".to_string(), Value::Raw(grid_column.to_string()));
+            v.insert("grid-row".to_string(), Value::Raw(grid_row.to_string()));
+            StyledNode { node: &node, specified_values: v, children: vec![] }
+        };
+        let mut values = HashMap::new();
+        values.insert("display".to_string(), Value::Keyword("grid".into()));
+        values.insert(
+            "grid-template-columns".to_string(),
+            Value::Raw("repeat(2, 1fr)".to_string()),
+        );
+        let root = StyledNode {
+            node: &node,
+            specified_values: values,
+            children: vec![
+                cell("1", "span 2", 130.0), // column 0, rows 0-1
+                cell("2", "1", 40.0),       // column 1, row 0 (explicit)
+                cell("2", "2", 40.0),       // column 1, row 1 (explicit)
+            ],
+        };
+        let mut viewport: Dimensions = Default::default();
+        viewport.content.width = 200.0; // 2 columns of 100
+
+        let laid = layout_tree(&root, viewport, None, &ImageMap::new());
+        let xs: Vec<f32> = laid.children.iter().map(|c| c.dimensions.content.x).collect();
+        let ys: Vec<f32> = laid.children.iter().map(|c| c.dimensions.content.y).collect();
+        let heights: Vec<f32> =
+            laid.children.iter().map(|c| c.dimensions.content.height).collect();
+
+        // `grid-row` pins the explicit items to their own row/column.
+        assert_eq!(xs, vec![0.0, 100.0, 100.0]);
+        assert_eq!(ys, vec![0.0, 0.0, 40.0], "row 1 starts where row 0 (sized by item 1) ends");
+        // The spanning item keeps its own requested height, which is taller
+        // than the two rows it covers (40 + 40 = 80) — the extra 50px grows
+        // the last row it spans, the way a table's rowspan cell does.
+        assert_eq!(heights[0], 130.0);
+        assert_eq!(laid.dimensions.content.height, 130.0);
     }
 
     #[test]
