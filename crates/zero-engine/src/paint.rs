@@ -777,7 +777,7 @@ fn child_clip(layout_box: &LayoutBox, clip: Rect, xf: Xf) -> Option<Rect> {
 fn has_explicit_height(style: &crate::style::StyledNode) -> bool {
     ["height", "max-height"]
         .iter()
-        .any(|name| matches!(style.value(name), Some(Value::Length(..))))
+        .any(|name| matches!(style.value(name), Some(Value::Length(..) | Value::Calc(..))))
 }
 
 /// `visibility: hidden` — the box and its text are not painted, though a
@@ -1676,7 +1676,9 @@ fn render_outline(list: &mut DisplayList, layout_box: &LayoutBox) {
         _ => {}
     }
     let width = match style.value("outline-width") {
-        Some(v @ (Value::Length(..) | Value::Number(_))) => v.resolve(style.length_context(0.0)),
+        Some(v @ (Value::Length(..) | Value::Number(_) | Value::Calc(..))) => {
+            v.resolve(style.length_context(0.0))
+        }
         _ => return,
     };
     if width <= 0.0 {

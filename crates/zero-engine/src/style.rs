@@ -50,7 +50,9 @@ impl<'a> StyledNode<'a> {
         let font_size = self.font_size();
         match self.specified_values.get("line-height") {
             Some(Value::Number(n)) => n * font_size,
-            Some(v @ Value::Length(..)) => v.resolve(self.length_context(font_size)),
+            Some(v @ (Value::Length(..) | Value::Calc(..))) => {
+                v.resolve(self.length_context(font_size))
+            }
             _ => font_size * 1.25, // absent, or a keyword (`normal`) we don't special-case
         }
     }

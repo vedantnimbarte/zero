@@ -146,6 +146,155 @@ pub enum Value {
     /// A multi-value declaration kept verbatim (e.g. a grid track list), for
     /// properties whose grammar the generic classifier can't express.
     Raw(String),
+    /// `calc(...)`, kept as an expression tree rather than reduced to a
+    /// single `Length` — a mixed-unit expression (`calc(100% - 20px)`) has no
+    /// single `(magnitude, unit)` it could be, since resolving the `%` needs
+    /// a containing block that isn't known until layout. Each leaf resolves
+    /// through the same [`Value::resolve`] every other length already goes
+    /// through, so the units only ever mix at the very end, in px.
+    Calc(Box<CalcExpr>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum CalcOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum CalcExpr {
+    Value(Box<Value>),
+    Op(Box<CalcExpr>, CalcOp, Box<CalcExpr>),
+}
+
+fn resolve_calc(expr: &CalcExpr, ctx: LengthContext) -> f32 {
+    match expr {
+        CalcExpr::Value(v) => v.resolve(ctx),
+        CalcExpr::Op(l, op, r) => {
+            let (l, r) = (resolve_calc(l, ctx), resolve_calc(r, ctx));
+            match op {
+                CalcOp::Add => l + r,
+                CalcOp::Sub => l - r,
+                CalcOp::Mul => l * r,
+                CalcOp::Div if r != 0.0 => l / r,
+                CalcOp::Div => 0.0,
+            }
+        }
+    }
+}
+
+/// A `calc(...)` expression parser: `<sum> = <product> ([+|-] <product>)*`,
+/// `<product> = <value> ([*|/] <value>)*`, `<value>` a number/length/
+/// percentage, a parenthesized `<sum>`, or a nested `calc(<sum>)`.
+struct CalcParser {
+    chars: Vec<char>,
+    pos: usize,
+}
+
+impl CalcParser {
+    fn new(s: &str) -> CalcParser {
+        CalcParser { chars: s.chars().collect(), pos: 0 }
+    }
+
+    fn skip_ws(&mut self) {
+        while matches!(self.chars.get(self.pos), Some(c) if c.is_whitespace()) {
+            self.pos += 1;
+        }
+    }
+
+    fn peek(&self) -> Option<char> {
+        self.chars.get(self.pos).copied()
+    }
+
+    fn parse_sum(&mut self) -> Option<CalcExpr> {
+        let mut left = self.parse_product()?;
+        loop {
+            self.skip_ws();
+            let op = match self.peek() {
+                Some('+') => CalcOp::Add,
+                Some('-') => CalcOp::Sub,
+                _ => break,
+            };
+            self.pos += 1;
+            self.skip_ws();
+            let right = self.parse_product()?;
+            left = CalcExpr::Op(Box::new(left), op, Box::new(right));
+        }
+        Some(left)
+    }
+
+    fn parse_product(&mut self) -> Option<CalcExpr> {
+        let mut left = self.parse_value()?;
+        loop {
+            self.skip_ws();
+            let op = match self.peek() {
+                Some('*') => CalcOp::Mul,
+                Some('/') => CalcOp::Div,
+                _ => break,
+            };
+            self.pos += 1;
+            self.skip_ws();
+            let right = self.parse_value()?;
+            left = CalcExpr::Op(Box::new(left), op, Box::new(right));
+        }
+        Some(left)
+    }
+
+    fn parse_value(&mut self) -> Option<CalcExpr> {
+        self.skip_ws();
+        if self.peek() == Some('(') {
+            self.pos += 1;
+            let inner = self.parse_sum()?;
+            self.skip_ws();
+            if self.peek() == Some(')') {
+                self.pos += 1;
+            }
+            return Some(inner);
+        }
+        if self.chars[self.pos..].starts_with(&['c', 'a', 'l', 'c', '(']) {
+            self.pos += 5;
+            let inner = self.parse_sum()?;
+            self.skip_ws();
+            if self.peek() == Some(')') {
+                self.pos += 1;
+            }
+            return Some(inner);
+        }
+        // A leading `-` here is a sign, not the binary operator (`parse_sum`
+        // already consumed that one and the whitespace after it).
+        let negate = self.peek() == Some('-');
+        if negate {
+            self.pos += 1;
+        }
+        let start = self.pos;
+        while let Some(c) = self.peek() {
+            if matches!(c, '+' | '-' | '*' | '/' | '(' | ')') || c.is_whitespace() {
+                break;
+            }
+            self.pos += 1;
+        }
+        let token: String = self.chars[start..self.pos].iter().collect();
+        if token.is_empty() {
+            return None;
+        }
+        let value = match classify_value(&token)? {
+            Value::Length(n, u) if negate => Value::Length(-n, u),
+            Value::Number(n) if negate => Value::Number(-n),
+            other => other,
+        };
+        Some(CalcExpr::Value(Box::new(value)))
+    }
+}
+
+/// `calc(...)`'s inner text (already stripped of the outer `calc(`/`)`) into
+/// an expression tree, or `None` if it doesn't parse as one.
+fn parse_calc(inner: &str) -> Option<CalcExpr> {
+    let mut parser = CalcParser::new(inner);
+    let expr = parser.parse_sum()?;
+    parser.skip_ws();
+    (parser.pos == parser.chars.len()).then_some(expr)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -222,6 +371,7 @@ impl Value {
             Value::Length(v, Unit::Rem) => v * ctx.root_font_size,
             Value::Length(v, Unit::Percent) => v / 100.0 * ctx.percent_base,
             Value::Number(n) => n,
+            Value::Calc(ref expr) => resolve_calc(expr, ctx),
             _ => 0.0,
         }
     }
@@ -504,6 +654,9 @@ fn classify_value(s: &str) -> Option<Value> {
     if let Some(hex) = s.strip_prefix('#') {
         return parse_hex_color(hex);
     }
+    if let Some(inner) = s.strip_prefix("calc(").and_then(|rest| rest.strip_suffix(')')) {
+        return parse_calc(inner).map(|expr| Value::Calc(Box::new(expr)));
+    }
     if s.contains('(') && !s.starts_with("linear-gradient(") {
         if let Some(color) = parse_color_function(s) {
             return Some(color);
@@ -557,7 +710,9 @@ fn border_like_longhands(
     let mut style = None;
     for token in tokens {
         match classify_value(token) {
-            Some(v @ (Value::Length(..) | Value::Number(_))) if width.is_none() => width = Some(v),
+            Some(v @ (Value::Length(..) | Value::Number(_) | Value::Calc(..))) if width.is_none() => {
+                width = Some(v)
+            }
             Some(v @ Value::ColorValue(_)) if color.is_none() => color = Some(v),
             Some(v @ Value::Keyword(_)) if style.is_none() => style = Some(v),
             _ => {}
@@ -1406,6 +1561,32 @@ mod tests {
         assert_eq!(Value::Length(50.0, Unit::Percent).resolve(ctx), 400.0);
         assert_eq!(Value::Length(1.5, Unit::Em).resolve(ctx), 30.0);
         assert_eq!(Value::Length(2.0, Unit::Rem).resolve(ctx), 32.0);
+    }
+
+    #[test]
+    fn calc_mixes_units_by_resolving_each_side_in_context() {
+        let ctx = LengthContext {
+            percent_base: 800.0,
+            font_size: 20.0,
+            root_font_size: 16.0,
+        };
+        // The canonical use: a sidebar-adjacent width. Neither side alone can
+        // be one Value::Length, since resolving the % needs a context that
+        // isn't known until each side is resolved separately, here.
+        assert_eq!(
+            classify_value("calc(100% - 250px)").unwrap().resolve(ctx),
+            800.0 - 250.0
+        );
+        // Precedence: * binds tighter than -.
+        assert_eq!(classify_value("calc(10px + 2 * 5px)").unwrap().resolve(ctx), 20.0);
+        // Parens override precedence, and nesting works.
+        assert_eq!(classify_value("calc((10px + 2px) * 3)").unwrap().resolve(ctx), 36.0);
+        // A unary minus on a term, not just a binary subtraction.
+        assert_eq!(classify_value("calc(100px + -20px)").unwrap().resolve(ctx), 80.0);
+        // Division.
+        assert_eq!(classify_value("calc(100px / 4)").unwrap().resolve(ctx), 25.0);
+        // Garbage inside calc() must not silently become some other value.
+        assert!(classify_value("calc(100px +)").is_none());
     }
 
     #[test]

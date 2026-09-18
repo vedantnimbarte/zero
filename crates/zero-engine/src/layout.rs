@@ -891,7 +891,7 @@ impl<'a> LayoutBox<'a> {
                         let style = self.children[index].get_style_node();
                         let ctx = style.length_context(max_width);
                         match style.value("width") {
-                            Some(v @ Value::Length(..)) => {
+                            Some(v @ (Value::Length(..) | Value::Calc(..))) => {
                                 v.resolve(ctx) + horizontal_edges(style, ctx)
                             }
                             // `fonts` is already unwrapped in this scope.
@@ -1202,7 +1202,10 @@ impl<'a> LayoutBox<'a> {
         // sizing; subtract the edges once here so the rest of this function —
         // written for content-box — never has to know the difference.
         let to_content = |px: f32| if border_box { (px - edges).max(0.0) } else { px };
-        if let Value::Length(..) = width {
+        // `calc()` normalizes to a resolved px length here too, same as a
+        // plain `Length` — everything downstream only ever needs to compare
+        // against `auto` or read an already-resolved px value.
+        if matches!(width, Value::Length(..) | Value::Calc(..)) {
             width = Value::Length(to_content(width.resolve(ctx)), Unit::Px);
         }
         let min_width = style.value("min-width").map(|v| to_content(v.resolve(ctx)));
@@ -1478,7 +1481,7 @@ impl<'a> LayoutBox<'a> {
                         .value("flex-basis")
                         .filter(|v| !matches!(v, Value::Keyword(k) if k == "auto"));
                     let base = match explicit_basis.or_else(|| style.value("width")) {
-                        Some(v @ Value::Length(..)) => {
+                        Some(v @ (Value::Length(..) | Value::Calc(..))) => {
                             v.resolve(ctx) + horizontal_edges(style, ctx)
                         }
                         _ => max_content_width(style, fonts, images).min(container.width),
@@ -1661,7 +1664,7 @@ impl<'a> LayoutBox<'a> {
         let to_content = |px: f32| if border_box { (px - edges).max(0.0) } else { px };
 
         if let Some(value) = style.value("height") {
-            if matches!(value, Value::Length(..)) {
+            if matches!(value, Value::Length(..) | Value::Calc(..)) {
                 self.dimensions.content.height = to_content(value.resolve(ctx));
             }
         }
@@ -2575,6 +2578,23 @@ mod tests {
 
         let root = layout_tree(&styled, viewport, None, &ImageMap::new());
         assert_eq!(root.dimensions.content.width, 200.0);
+    }
+
+    #[test]
+    fn calc_resolves_through_the_real_css_and_layout_pipeline() {
+        let css = "div { display: block; }
+                   body { margin: 0; }
+                   #sidebar { width: 250px; height: 10px; }
+                   #content { width: calc(100% - 250px); height: 10px; padding: calc(5px * 2); }";
+        let html = "<body><div id=sidebar></div><div id=content></div></body>";
+        let b = boxes_by_id(html, css, 800.0);
+
+        // The canonical use of calc(): a sidebar-adjacent width, where
+        // neither side of the subtraction is knowable as a single Length
+        // until the % resolves against the containing block at layout time.
+        // `collect_element_rects` reports the border box, so the 550px
+        // content width plus calc(5px * 2) = 10px of padding on each side.
+        assert_eq!(b["content"].width, 570.0);
     }
 
     /// Lay a page out at `width` and return every element box by `id`.
