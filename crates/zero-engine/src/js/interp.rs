@@ -141,6 +141,12 @@ pub enum Value {
     /// A compiled regular expression (see [`super::regex`]). Never part of a
     /// cycle — a `Regex` holds no `Value` — so it stays a plain `Rc`.
     Regex(Rc<super::regex::Regex>),
+    /// `localStorage`, or `sessionStorage` when true. Not a plain object: every
+    /// property read and write on it goes through the embedder's store, which
+    /// is what makes `store.token`, `store['token']` and `store.length` behave
+    /// the way a page expects instead of quietly writing to a stray object
+    /// that nothing persists.
+    Storage(bool),
 }
 
 impl Value {
@@ -185,8 +191,16 @@ pub struct Thrown(pub Value);
 
 /// What `new` recognizes as an error constructor — both the JS-visible name
 /// and the `.name` an instance gets, which are the same word.
-const ERROR_KINDS: [&str; 5] =
-    ["Error", "TypeError", "RangeError", "SyntaxError", "ReferenceError"];
+const ERROR_KINDS: [&str; 6] = [
+    "Error",
+    "TypeError",
+    "RangeError",
+    "SyntaxError",
+    "ReferenceError",
+    // Sites catch this one by name to fall back to a smaller cache, so it has
+    // to be constructible and comparable, not just a string in a message.
+    "QuotaExceededError",
+];
 
 #[derive(Default)]
 pub struct Output {
@@ -211,6 +225,9 @@ pub struct Interp {
     /// Event handlers keyed by (element node_id, event type), so they survive
     /// re-renders and one element can listen for several events.
     handlers: HashMap<(usize, String), Value>,
+    /// `window.addEventListener` registrations, by event name. Element
+    /// handlers hang off a node; these have no node to hang off.
+    window_handlers: HashMap<String, Vec<Value>>,
     /// Callbacks queued by setTimeout, ordered by delay then insertion.
     timers: Vec<(f64, usize, Value)>,
     timer_seq: usize,
@@ -218,6 +235,10 @@ pub struct Interp {
     loader: Option<Rc<dyn ResourceLoader>>,
     /// Backing store for `localStorage`, partitioned by the embedder.
     store: Option<Rc<dyn KeyValueStore>>,
+    /// Backing store for `sessionStorage`. Same shape, different lifetime: the
+    /// embedder keeps it per tab and drops it when that tab closes, so it has
+    /// to outlive this `Interp` — a fresh one is built on every navigation.
+    session: Option<Rc<dyn KeyValueStore>>,
     pub out: Output,
 }
 
@@ -236,10 +257,12 @@ impl Interp {
             depth: 0,
             dom,
             handlers: HashMap::new(),
+            window_handlers: HashMap::new(),
             timers: Vec::new(),
             timer_seq: 0,
             loader: None,
             store: None,
+            session: None,
             out: Output::default(),
         };
         let root = interp.new_env(None, true);
@@ -255,6 +278,14 @@ impl Interp {
         for kind in ERROR_KINDS {
             interp.env_define(root, kind.to_string(), Value::Native(kind));
         }
+        // Scripts reach for `Object.keys` constantly, not least to walk a
+        // storage area. Without the global they fail at the first mention.
+        let object = interp.namespace(&[
+            ("keys", "Object.keys"),
+            ("values", "Object.values"),
+            ("entries", "Object.entries"),
+        ]);
+        interp.env_define(root, "Object".into(), object);
         let json = interp.namespace(&[("parse", "JSON.parse"), ("stringify", "JSON.stringify")]);
         interp.env_define(root, "JSON".into(), json);
         let promises = interp.namespace(&[
@@ -263,13 +294,13 @@ impl Interp {
             ("all", "Promise.all"),
         ]);
         interp.env_define(root, "Promise".into(), promises);
-        let local_storage = interp.namespace(&[
-            ("getItem", "localStorage.getItem"),
-            ("setItem", "localStorage.setItem"),
-            ("removeItem", "localStorage.removeItem"),
-            ("clear", "localStorage.clear"),
-        ]);
+        // Not `namespace`: a plain object would make `localStorage.token = x`
+        // write to the object and vanish. `get_property` and `assign_to` route
+        // these through the store instead.
+        let local_storage = Value::Storage(false);
+        let session_storage = Value::Storage(true);
         interp.env_define(root, "localStorage".into(), local_storage.clone());
+        interp.env_define(root, "sessionStorage".into(), session_storage.clone());
         let document = interp.namespace(&[
             ("write", "document.write"),
             ("getElementById", "document.getElementById"),
@@ -291,13 +322,13 @@ impl Interp {
             ("document".to_string(), document),
             ("console".to_string(), console),
             ("localStorage".to_string(), local_storage),
+            ("sessionStorage".to_string(), session_storage),
             ("setTimeout".to_string(), Value::Native("setTimeout")),
             ("fetch".to_string(), Value::Native("fetch")),
-            // Listening is accepted and does nothing: the events these ask for
-            // (load, resize, scroll) are not dispatched, and pretending to
-            // register is better than failing the script outright.
+            // `storage` is really delivered; load/resize/scroll are still
+            // accepted and never fired, since nothing raises them yet.
             ("addEventListener".to_string(), Value::Native("window.addEventListener")),
-            ("removeEventListener".to_string(), Value::Native("window.addEventListener")),
+            ("removeEventListener".to_string(), Value::Native("window.removeEventListener")),
         ]);
         let window = interp.new_object(window_map);
         interp.env_define(root, "window".into(), window);
@@ -339,6 +370,25 @@ impl Interp {
         self.store = Some(store);
     }
 
+    /// Give scripts tab-scoped key/value storage through the embedder.
+    pub fn set_session_store(&mut self, store: Rc<dyn KeyValueStore>) {
+        self.session = Some(store);
+    }
+
+    /// Which store a `localStorage.*`/`sessionStorage.*` native belongs to.
+    ///
+    /// Cloned rather than borrowed so callers can stringify their arguments
+    /// (which needs `&mut self`) before reaching for the store.
+    fn store_for(&self, native: &str) -> Option<Rc<dyn KeyValueStore>> {
+        self.store_of(native.starts_with("sessionStorage."))
+    }
+
+    /// The same choice made from a [`Value::Storage`] flag rather than a name.
+    fn store_of(&self, session: bool) -> Option<Rc<dyn KeyValueStore>> {
+        let slot = if session { &self.session } else { &self.store };
+        slot.clone()
+    }
+
     /// Refresh the snapshot after the document changed, so later events see new text.
     pub fn set_dom(&mut self, dom: DomView) {
         self.dom = dom;
@@ -359,6 +409,55 @@ impl Interp {
             self.out.errors.push(msg);
         }
         true
+    }
+
+    /// Fire every `window` listener for `event`, each with the same event
+    /// object. Returns whether any ran, so the embedder knows to repaint.
+    pub fn dispatch_window(&mut self, event: &str, detail: Value) -> bool {
+        let Some(listeners) = self.window_handlers.get(event).cloned() else { return false };
+        if listeners.is_empty() {
+            return false;
+        }
+        for handler in listeners {
+            if let Err(e) = self.call(handler, vec![detail.clone()]) {
+                let msg = self.describe(&e);
+                self.out.errors.push(msg);
+            }
+        }
+        true
+    }
+
+    /// Build a `StorageEvent` and hand it to every `storage` listener.
+    ///
+    /// `key` is `None` for the event `clear()` raises, which the web spells as
+    /// a null key; `old` and `new` are `None` where that value did not exist.
+    pub fn dispatch_storage_event(
+        &mut self,
+        key: Option<&str>,
+        old: Option<&str>,
+        new: Option<&str>,
+        url: &str,
+    ) -> bool {
+        // Nothing listening: don't build an object only to drop it.
+        if self.window_handlers.get("storage").is_none_or(|l| l.is_empty()) {
+            return false;
+        }
+        let nullable = |value: Option<&str>| match value {
+            Some(text) => Value::Str(text.to_string()),
+            None => Value::Null,
+        };
+        let fields = HashMap::from([
+            ("key".to_string(), nullable(key)),
+            ("oldValue".to_string(), nullable(old)),
+            ("newValue".to_string(), nullable(new)),
+            ("url".to_string(), Value::Str(url.to_string())),
+            // Always `localStorage`: a `sessionStorage` area is only ever
+            // shared with other documents in the same tab, and a tab here
+            // holds exactly one, so such a write has nobody to tell.
+            ("storageArea".to_string(), Value::Storage(false)),
+        ]);
+        let event = self.new_object(fields);
+        self.dispatch_window("storage", event)
     }
 
     /// Run every queued timer callback, in delay order. Timers scheduled by a
@@ -611,6 +710,7 @@ impl Interp {
                 .join(","),
             Value::Object(_) => "[object Object]".into(),
             Value::Element(_) => "[object HTMLElement]".into(),
+            Value::Storage(_) => "[object Storage]".into(),
         }
     }
 
@@ -740,6 +840,38 @@ impl Interp {
                 // The loop variable belongs to the loop, not to what surrounds it.
                 let saved = self.push_scope();
                 let result = self.run_for(init.as_deref(), cond.as_ref(), step.as_ref(), body);
+                self.env = saved;
+                result
+            }
+            Stmt::ForEach {
+                name,
+                values,
+                subject,
+                body,
+            } => {
+                let subject = self.eval(subject)?;
+                // Snapshotted before the first pass: a body that writes to
+                // what it is walking would otherwise decide its own length,
+                // and on a storage area that means a loop that adds a key per
+                // key it sees never ends.
+                let keys = self.own_keys(&subject);
+                let saved = self.push_scope();
+                let mut result = Ok(Flow::Normal);
+                for key in keys {
+                    let item = match values {
+                        true => self.get_property(&subject, &key),
+                        false => Value::Str(key),
+                    };
+                    self.env_define(self.env, name.clone(), item);
+                    match self.exec(body) {
+                        Ok(Flow::Normal | Flow::Continue) => {}
+                        Ok(Flow::Break) => break,
+                        other => {
+                            result = other;
+                            break;
+                        }
+                    }
+                }
                 self.env = saved;
                 result
             }
@@ -921,6 +1053,26 @@ impl Interp {
                     None => Ok(value),
                 }
             }
+            // `delete` works on the *place*, not the value, so it cannot go
+            // through the generic unary arm. Always reports true, as the web
+            // does for anything configurable — which everything here is.
+            Expr::Unary { op, expr } if op == "delete" => {
+                match &**expr {
+                    Expr::Member { object, property } => {
+                        let target = self.eval(object)?;
+                        self.delete_key(&target, property);
+                    }
+                    Expr::Index { object, index } => {
+                        let target = self.eval(object)?;
+                        let key = self.eval(index)?;
+                        let key = self.to_display(&key);
+                        self.delete_key(&target, &key);
+                    }
+                    // `delete x` on a bare name is a no-op in sloppy mode.
+                    _ => {}
+                }
+                Ok(Value::Bool(true))
+            }
             Expr::Unary { op, expr } if op == "typeof" => {
                 // `typeof` is how scripts ask whether something exists at all,
                 // so an unknown name answers "undefined" instead of failing.
@@ -948,6 +1100,13 @@ impl Interp {
                 Ok(last)
             }
             Expr::Binary { op, left, right } => {
+                // `'k' in obj` asks the container, not the value.
+                if op == "in" {
+                    let key = self.eval(left)?;
+                    let key = self.to_display(&key);
+                    let container = self.eval(right)?;
+                    return Ok(Value::Bool(self.has_key(&container, &key)));
+                }
                 // Short-circuit before evaluating the right side.
                 if op == "&&" {
                     let l = self.eval(left)?;
@@ -1059,6 +1218,18 @@ impl Interp {
                             .borrow_mut()
                             .insert(property.clone(), v);
                     }
+                    // `localStorage.token = t` is a write to the store, not to
+                    // a property of a throwaway object.
+                    Value::Storage(session) => {
+                        let text = self.to_display(&v);
+                        if let Some(store) = self.store_of(session) {
+                            if !store.set(property, &text) {
+                                return Err(
+                                    self.err("QuotaExceededError", "the storage area is full")
+                                );
+                            }
+                        }
+                    }
                     Value::Element(i) => match property.as_str() {
                         // Field text lives in the document's form state, not the DOM.
                         "value" => {
@@ -1121,11 +1292,73 @@ impl Interp {
                         let key_str = self.to_display(&key);
                         self.objects[id as usize].borrow_mut().insert(key_str, v);
                     }
+                    Value::Storage(session) => {
+                        let key_str = self.to_display(&key);
+                        let text = self.to_display(&v);
+                        if let Some(store) = self.store_of(session) {
+                            if !store.set(&key_str, &text) {
+                                return Err(
+                                    self.err("QuotaExceededError", "the storage area is full")
+                                );
+                            }
+                        }
+                    }
                     _ => {}
                 }
                 Ok(())
             }
             _ => Err(self.err("SyntaxError", "invalid assignment target")),
+        }
+    }
+
+    /// Remove a key from whatever can hold one. A storage object writes
+    /// through to the embedder, which is the whole point of `delete
+    /// localStorage.token` — it must not quietly drop a property instead.
+    fn delete_key(&mut self, target: &Value, key: &str) {
+        match target {
+            Value::Storage(session) => {
+                if let Some(store) = self.store_of(*session) {
+                    store.remove(key);
+                }
+            }
+            Value::Object(id) => {
+                self.objects[*id as usize].borrow_mut().remove(key);
+            }
+            _ => {}
+        }
+    }
+
+    /// The own enumerable names of a value, in the order the web would walk
+    /// them. A storage area enumerates its keys, which is what makes
+    /// `Object.keys(localStorage)` list what the page actually stored.
+    fn own_keys(&self, subject: &Value) -> Vec<String> {
+        match subject {
+            Value::Storage(session) => {
+                self.store_of(*session).map(|s| s.keys()).unwrap_or_default()
+            }
+            Value::Object(id) => self.objects[*id as usize].borrow().keys().cloned().collect(),
+            Value::Array(id) => {
+                (0..self.arrays[*id as usize].borrow().len()).map(|i| i.to_string()).collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Whether `key` names something the container holds — what `in` answers.
+    fn has_key(&self, container: &Value, key: &str) -> bool {
+        match container {
+            Value::Storage(session) => {
+                self.store_of(*session).is_some_and(|s| s.get(key).is_some())
+            }
+            Value::Object(id) => self.objects[*id as usize].borrow().contains_key(key),
+            // On an array `in` tests indices, not values — `0 in [7]` is true
+            // and `7 in [7]` is false. Worth getting right rather than
+            // guessing, since the wrong answer here is silent.
+            Value::Array(id) => match key.parse::<usize>() {
+                Ok(i) => i < self.arrays[*id as usize].borrow().len(),
+                Err(_) => key == "length",
+            },
+            _ => false,
         }
     }
 
@@ -1139,7 +1372,35 @@ impl Interp {
             Value::Array(id) if property == "length" => {
                 Value::Num(self.arrays[*id as usize].borrow().len() as f64)
             }
+            // `a["0"]` is `a[0]`. The `Index` expression has always handled a
+            // numeric subscript itself; routing it through here too is what
+            // lets anything holding a *name* — `for (v of a)`, `Object.values`
+            // — read an element rather than `undefined`.
+            Value::Array(id) => match property.parse::<usize>() {
+                Ok(i) => self.arrays[*id as usize]
+                    .borrow()
+                    .get(i)
+                    .cloned()
+                    .unwrap_or(Value::Undefined),
+                Err(_) => Value::Undefined,
+            },
             Value::Str(s) if property == "length" => Value::Num(s.chars().count() as f64),
+            Value::Storage(session) => match storage_native(*session, property) {
+                Some(method) => method,
+                // `length` counts what the store holds, not what some object
+                // was told to remember.
+                None if property == "length" => {
+                    let n = self.store_of(*session).map(|s| s.keys().len()).unwrap_or(0);
+                    Value::Num(n as f64)
+                }
+                // Any other name is a key. A missing one reads `undefined`
+                // here — unlike `getItem`, which answers `null`. The web draws
+                // that same distinction and scripts feature-detect on it.
+                None => match self.store_of(*session).and_then(|s| s.get(property)) {
+                    Some(value) => Value::Str(value),
+                    None => Value::Undefined,
+                },
+            },
             Value::Element(i) => self.element_property(*i, property),
             _ => Value::Undefined,
         }
@@ -1349,8 +1610,28 @@ impl Interp {
                 match name {
                     "console.log" => self.out.console.push(text),
                     "document.write" => self.out.writes.push_str(&text),
-                    // Accepted and ignored: load/resize/scroll are never fired.
-                    "window.addEventListener" => {}
+                    // Registered for real. Only `storage` is ever dispatched so
+                    // far; the rest cost a `Vec` entry nobody reads, which is
+                    // cheaper than deciding here which names will matter later.
+                    "window.addEventListener" => {
+                        if let (Some(event), Some(handler)) = (args.first(), args.get(1)) {
+                            let event = self.to_display(event);
+                            self.window_handlers.entry(event).or_default().push(handler.clone());
+                        }
+                    }
+                    "window.removeEventListener" => {
+                        if let (Some(event), Some(handler)) = (args.first(), args.get(1)) {
+                            let event = self.to_display(event);
+                            if let Some(listeners) = self.window_handlers.get_mut(&event) {
+                                // Identity, as the web requires: the same
+                                // function object, not one that merely looks
+                                // alike. A `Func` is an index into `funcs`.
+                                listeners.retain(|h| {
+                                    !matches!((h, handler), (Value::Func(a), Value::Func(b)) if a == b)
+                                });
+                            }
+                        }
+                    }
                     "setTimeout" => {
                         // No real clock: callbacks queue and the embedder drains them.
                         let delay = args.get(1).map(Value::as_number).unwrap_or(0.0);
@@ -1418,34 +1699,81 @@ impl Interp {
                         };
                         return Ok(Value::Str(s));
                     }
-                    "localStorage.getItem" => {
-                        let key = args.first().map(|v| self.to_display(v)).unwrap_or_default();
-                        return Ok(match self.store.as_ref().and_then(|s| s.get(&key)) {
+                    "localStorage.getItem" | "sessionStorage.getItem" => {
+                        if args.is_empty() {
+                            return Err(self.err("TypeError", "getItem requires 1 argument"));
+                        }
+                        let key = self.to_display(&args[0]);
+                        return Ok(match self.store_for(name).and_then(|s| s.get(&key)) {
                             Some(v) => Value::Str(v),
                             None => Value::Null, // absent keys read as null, like the web
                         });
                     }
-                    "localStorage.setItem" => {
-                        if let Some(key) = args.first() {
-                            let key = self.to_display(key);
-                            let value = args.get(1).map(|v| self.to_display(v)).unwrap_or_default();
-                            if let Some(store) = &self.store {
-                                store.set(&key, &value);
+                    "localStorage.setItem" | "sessionStorage.setItem" => {
+                        // Both arguments are required, and the web throws
+                        // rather than inventing an empty one.
+                        if args.len() < 2 {
+                            return Err(self.err(
+                                "TypeError",
+                                "setItem requires 2 arguments",
+                            ));
+                        }
+                        let key = self.to_display(&args[0]);
+                        let value = self.to_display(&args[1]);
+                        if let Some(store) = self.store_for(name) {
+                            if !store.set(&key, &value) {
+                                return Err(self.err(
+                                    "QuotaExceededError",
+                                    "the storage area is full",
+                                ));
                             }
                         }
                         return Ok(Value::Undefined);
                     }
-                    "localStorage.removeItem" => {
-                        if let Some(key) = args.first() {
-                            let key = self.to_display(key);
-                            if let Some(store) = &self.store {
-                                store.remove(&key);
-                            }
+                    "localStorage.removeItem" | "sessionStorage.removeItem" => {
+                        if args.is_empty() {
+                            return Err(self.err("TypeError", "removeItem requires 1 argument"));
+                        }
+                        let key = self.to_display(&args[0]);
+                        if let Some(store) = self.store_for(name) {
+                            store.remove(&key);
                         }
                         return Ok(Value::Undefined);
                     }
-                    "localStorage.clear" => {
-                        if let Some(store) = &self.store {
+                    "Object.keys" | "Object.values" | "Object.entries" => {
+                        let subject = args.first().cloned().unwrap_or(Value::Undefined);
+                        let keys = self.own_keys(&subject);
+                        let rows = keys
+                            .into_iter()
+                            .map(|key| match name {
+                                "Object.keys" => Value::Str(key),
+                                "Object.values" => self.get_property(&subject, &key),
+                                _ => {
+                                    let value = self.get_property(&subject, &key);
+                                    self.new_array(vec![Value::Str(key), value])
+                                }
+                            })
+                            .collect();
+                        return Ok(self.new_array(rows));
+                    }
+                    "localStorage.key" | "sessionStorage.key" => {
+                        if args.is_empty() {
+                            return Err(self.err("TypeError", "key requires 1 argument"));
+                        }
+                        let i = args[0].as_number();
+                        let keys = self.store_for(name).map(|s| s.keys()).unwrap_or_default();
+                        let at = (i.is_finite() && i >= 0.0)
+                            .then(|| keys.get(i as usize))
+                            .flatten();
+                        // Out of range is `null`, not `undefined` — `key()` is
+                        // specified to return a nullable string.
+                        return Ok(match at {
+                            Some(key) => Value::Str(key.clone()),
+                            None => Value::Null,
+                        });
+                    }
+                    "localStorage.clear" | "sessionStorage.clear" => {
+                        if let Some(store) = self.store_for(name) {
                             store.clear();
                         }
                         return Ok(Value::Undefined);
@@ -1694,6 +2022,27 @@ fn to_u32(value: &Value) -> u32 {
 }
 
 /// What `typeof` reports. Arrays and elements are objects, as in a browser.
+/// The native behind one method on one of the two storage objects.
+///
+/// Both halves of the tag have to be `'static`, so the ten pairs are spelled
+/// out rather than formatted at runtime. `None` means "not a method", which is
+/// how `get_property` knows to treat the name as a stored key instead.
+fn storage_native(session: bool, method: &str) -> Option<Value> {
+    Some(Value::Native(match (session, method) {
+        (false, "getItem") => "localStorage.getItem",
+        (false, "setItem") => "localStorage.setItem",
+        (false, "removeItem") => "localStorage.removeItem",
+        (false, "clear") => "localStorage.clear",
+        (false, "key") => "localStorage.key",
+        (true, "getItem") => "sessionStorage.getItem",
+        (true, "setItem") => "sessionStorage.setItem",
+        (true, "removeItem") => "sessionStorage.removeItem",
+        (true, "clear") => "sessionStorage.clear",
+        (true, "key") => "sessionStorage.key",
+        _ => return None,
+    }))
+}
+
 fn type_name(value: &Value) -> &'static str {
     match value {
         Value::Num(_) => "number",
@@ -1701,9 +2050,12 @@ fn type_name(value: &Value) -> &'static str {
         Value::Bool(_) => "boolean",
         Value::Undefined => "undefined",
         Value::Func(_) | Value::Native(_) => "function",
-        Value::Null | Value::Object(_) | Value::Array(_) | Value::Element(_) | Value::Regex(_) => {
-            "object"
-        }
+        Value::Null
+        | Value::Object(_)
+        | Value::Array(_)
+        | Value::Element(_)
+        | Value::Regex(_)
+        | Value::Storage(_) => "object",
     }
 }
 

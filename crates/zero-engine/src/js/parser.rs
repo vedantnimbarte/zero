@@ -104,6 +104,15 @@ pub enum Stmt {
         step: Option<Expr>,
         body: Box<Stmt>,
     },
+    /// `for (k in obj)` / `for (const [k, v] of rows)` — the second spelling
+    /// differs only in what it walks, so one shape carries both.
+    ForEach {
+        name: String,
+        /// `false` for `in` (the keys), `true` for `of` (the values).
+        values: bool,
+        subject: Expr,
+        body: Box<Stmt>,
+    },
     Block(Vec<Stmt>),
     Return(Option<Expr>),
     /// Unlabeled only — see the parser's note on `break`/`continue`.
@@ -138,7 +147,8 @@ fn precedence(op: &str) -> Option<u8> {
         "^" => 4,
         "&" => 5,
         "==" | "!=" | "===" | "!==" => 6,
-        "<" | ">" | "<=" | ">=" => 7,
+        // `in` sits with the relational operators, as the web puts it.
+        "<" | ">" | "<=" | ">=" | "in" => 7,
         "<<" | ">>" | ">>>" => 8,
         "+" | "-" => 9,
         "*" | "/" | "%" => 10,
@@ -373,6 +383,22 @@ impl Parser {
         }
         if self.eat_kw(Kw::For) {
             self.expect_op("(")?;
+            // `for (k in o)` and `for (k of o)` share the keyword and the
+            // paren with the counting `for`, and only diverge at the word
+            // after the name — so the head is looked at before it is parsed,
+            // rather than parsed and then backed out of.
+            if let Some((name, values)) = self.peek_for_each_head() {
+                self.pos += if matches!(self.peek(), Tok::Kw(_)) { 3 } else { 2 };
+                let subject = self.parse_expr()?;
+                self.expect_op(")")?;
+                let body = Box::new(self.parse_stmt()?);
+                return Ok(Stmt::ForEach {
+                    name,
+                    values,
+                    subject,
+                    body,
+                });
+            }
             let init = if self.eat_op(";") {
                 None
             } else {
@@ -510,6 +536,10 @@ impl Parser {
         loop {
             let op = match self.peek() {
                 Tok::Op(o) => o.clone(),
+                // The one binary operator spelled as a word. Safe to take
+                // unconditionally: there is no `for (k in o)` syntax here for
+                // it to be mistaken for.
+                Tok::Ident(name) if name == "in" => name.clone(),
                 _ => break,
             };
             let bp = match precedence(&op) {
@@ -527,10 +557,30 @@ impl Parser {
         Ok(left)
     }
 
+    /// Is this loop head `[var|let|const] NAME in|of`? Returns the name and
+    /// which of the two it is, without consuming anything.
+    fn peek_for_each_head(&self) -> Option<(String, bool)> {
+        // The declaration keyword is optional: `for (k in o)` is as valid as
+        // `for (var k in o)`.
+        let at = match self.toks.get(self.pos) {
+            Some(Tok::Kw(Kw::Var | Kw::Let | Kw::Const)) => self.pos + 1,
+            _ => self.pos,
+        };
+        let name = match self.toks.get(at) {
+            Some(Tok::Ident(name)) => name.clone(),
+            _ => return None,
+        };
+        match self.toks.get(at + 1) {
+            Some(Tok::Ident(word)) if word == "in" => Some((name, false)),
+            Some(Tok::Ident(word)) if word == "of" => Some((name, true)),
+            _ => None,
+        }
+    }
+
     fn parse_unary(&mut self) -> Result<Expr, String> {
-        // `typeof` and `await` are words, not symbols, so they arrive as
-        // identifiers. Both bind like a unary operator.
-        for word in ["typeof", "await"] {
+        // `typeof`, `delete` and `await` are words, not symbols, so they
+        // arrive as identifiers. All three bind like a unary operator.
+        for word in ["typeof", "delete", "await"] {
             if matches!(self.peek(), Tok::Ident(name) if name == word) {
                 self.pos += 1;
                 let expr = self.parse_unary()?;

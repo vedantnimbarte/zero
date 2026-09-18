@@ -313,6 +313,127 @@ fn localstorage_round_trips_through_the_pipe_to_a_real_kv_store() {
     assert!(status.success(), "the worker should exit cleanly on EOF, got {status}");
 }
 
+#[test]
+fn sessionstorage_is_its_own_store_and_does_not_collide_with_localstorage() {
+    // The two are separate namespaces reached over one pipe, told apart only
+    // by the message name `PipeStore::verb` picks. So the page writes the
+    // *same key* to both with different values and reads both back: if the
+    // scopes were crossed anywhere — the child sending one verb for both, or
+    // the parent routing both to one store — the second write would clobber
+    // the first and one of the two reads would come back wrong.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_zero"))
+        .arg("--render-worker")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn the renderer worker");
+    let mut stdin = child.stdin.take().expect("child stdin");
+    let mut stdout = child.stdout.take().expect("child stdout");
+    let mut store = std::collections::HashMap::new();
+
+    let html = "<div id=marker></div>\
+                 <style>#marker { width: 20px; height: 20px; background: #ffffff; } \
+                         #marker.ok { background: #00ff00; }</style>\
+                 <script>\
+                   localStorage.setItem('k', 'local');\
+                   sessionStorage.setItem('k', 'session');\
+                   var a = localStorage.getItem('k');\
+                   var b = sessionStorage.getItem('k');\
+                   if (a == 'local' && b == 'session') { \
+                     document.getElementById('marker').className = 'ok'; }\
+                 </script>";
+    write_msg(&mut stdin, "render", &[html, "", ""], &[40.0, 40.0]);
+    let frame = read_frame(&mut stdout, &mut stdin, &mut store).expect("a frame");
+
+    assert_eq!(
+        store.get("k").map(String::as_str),
+        Some("local"),
+        "the localStorage write should have landed in the site store"
+    );
+    assert_eq!(
+        store.get("session:k").map(String::as_str),
+        Some("session"),
+        "the sessionStorage write should have landed in the tab store, not the site one"
+    );
+    let (_, marker) = frame.rect_by_id("marker").expect("the marker's own rect");
+    let (x, y) = (marker.0 as usize + 5, marker.1 as usize + 5);
+    let i = (y * frame.width + x) * 4;
+    assert_eq!(
+        &frame.pixels[i..i + 3],
+        &[0, 0xff, 0],
+        "each store should have read back its own value, not the other's"
+    );
+
+    drop(stdin);
+    let status = child.wait().expect("wait for the worker to exit");
+    assert!(status.success(), "the worker should exit cleanly on EOF, got {status}");
+}
+
+#[test]
+fn a_storage_event_from_another_tab_reaches_this_pages_handler() {
+    // The parent tells a tab about a localStorage write some *other* tab
+    // made, by pushing a `storage_event` into its renderer. This walks that
+    // path against the real worker: a page registers a `storage` listener,
+    // the message arrives, and the handler paints. Nothing else in the
+    // browser can deliver that event, so if the message name, the field
+    // order or the null flags are wrong, the marker stays white.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_zero"))
+        .arg("--render-worker")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn the renderer worker");
+    let mut stdin = child.stdin.take().expect("child stdin");
+    let mut stdout = child.stdout.take().expect("child stdout");
+    let mut store = std::collections::HashMap::new();
+
+    let html = "<div id=marker></div>\
+                 <style>#marker { width: 20px; height: 20px; background: #ffffff; } \
+                         #marker.ok { background: #00ff00; }</style>\
+                 <script>\
+                   window.addEventListener('storage', function (e) {\
+                     if (e.key == 'shared' && e.oldValue == 'was' && e.newValue == 'now') {\
+                       document.getElementById('marker').className = 'ok';\
+                     }\
+                   });\
+                 </script>";
+    write_msg(&mut stdin, "render", &[html, "", ""], &[40.0, 40.0]);
+    let frame = read_frame(&mut stdout, &mut stdin, &mut store).expect("the first frame");
+
+    // Nothing has happened yet, so the marker is still its resting colour.
+    let (_, marker) = frame.rect_by_id("marker").expect("the marker's own rect");
+    let (x, y) = (marker.0 as usize + 5, marker.1 as usize + 5);
+    let i = (y * frame.width + x) * 4;
+    assert_eq!(
+        &frame.pixels[i..i + 3],
+        &[0xff, 0xff, 0xff],
+        "the handler should not have run before any event was sent"
+    );
+
+    // Now the write another tab made. The three flags say all three fields
+    // are really present rather than empty strings.
+    write_msg(
+        &mut stdin,
+        "storage_event",
+        &["shared", "was", "now", "https://example.com/"],
+        &[1.0, 1.0, 1.0],
+    );
+    let frame = read_frame(&mut stdout, &mut stdin, &mut store).expect("a frame after the event");
+
+    let (_, marker) = frame.rect_by_id("marker").expect("the marker's own rect");
+    let (x, y) = (marker.0 as usize + 5, marker.1 as usize + 5);
+    let i = (y * frame.width + x) * 4;
+    assert_eq!(
+        &frame.pixels[i..i + 3],
+        &[0, 0xff, 0],
+        "the storage handler should have run and repainted the marker"
+    );
+
+    drop(stdin);
+    let status = child.wait().expect("wait for the worker to exit");
+    assert!(status.success(), "the worker should exit cleanly on EOF, got {status}");
+}
+
 struct TestFrame {
     width: usize,
     height: usize,
@@ -432,6 +553,12 @@ fn decode_frame(msg: RawMsg) -> TestFrame {
 /// up by hand here since that function is private to the binary crate.
 /// `fetch` answers "missing" for everything: nothing in these tests loads a
 /// subresource.
+///
+/// `session_*` is the same exchange for `sessionStorage`. The real browser
+/// hands those to a separate store; one map with a `session:` prefix stands
+/// in for that here, which keeps the thirteen callers of this helper on one
+/// argument and still fails loudly if the child ever sends a session write
+/// down the `localStorage` path (the key would land unprefixed).
 fn read_frame(
     r: &mut impl Read,
     w: &mut impl Write,
@@ -441,17 +568,34 @@ fn read_frame(
         let msg = read_msg(r)?;
         match msg.name.as_str() {
             "frame" => return Some(decode_frame(msg)),
-            "storage_get" => match store.get(&msg.text[0]) {
-                Some(value) => write_msg(w, "storage_value", &[value], &[1.0]),
-                None => write_msg(w, "storage_value", &[""], &[0.0]),
-            },
-            "storage_set" => {
-                store.insert(msg.text[0].clone(), msg.text[1].clone());
+            "storage_get" | "session_get" => {
+                let key = scoped(&msg.name, &msg.text[0]);
+                match store.get(&key) {
+                    Some(value) => write_msg(w, "storage_value", &[value], &[1.0]),
+                    None => write_msg(w, "storage_value", &[""], &[0.0]),
+                }
             }
-            "storage_remove" => {
-                store.remove(&msg.text[0]);
+            // A write is answered, not fire-and-forget: `setItem` throws when
+            // the area is full, so the child waits to hear that it landed.
+            "storage_set" | "session_set" => {
+                store.insert(scoped(&msg.name, &msg.text[0]), msg.text[1].clone());
+                write_msg(w, "storage_stored", &[], &[1.0]);
             }
-            "storage_clear" => store.clear(),
+            "storage_remove" | "session_remove" => {
+                store.remove(&scoped(&msg.name, &msg.text[0]));
+            }
+            "storage_keys" | "session_keys" => {
+                let prefix = if msg.name.starts_with("session_") { "session:" } else { "" };
+                let mut keys: Vec<&str> = store
+                    .keys()
+                    .filter(|k| k.starts_with("session:") == !prefix.is_empty())
+                    .map(|k| k.trim_start_matches("session:"))
+                    .collect();
+                keys.sort_unstable();
+                write_msg(w, "storage_keys_value", &keys, &[]);
+            }
+            "storage_clear" => store.retain(|k, _| k.starts_with("session:")),
+            "session_clear" => store.retain(|k, _| !k.starts_with("session:")),
             "fetch" => {
                 let mut body = Vec::new();
                 for _ in &msg.text {
@@ -470,6 +614,14 @@ fn read_frame(
             }
             _ => return None,
         }
+    }
+}
+
+/// Where a key lands in the stand-in store, given which scope asked.
+fn scoped(message: &str, key: &str) -> String {
+    match message.starts_with("session_") {
+        true => format!("session:{key}"),
+        false => key.to_string(),
     }
 }
 

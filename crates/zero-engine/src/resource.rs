@@ -27,9 +27,21 @@ pub trait ResourceLoader {
 /// site so one origin cannot read another's state.
 pub trait KeyValueStore {
     fn get(&self, key: &str) -> Option<String>;
-    fn set(&self, key: &str, value: &str);
+    /// Store `value` under `key`. Returns false if the area is full, which
+    /// the caller turns into the `QuotaExceededError` the web throws — a site
+    /// that has outgrown its storage needs to hear about it, not to carry on
+    /// believing it saved something it did not.
+    fn set(&self, key: &str, value: &str) -> bool;
     fn remove(&self, key: &str);
     fn clear(&self);
+
+    /// Every key held, in an order that does not change between two calls with
+    /// no write in between — what `length` counts and `key(n)` indexes into.
+    /// The web leaves the order itself to the implementation but does require
+    /// that stability, which an ordered map gives for free. No default impl: a
+    /// store that silently returned nothing here would make `length` read 0
+    /// for a page whose keys are plainly there.
+    fn keys(&self) -> Vec<String>;
 }
 
 /// A loader that fetches nothing — used by the plain `render` path.

@@ -105,7 +105,7 @@ impl Document {
         css_source: &str,
         loader: std::rc::Rc<dyn ResourceLoader>,
     ) -> Document {
-        Document::load_hosted(html_source, css_source, Some(loader), None)
+        Document::load_hosted(html_source, css_source, Some(loader), None, None)
     }
 
     /// Parse `html` and run its scripts with whatever host services are available.
@@ -115,6 +115,7 @@ impl Document {
         css_source: &str,
         loader: Option<std::rc::Rc<dyn ResourceLoader>>,
         store: Option<std::rc::Rc<dyn KeyValueStore>>,
+        session: Option<std::rc::Rc<dyn KeyValueStore>>,
     ) -> Document {
         let mut doc = Document::prepare(html_source, css_source);
         if let Some(loader) = loader {
@@ -122,6 +123,9 @@ impl Document {
         }
         if let Some(store) = store {
             doc.interp.set_store(store);
+        }
+        if let Some(session) = session {
+            doc.interp.set_session_store(session);
         }
         doc.run_initial_scripts();
         doc
@@ -405,6 +409,24 @@ impl Document {
     /// Run a handler and apply everything it changed.
     fn dispatch_event(&mut self, node_id: usize, event: &str) -> bool {
         if !self.interp.dispatch(node_id, event) {
+            return false;
+        }
+        self.absorb_script_output();
+        self.run_timers();
+        true
+    }
+
+    /// Deliver a `storage` event: another document wrote to a `localStorage`
+    /// area this one shares. Returns whether any handler ran, so the embedder
+    /// knows whether this page needs repainting.
+    pub fn storage_event(
+        &mut self,
+        key: Option<&str>,
+        old: Option<&str>,
+        new: Option<&str>,
+        url: &str,
+    ) -> bool {
+        if !self.interp.dispatch_storage_event(key, old, new, url) {
             return false;
         }
         self.absorb_script_output();

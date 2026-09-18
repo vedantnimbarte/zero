@@ -618,30 +618,36 @@ mod tests {
         assert_eq!(doc.text_of(4), "untouched");
     }
 
+    use std::cell::RefCell;
+    // Ordered, so `keys()` is stable the way the trait asks.
+    use std::collections::BTreeMap as Map;
+    use std::rc::Rc;
+
+    /// Stand-in for the embedder's on-disk store, shared by the storage tests.
+    #[derive(Default)]
+    struct MemStore(RefCell<Map<String, String>>);
+
+    impl crate::KeyValueStore for MemStore {
+        fn get(&self, key: &str) -> Option<String> {
+            self.0.borrow().get(key).cloned()
+        }
+        fn set(&self, key: &str, value: &str) -> bool {
+            self.0.borrow_mut().insert(key.into(), value.into());
+            true
+        }
+        fn remove(&self, key: &str) {
+            self.0.borrow_mut().remove(key);
+        }
+        fn clear(&self) {
+            self.0.borrow_mut().clear();
+        }
+        fn keys(&self) -> Vec<String> {
+            self.0.borrow().keys().cloned().collect()
+        }
+    }
+
     #[test]
     fn local_storage_reads_writes_and_survives_a_reload() {
-        use std::cell::RefCell;
-        use std::collections::HashMap as Map;
-        use std::rc::Rc;
-
-        /// Stand-in for the embedder's on-disk store.
-        #[derive(Default)]
-        struct MemStore(RefCell<Map<String, String>>);
-        impl crate::KeyValueStore for MemStore {
-            fn get(&self, key: &str) -> Option<String> {
-                self.0.borrow().get(key).cloned()
-            }
-            fn set(&self, key: &str, value: &str) {
-                self.0.borrow_mut().insert(key.into(), value.into());
-            }
-            fn remove(&self, key: &str) {
-                self.0.borrow_mut().remove(key);
-            }
-            fn clear(&self) {
-                self.0.borrow_mut().clear();
-            }
-        }
-
         let store = Rc::new(MemStore::default());
         let page = "<html><body><script>\
             console.log(localStorage.getItem('visits'));\
@@ -651,18 +657,238 @@ mod tests {
             console.log(localStorage.getItem('junk'));\
             </script></body></html>";
 
-        let doc = crate::Document::load_hosted(page, "", None, Some(store.clone()));
+        let doc = crate::Document::load_hosted(page, "", None, Some(store.clone()), None);
         // First visit: nothing stored yet, and a removed key reads back as null.
         assert_eq!(doc.console, vec!["null", "null"]);
 
         // Same store, fresh document: the value written last time is still there.
-        let doc = crate::Document::load_hosted(page, "", None, Some(store.clone()));
+        let doc = crate::Document::load_hosted(page, "", None, Some(store.clone()), None);
         assert_eq!(doc.console[0], "1");
 
         // A different site gets a different store, so it sees nothing.
         let other = Rc::new(MemStore::default());
-        let doc = crate::Document::load_hosted(page, "", None, Some(other));
+        let doc = crate::Document::load_hosted(page, "", None, Some(other), None);
         assert_eq!(doc.console[0], "null");
+    }
+
+    #[test]
+    fn storage_length_key_and_property_access_go_through_the_store() {
+        let store = Rc::new(MemStore::default());
+        let page = "<html><body><script>\
+            localStorage.setItem('a', '1');\
+            localStorage.b = '2';\
+            localStorage['c'] = 3;\
+            console.log(localStorage.length);\
+            console.log(localStorage.key(0), localStorage.key(2), localStorage.key(9));\
+            console.log(localStorage.a, localStorage['b'], localStorage.c);\
+            console.log(localStorage.missing, localStorage.getItem('missing'));\
+            </script></body></html>";
+        let doc = crate::Document::load_hosted(page, "", None, Some(store.clone()), None);
+
+        // A property write is a real write, so it counts toward `length` and
+        // is readable through `getItem` — the thing a plain object could not do.
+        assert_eq!(doc.console[0], "3");
+        assert_eq!(doc.console[1], "a c null", "key() past the end is null");
+        assert_eq!(doc.console[2], "1 2 3", "values coerce to strings on the way in");
+        // The web draws this distinction and scripts feature-detect on it.
+        assert_eq!(doc.console[3], "undefined null");
+        assert_eq!(store.0.borrow().get("c").map(String::as_str), Some("3"));
+    }
+
+    #[test]
+    fn the_two_storage_areas_do_not_share_keys_through_property_access() {
+        let local = Rc::new(MemStore::default());
+        let session = Rc::new(MemStore::default());
+        let page = "<html><body><script>\
+            localStorage.k = 'L';\
+            sessionStorage.k = 'S';\
+            console.log(localStorage.k, sessionStorage.k);\
+            console.log(localStorage.length, sessionStorage.length);\
+            sessionStorage.clear();\
+            console.log(localStorage.k, sessionStorage.k);\
+            </script></body></html>";
+        let doc = crate::Document::load_hosted(
+            page,
+            "",
+            None,
+            Some(local.clone()),
+            Some(session.clone()),
+        );
+        assert_eq!(doc.console[0], "L S");
+        assert_eq!(doc.console[1], "1 1");
+        assert_eq!(doc.console[2], "L undefined", "clearing one must not touch the other");
+    }
+
+    /// A store that accepts nothing, standing in for a full area.
+    #[derive(Default)]
+    struct FullStore;
+
+    impl crate::KeyValueStore for FullStore {
+        fn get(&self, _key: &str) -> Option<String> {
+            None
+        }
+        fn set(&self, _key: &str, _value: &str) -> bool {
+            false
+        }
+        fn remove(&self, _key: &str) {}
+        fn clear(&self) {}
+        fn keys(&self) -> Vec<String> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn delete_and_in_reach_through_to_the_store() {
+        let store = Rc::new(MemStore::default());
+        let page = "<html><body><script>\
+            localStorage.setItem('a', '1');\
+            localStorage.setItem('b', '2');\
+            console.log('a' in localStorage, 'zz' in localStorage);\
+            delete localStorage.a;\
+            console.log('a' in localStorage, localStorage.getItem('a'));\
+            delete localStorage['b'];\
+            console.log(localStorage.length);\
+            </script></body></html>";
+        let doc = crate::Document::load_hosted(page, "", None, Some(store.clone()), None);
+
+        assert_eq!(doc.console[0], "true false");
+        // The point of the whole exercise: `delete` must write through to the
+        // embedder, not quietly drop a property off a local object.
+        assert_eq!(doc.console[1], "false null");
+        assert_eq!(doc.console[2], "0");
+        assert!(store.0.borrow().is_empty(), "both keys should be gone from the store itself");
+    }
+
+    #[test]
+    fn for_in_and_for_of_walk_a_storage_area() {
+        // The canonical way a page enumerates its own storage.
+        let store = Rc::new(MemStore::default());
+        let page = "<html><body><script>            localStorage.setItem('a', '1');            localStorage.setItem('b', '2');            var names = '';            for (var k in localStorage) { names += k; }            console.log(names);            var vals = '';            for (var v of Object.values(localStorage)) { vals += v; }            console.log(vals);            var stopped = '';            for (var k in localStorage) { stopped += k; break; }            console.log(stopped);            </script></body></html>";
+        let doc = crate::Document::load_hosted(page, "", None, Some(store), None);
+        assert_eq!(doc.console[0], "ab", "for-in walks the keys");
+        assert_eq!(doc.console[1], "12", "for-of walks the values");
+        assert_eq!(doc.console[2], "a", "break leaves the loop");
+    }
+
+    #[test]
+    fn writing_to_a_storage_area_while_walking_it_still_terminates() {
+        // A body that adds a key per key it sees would never finish if the
+        // loop asked the store again each pass.
+        let store = Rc::new(MemStore::default());
+        let page = "<html><body><script>            localStorage.setItem('a', '1');            var seen = 0;            for (var k in localStorage) { seen = seen + 1; localStorage.setItem(k + 'x', '1'); }            console.log(seen);            </script></body></html>";
+        let doc = crate::Document::load_hosted(page, "", None, Some(store), None);
+        assert_eq!(doc.console[0], "1", "the walk is over the keys present when it started");
+    }
+
+    #[test]
+    fn object_keys_walks_a_storage_area() {
+        let store = Rc::new(MemStore::default());
+        let page = "<html><body><script>\
+            localStorage.setItem('one', 'x');\
+            localStorage.setItem('two', 'y');\
+            console.log(Object.keys(localStorage).length);\
+            console.log(Object.keys(localStorage)[0], Object.keys(localStorage)[1]);\
+            console.log(Object.values(localStorage)[0]);\
+            console.log(Object.entries(localStorage)[1][0], Object.entries(localStorage)[1][1]);\
+            </script></body></html>";
+        let doc = crate::Document::load_hosted(page, "", None, Some(store), None);
+
+        assert_eq!(doc.console[0], "2");
+        assert_eq!(doc.console[1], "one two");
+        assert_eq!(doc.console[2], "x");
+        assert_eq!(doc.console[3], "two y");
+    }
+
+    #[test]
+    fn a_full_area_throws_quota_exceeded_where_a_site_can_catch_it() {
+        // Sites catch this by name to fall back to a smaller cache. A write
+        // that silently did nothing would leave them believing it was saved.
+        let page = "<html><body><script>\
+            try {\
+              localStorage.setItem('k', 'v');\
+              console.log('no error');\
+            } catch (e) {\
+              console.log('caught', e.name);\
+            }\
+            try {\
+              localStorage.viaProperty = 'v';\
+            } catch (e) {\
+              console.log('property write too', e.name);\
+            }\
+            </script></body></html>";
+        let doc = crate::Document::load_hosted(page, "", None, Some(Rc::new(FullStore)), None);
+
+        assert_eq!(doc.console[0], "caught QuotaExceededError");
+        // A property write is a write, so it has to refuse the same way.
+        assert_eq!(doc.console[1], "property write too QuotaExceededError");
+    }
+
+    #[test]
+    fn the_storage_methods_require_their_arguments() {
+        let page = "<html><body><script>\
+            try { localStorage.setItem('k'); } catch (e) { console.log(e.name); }\
+            try { localStorage.getItem(); } catch (e) { console.log(e.name); }\
+            try { localStorage.removeItem(); } catch (e) { console.log(e.name); }\
+            try { localStorage.key(); } catch (e) { console.log(e.name); }\
+            </script></body></html>";
+        let doc = crate::Document::load_hosted(
+            page,
+            "",
+            None,
+            Some(Rc::new(MemStore::default())),
+            None,
+        );
+        assert_eq!(doc.console, vec!["TypeError"; 4]);
+    }
+
+    #[test]
+    fn a_storage_event_reaches_window_listeners_with_the_values_that_changed() {
+        let page = "<html><body><script>\
+            window.addEventListener('storage', function (e) {\
+              console.log(e.key, e.oldValue, e.newValue, e.url);\
+              console.log(typeof e.storageArea);\
+            });\
+            </script></body></html>";
+        let mut doc = crate::Document::load_hosted(page, "", None, None, None);
+
+        assert!(
+            doc.storage_event(Some("token"), Some("old"), Some("new"), "https://example.com/"),
+            "a registered listener should report that it ran"
+        );
+        assert_eq!(doc.console[0], "token old new https://example.com/");
+        assert_eq!(doc.console[1], "object", "storageArea should be the store itself");
+
+        // `clear()` is announced with a null key and no values.
+        doc.storage_event(None, None, None, "https://example.com/");
+        assert_eq!(doc.console[2], "null null null https://example.com/");
+    }
+
+    #[test]
+    fn a_page_with_no_storage_listener_is_not_disturbed_by_one() {
+        // Worth pinning: the embedder calls this on every same-site tab, and
+        // the answer is what tells it whether that tab needs repainting at all.
+        let page = "<html><body><script>console.log('ran');</script></body></html>";
+        let mut doc = crate::Document::load_hosted(page, "", None, None, None);
+        assert!(
+            !doc.storage_event(Some("k"), None, Some("v"), "https://example.com/"),
+            "with nothing listening there is nothing to run and nothing to repaint"
+        );
+        assert_eq!(doc.console, vec!["ran"], "no handler means no new output");
+    }
+
+    #[test]
+    fn removing_a_storage_listener_stops_it_being_called() {
+        let page = "<html><body><script>\
+            function onStorage(e) { console.log('fired ' + e.key); }\
+            window.addEventListener('storage', onStorage);\
+            window.removeEventListener('storage', onStorage);\
+            </script></body></html>";
+        let mut doc = crate::Document::load_hosted(page, "", None, None, None);
+        assert!(
+            !doc.storage_event(Some("k"), None, Some("v"), "https://example.com/"),
+            "a removed listener must not run"
+        );
+        assert!(doc.console.is_empty());
     }
 
     #[test]

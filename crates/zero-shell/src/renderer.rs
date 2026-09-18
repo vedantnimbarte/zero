@@ -70,7 +70,7 @@ pub fn serve() {
                 continue;
             }
             "click" | "focus" | "blur" | "insert_text" | "backspace" | "resize" | "find"
-            | "submit" | "hover" => {
+            | "submit" | "hover" | "storage_event" => {
                 match session.as_mut() {
                     Some(session) => session.apply(&request),
                     // An interaction with nothing loaded yet is a protocol
@@ -152,7 +152,8 @@ impl Session {
             html,
             css,
             Some(std::rc::Rc::new(PipeLoader)),
-            Some(std::rc::Rc::new(PipeStore)),
+            Some(std::rc::Rc::new(PipeStore { session: false })),
+            Some(std::rc::Rc::new(PipeStore { session: true })),
         );
         if !find.is_empty() {
             doc.set_find(Some(find.to_string()));
@@ -194,6 +195,20 @@ impl Session {
                 self.doc.focus(request.num_at(0) as usize);
             }
             "blur" => self.doc.blur(),
+            // Another tab wrote to a localStorage area this page shares. The
+            // wire has no null, so a flag per field says which are really
+            // absent rather than empty.
+            "storage_event" => {
+                let present = |i: usize| request.num_at(i) != 0.0;
+                let field = |i: usize| present(i).then(|| request.str_at(i).to_string());
+                let (key, old, new) = (field(0), field(1), field(2));
+                self.doc.storage_event(
+                    key.as_deref(),
+                    old.as_deref(),
+                    new.as_deref(),
+                    request.str_at(3),
+                );
+            }
             "insert_text" => {
                 self.doc.insert_text(request.str_at(0));
             }
@@ -337,11 +352,24 @@ impl ResourceLoader for PipeLoader {
 /// every read is a blocking question for the parent, and every write is
 /// fire-and-forget, exactly as a script calling `localStorage.setItem`
 /// expects never to wait on.
-struct PipeStore;
+struct PipeStore {
+    /// `sessionStorage` rather than `localStorage`. Only the message names
+    /// change; the parent is what knows the two apart.
+    session: bool,
+}
+
+impl PipeStore {
+    /// `storage_get` or `session_get`, and so on. Distinct names rather than a
+    /// scope argument so a wire log still says which store was meant.
+    fn verb(&self, action: &str) -> String {
+        let scope = if self.session { "session" } else { "storage" };
+        format!("{scope}_{action}")
+    }
+}
 
 impl zero_engine::KeyValueStore for PipeStore {
     fn get(&self, key: &str) -> Option<String> {
-        let request = Msg::new("storage_get").text(key);
+        let request = Msg::new(&self.verb("get")).text(key);
         if wire::write(&mut std::io::stdout(), &request).is_err() {
             return None;
         }
@@ -349,19 +377,36 @@ impl zero_engine::KeyValueStore for PipeStore {
         (answer.num_at(0) != 0.0).then(|| answer.str_at(0).to_string())
     }
 
-    fn set(&self, key: &str, value: &str) {
-        let _ = wire::write(
-            &mut std::io::stdout(),
-            &Msg::new("storage_set").text(key).text(value),
-        );
+    /// Unlike the other writes this one waits for an answer: `setItem` is
+    /// specified to throw when the area is full, so the script cannot be told
+    /// it succeeded before the parent has actually accepted it.
+    fn set(&self, key: &str, value: &str) -> bool {
+        let request = Msg::new(&self.verb("set")).text(key).text(value);
+        if wire::write(&mut std::io::stdout(), &request).is_err() {
+            return false;
+        }
+        let Ok(Some(answer)) = wire::read(&mut std::io::stdin()) else { return false };
+        answer.num_at(0) != 0.0
     }
 
     fn remove(&self, key: &str) {
-        let _ = wire::write(&mut std::io::stdout(), &Msg::new("storage_remove").text(key));
+        let _ = wire::write(&mut std::io::stdout(), &Msg::new(&self.verb("remove")).text(key));
     }
 
     fn clear(&self) {
-        let _ = wire::write(&mut std::io::stdout(), &Msg::new("storage_clear"));
+        let _ = wire::write(&mut std::io::stdout(), &Msg::new(&self.verb("clear")));
+    }
+
+    /// The one read that is not about a single key, and the only reason
+    /// `length` and `key(n)` can work at all from inside a process that holds
+    /// no storage of its own. Blocking, like `get`.
+    fn keys(&self) -> Vec<String> {
+        let request = Msg::new(&self.verb("keys"));
+        if wire::write(&mut std::io::stdout(), &request).is_err() {
+            return Vec::new();
+        }
+        let Ok(Some(answer)) = wire::read(&mut std::io::stdin()) else { return Vec::new() };
+        answer.text
     }
 }
 
@@ -497,6 +542,48 @@ enum Service {
 /// Answer (or apply) one non-`frame` message from the child — `fetch` via
 /// `loader`, `storage_*` via `store` when there is one to answer with — or
 /// decode it if it turns out to be the `frame` the caller is waiting for.
+/// Queue a `storage` event for the other tabs on this site.
+///
+/// `localStorage` only. A `sessionStorage` area belongs to one tab and a tab
+/// holds one document, so such a write has no other document to be told about
+/// it — firing one would be inventing an event the web does not raise.
+fn announce(
+    stores: Option<&crate::localstore::Stores>,
+    message: &str,
+    key: Option<String>,
+    old: Option<String>,
+    new: Option<String>,
+) {
+    if message.starts_with("session_") {
+        return;
+    }
+    let Some(stores) = stores else { return };
+    if stores.site.is_empty() {
+        return; // a headless render belongs to no site and no tab
+    }
+    crate::localstore::note_write(crate::localstore::StorageNotice {
+        site: stores.site.clone(),
+        tab: stores.tab,
+        key,
+        old,
+        new,
+    });
+}
+
+/// Which of the two stores a `storage_*`/`session_*` message means. `None`
+/// when the caller has no stores at all, which is how a headless render's
+/// reads answer "missing" and its writes go nowhere.
+fn pick<'a>(
+    stores: Option<&'a crate::localstore::Stores>,
+    message: &str,
+) -> Option<&'a dyn zero_engine::KeyValueStore> {
+    let stores = stores?;
+    match message.starts_with("session_") {
+        true => Some(stores.session.as_ref()),
+        false => Some(stores.local.as_ref()),
+    }
+}
+
 /// Shared by [`round_trip`] (reads the pipe directly) and [`TabRenderer`]'s
 /// reply loop (reads from its background reader thread instead), since
 /// what a message means is the same either way.
@@ -504,7 +591,7 @@ fn handle_service_message(
     message: Msg,
     to_child: &mut impl Write,
     loader: &dyn ResourceLoader,
-    store: Option<&dyn zero_engine::KeyValueStore>,
+    stores: Option<&crate::localstore::Stores>,
 ) -> Service {
     match message.name.as_str() {
         "fetch" => {
@@ -529,8 +616,9 @@ fn handle_service_message(
         // A headless render has no site to persist to (`store` is `None`);
         // every read answers "missing" and every write is silently dropped,
         // same as a script running with storage disabled would see.
-        "storage_get" => {
-            let answer = match store.and_then(|s| s.get(message.str_at(0))) {
+        "storage_get" | "session_get" => {
+            let chosen = pick(stores, &message.name);
+            let answer = match chosen.and_then(|s| s.get(message.str_at(0))) {
                 Some(value) => Msg::new("storage_value").num(1.0).text(value),
                 None => Msg::new("storage_value").num(0.0).text(""),
             };
@@ -539,21 +627,64 @@ fn handle_service_message(
                 Err(_) => Service::Broken,
             }
         }
-        "storage_set" => {
-            if let Some(store) = store {
-                store.set(message.str_at(0), message.str_at(1));
+        "storage_keys" | "session_keys" => {
+            let keys = pick(stores, &message.name).map(|s| s.keys()).unwrap_or_default();
+            let mut answer = Msg::new("storage_keys_value");
+            for key in keys {
+                answer = answer.text(key);
+            }
+            match wire::write(to_child, &answer) {
+                Ok(()) => Service::Continue,
+                Err(_) => Service::Broken,
+            }
+        }
+        "storage_set" | "session_set" => {
+            let mut stored = false;
+            if let Some(store) = pick(stores, &message.name) {
+                let (key, value) = (message.str_at(0), message.str_at(1));
+                let old = store.get(key);
+                // Writing the value that is already there is not a change, and
+                // the web raises no event for it. Announcing anyway would wake
+                // every other tab on the site for nothing — and a handler that
+                // writes back what it read would keep them waking each other.
+                let changed = old.as_deref() != Some(value);
+                stored = store.set(key, value);
+                // A refused write changed nothing, so it announces nothing.
+                if changed && stored {
+                    announce(
+                        stores,
+                        &message.name,
+                        Some(key.to_string()),
+                        old,
+                        Some(value.to_string()),
+                    );
+                }
+            }
+            let answer = Msg::new("storage_stored").num(stored as u8 as f64);
+            match wire::write(to_child, &answer) {
+                Ok(()) => Service::Continue,
+                Err(_) => Service::Broken,
+            }
+        }
+        "storage_remove" | "session_remove" => {
+            if let Some(store) = pick(stores, &message.name) {
+                let key = message.str_at(0);
+                let old = store.get(key);
+                store.remove(key);
+                // Removing a key that was not there removes nothing, so there
+                // is nothing to announce.
+                if old.is_some() {
+                    announce(stores, &message.name, Some(key.to_string()), old, None);
+                }
             }
             Service::Continue
         }
-        "storage_remove" => {
-            if let Some(store) = store {
-                store.remove(message.str_at(0));
-            }
-            Service::Continue
-        }
-        "storage_clear" => {
-            if let Some(store) = store {
+        "storage_clear" | "session_clear" => {
+            if let Some(store) = pick(stores, &message.name) {
                 store.clear();
+                // A cleared area is announced with a null key and no values,
+                // which is how the web says "all of it went".
+                announce(stores, &message.name, None, None, None);
             }
             Service::Continue
         }
@@ -581,7 +712,7 @@ fn round_trip(
     from_child: &mut ChildStdout,
     request: &Msg,
     loader: &dyn ResourceLoader,
-    store: Option<&dyn zero_engine::KeyValueStore>,
+    stores: Option<&crate::localstore::Stores>,
 ) -> Option<Frame> {
     wire::write(to_child, request).ok()?;
     loop {
@@ -589,7 +720,7 @@ fn round_trip(
             Ok(Some(message)) => message,
             _ => return None,
         };
-        match handle_service_message(message, to_child, loader, store) {
+        match handle_service_message(message, to_child, loader, stores) {
             Service::Frame(frame) => return Some(frame),
             Service::Continue => continue,
             // `round_trip` only ever sends `render`, which only ever gets a
@@ -686,7 +817,8 @@ pub fn render_in_child(
         .num(height as f64)
         // A screenshot is the one caller that wants every row of a long page.
         .num(-1.0);
-    // No `store`: a one-shot headless render has no site to persist to.
+    // Neither store: a one-shot headless render has no site to persist to,
+    // and no tab for a session to belong to either.
     let frame = round_trip(&mut to_child, &mut from_child, &request, loader, None);
 
     if frame.is_some() {
@@ -739,7 +871,10 @@ pub struct TabRenderer {
     stdin: ChildStdin,
     replies: mpsc::Receiver<Msg>,
     loader: std::rc::Rc<dyn ResourceLoader>,
-    store: std::rc::Rc<dyn zero_engine::KeyValueStore>,
+    /// This page's `localStorage` and its tab's `sessionStorage`, replaced on
+    /// every navigation. The session half outlives each renderer, because the
+    /// `Tab` — not this — is what owns it.
+    stores: crate::localstore::Stores,
     /// Set once a call times out or the reader thread sees the pipe close.
     /// Every later call fails fast instead of waiting out the timeout again.
     dead: bool,
@@ -756,13 +891,13 @@ impl TabRenderer {
         width: f32,
         height: f32,
         loader: std::rc::Rc<dyn ResourceLoader>,
-        store: std::rc::Rc<dyn zero_engine::KeyValueStore>,
+        stores: crate::localstore::Stores,
     ) -> Option<(TabRenderer, Frame)> {
         // A renderer that was started earlier has already paid for its fonts,
         // which is most of what opening a tab used to cost.
         let mut renderer = take_warm().or_else(Self::start)?;
         renderer.loader = loader;
-        renderer.store = store;
+        renderer.stores = stores;
         let request = Msg::new("render")
             .text(html)
             .text(css)
@@ -798,7 +933,7 @@ impl TabRenderer {
             // Replaced the moment a page is given to it; a renderer with nothing
             // loaded has nothing to fetch and nowhere to store it.
             loader: std::rc::Rc::new(zero_engine::resource::NullLoader),
-            store: std::rc::Rc::new(crate::localstore::NullStore),
+            stores: crate::localstore::Stores::none(),
             dead: false,
         })
     }
@@ -818,10 +953,10 @@ impl TabRenderer {
         width: f32,
         height: f32,
         loader: std::rc::Rc<dyn ResourceLoader>,
-        store: std::rc::Rc<dyn zero_engine::KeyValueStore>,
+        stores: crate::localstore::Stores,
     ) -> Option<Frame> {
         self.loader = loader;
-        self.store = store;
+        self.stores = stores;
         let request = Msg::new("render")
             .text(html)
             .text(css)
@@ -829,6 +964,22 @@ impl TabRenderer {
             .num(width as f64)
             .num(height as f64)
             .num(0.0);
+        self.exchange(request)
+    }
+
+    /// Tell this page about a `localStorage` write another tab made, and get
+    /// back whatever its `storage` handler painted.
+    pub fn storage_event(&mut self, notice: &crate::localstore::StorageNotice, url: &str) -> Option<Frame> {
+        let field = |value: &Option<String>| value.clone().unwrap_or_default();
+        let present = |value: &Option<String>| value.is_some() as u8 as f64;
+        let request = Msg::new("storage_event")
+            .text(field(&notice.key))
+            .text(field(&notice.old))
+            .text(field(&notice.new))
+            .text(url)
+            .num(present(&notice.key))
+            .num(present(&notice.old))
+            .num(present(&notice.new));
         self.exchange(request)
     }
 
@@ -909,7 +1060,7 @@ impl TabRenderer {
                 self.mark_dead();
                 return None;
             };
-            match handle_service_message(message, &mut self.stdin, self.loader.as_ref(), Some(self.store.as_ref())) {
+            match handle_service_message(message, &mut self.stdin, self.loader.as_ref(), Some(&self.stores)) {
                 Service::Text(text, headings) => return Some((text, headings)),
                 Service::Continue => continue,
                 Service::Frame(_) | Service::Broken => {
@@ -942,7 +1093,7 @@ impl TabRenderer {
                 self.mark_dead();
                 return None;
             };
-            match handle_service_message(message, &mut self.stdin, self.loader.as_ref(), Some(self.store.as_ref())) {
+            match handle_service_message(message, &mut self.stdin, self.loader.as_ref(), Some(&self.stores)) {
                 Service::Frame(frame) => return Some(frame),
                 Service::Continue => continue,
                 Service::Text(..) | Service::Broken => {
@@ -1035,9 +1186,15 @@ impl FakeRenderer {
         width: f32,
         height: f32,
         loader: std::rc::Rc<dyn ResourceLoader>,
-        store: std::rc::Rc<dyn zero_engine::KeyValueStore>,
+        stores: crate::localstore::Stores,
     ) -> Option<(FakeRenderer, Frame)> {
-        let doc = zero_engine::Document::load_hosted(html, css, Some(loader.clone()), Some(store));
+        let doc = zero_engine::Document::load_hosted(
+            html,
+            css,
+            Some(loader.clone()),
+            Some(stores.local),
+            Some(stores.session),
+        );
         let mut me = FakeRenderer {
             engine: Engine::shapes_only(),
             doc,
@@ -1062,7 +1219,7 @@ impl FakeRenderer {
         width: f32,
         height: f32,
         loader: std::rc::Rc<dyn ResourceLoader>,
-        _store: std::rc::Rc<dyn zero_engine::KeyValueStore>,
+        _stores: crate::localstore::Stores,
     ) -> Option<Frame> {
         self.loader = loader;
         self.doc = zero_engine::Document::load(html, css);
@@ -1073,6 +1230,20 @@ impl FakeRenderer {
 
     pub fn is_dead(&self) -> bool {
         false
+    }
+
+    pub fn storage_event(
+        &mut self,
+        notice: &crate::localstore::StorageNotice,
+        url: &str,
+    ) -> Option<Frame> {
+        self.doc.storage_event(
+            notice.key.as_deref(),
+            notice.old.as_deref(),
+            notice.new.as_deref(),
+            url,
+        );
+        Some(self.snapshot())
     }
 
     pub fn click(&mut self, node_id: usize) -> Option<Frame> {
@@ -1163,14 +1334,73 @@ impl FakeRenderer {
 mod tests {
     use super::*;
 
+    /// Which writes raise a `storage` event for the other tabs.
+    ///
+    /// Driven through `handle_service_message` itself, because that is where
+    /// the decision lives and the integration harness stands up its own parent
+    /// instead of calling it. A spurious event is not a harmless extra: it
+    /// wakes every other tab on the site, and a handler that writes back what
+    /// it read would keep them waking each other indefinitely.
+    #[test]
+    fn only_a_write_that_changed_something_is_announced() {
+        let stores = crate::localstore::Stores {
+            local: crate::localstore::site_store("announce.example"),
+            session: std::rc::Rc::new(NoStore),
+            site: "announce.example".to_string(),
+            tab: 3,
+        };
+        let loader = zero_engine::resource::NullLoader;
+        let mut sink: Vec<u8> = Vec::new();
+
+        let mut send = |message: Msg| {
+            let _ = handle_service_message(message, &mut sink, &loader, Some(&stores));
+            crate::localstore::take_writes()
+        };
+
+        let first = send(Msg::new("storage_set").text("k").text("one"));
+        assert_eq!(first.len(), 1, "a new value is a change");
+        assert_eq!(first[0].old, None);
+        assert_eq!(first[0].new.as_deref(), Some("one"));
+        assert_eq!(first[0].tab, 3, "the notice must name its writer, to skip it");
+
+        let again = send(Msg::new("storage_set").text("k").text("one"));
+        assert!(again.is_empty(), "writing the value already there changes nothing");
+
+        let changed = send(Msg::new("storage_set").text("k").text("two"));
+        assert_eq!(changed.len(), 1, "a different value is a change again");
+        assert_eq!(changed[0].old.as_deref(), Some("one"), "the event carries what it replaced");
+
+        let absent = send(Msg::new("storage_remove").text("never-set"));
+        assert!(absent.is_empty(), "removing what was not there removes nothing");
+
+        let present = send(Msg::new("storage_remove").text("k"));
+        assert_eq!(present.len(), 1);
+        assert_eq!(present[0].new, None, "a removal has no new value");
+
+        // sessionStorage belongs to one tab, which holds one document, so a
+        // write to it has no other document to be told about.
+        let session = send(Msg::new("session_set").text("s").text("x"));
+        assert!(session.is_empty(), "sessionStorage never raises a cross-tab event");
+
+        // `clear()` is announced with a null key, whatever it emptied.
+        let cleared = send(Msg::new("storage_clear"));
+        assert_eq!(cleared.len(), 1);
+        assert_eq!(cleared[0].key, None, "a cleared area is announced with a null key");
+    }
+
     struct NoStore;
     impl zero_engine::KeyValueStore for NoStore {
         fn get(&self, _: &str) -> Option<String> {
             None
         }
-        fn set(&self, _: &str, _: &str) {}
+        fn set(&self, _: &str, _: &str) -> bool {
+            true
+        }
         fn remove(&self, _: &str) {}
         fn clear(&self) {}
+        fn keys(&self) -> Vec<String> {
+            Vec::new()
+        }
     }
 
     #[test]
@@ -1188,9 +1418,14 @@ mod tests {
         // pipe has to be caught immediately, not by sitting out
         // `REPLY_TIMEOUT` for a reply that was never going to arrive.
         let loader: std::rc::Rc<dyn ResourceLoader> = std::rc::Rc::new(zero_engine::resource::NullLoader);
-        let store: std::rc::Rc<dyn zero_engine::KeyValueStore> = std::rc::Rc::new(NoStore);
+        let stores = crate::localstore::Stores {
+            local: std::rc::Rc::new(NoStore),
+            session: std::rc::Rc::new(NoStore),
+            site: String::new(),
+            tab: 0,
+        };
         let start = std::time::Instant::now();
-        let result = TabRenderer::spawn("<div></div>", "", 100.0, 100.0, loader, store);
+        let result = TabRenderer::spawn("<div></div>", "", 100.0, 100.0, loader, stores);
         assert!(result.is_none(), "a process that never sends a frame should not produce a renderer");
         assert!(
             start.elapsed() < REPLY_TIMEOUT / 2,

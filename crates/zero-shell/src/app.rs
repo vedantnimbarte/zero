@@ -717,11 +717,33 @@ fn lower(key: &str) -> String {
 /// The storage partition for a target: its site for URLs, the file name for local
 /// pages, so two local examples don't share one bucket.
 fn storage_site(address: &str) -> String {
-    let site = crate::cookies::site_of(address);
-    if site.is_empty() {
-        address_label(address)
-    } else {
-        site
+    // Deliberately not `cookies::site_of`, which drops the scheme and the
+    // port. That is right for cookies — they are scoped by host and a cookie
+    // set over https is readable over http — but a storage area is scoped by
+    // *origin*. Sharing one between `http://example.com` and
+    // `https://example.com` would let anything able to tamper with the plain
+    // page read and rewrite what the secure one stored, which is the whole
+    // reason the web draws this boundary where it does.
+    let host = crate::cookies::site_of(address);
+    if host.is_empty() {
+        return address_label(address);
+    }
+    let scheme = address.split("://").next().unwrap_or("").to_ascii_lowercase();
+    if scheme.is_empty() || scheme == address {
+        return host;
+    }
+    // The port is part of the origin, so it stays. Its absence is itself a
+    // distinct origin from any explicit port, which is what the web says.
+    let port = address
+        .split("://")
+        .nth(1)
+        .and_then(|rest| rest.split('/').next())
+        .and_then(|hostport| hostport.rsplit('@').next())
+        .and_then(|hostport| hostport.split(':').nth(1))
+        .filter(|port| !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()));
+    match port {
+        Some(port) => format!("{scheme}://{host}:{port}"),
+        None => format!("{scheme}://{host}"),
     }
 }
 
@@ -869,6 +891,11 @@ fn selection_text(runs: &[&TextRun]) -> String {
 
 /// Everything that belongs to one tab, including its own history and render cache.
 struct Tab {
+    /// Identifies this tab for the life of the process, so a `localStorage`
+    /// write can name the one tab that must *not* be told about it. Not an
+    /// index: tabs get reordered and closed, and an index would quietly start
+    /// pointing at a different tab.
+    id: usize,
     address: String,
     /// A process of its own, holding the parsed DOM and a live JS runtime so
     /// handlers survive between frames — see `docs/03-ROADMAP.md`'s note on
@@ -905,6 +932,10 @@ struct Tab {
     /// sends a `hover` message — and pays for a round trip and a repaint —
     /// when it has actually changed, not on every mouse-move pixel.
     hovered_node: Option<usize>,
+    /// This tab's `sessionStorage`, one map per site. It lives here, above
+    /// the renderer, because a web navigation replaces the renderer process
+    /// outright — and surviving exactly that is the whole point of it.
+    sessions: Rc<crate::localstore::TabSessions>,
     /// The markup this page was built from, kept for view-source and saving.
     source: String,
     /// Shared with this tab's document so its subresource cache outlives a
@@ -935,8 +966,45 @@ fn can_share_a_renderer(from: &str, to: &str) -> bool {
     crate::internal::is_internal(from) && crate::internal::is_internal(to)
 }
 
-fn store_for(address: &str) -> Rc<dyn zero_engine::KeyValueStore> {
-    Rc::new(crate::localstore::SiteStore::for_site(&storage_site(address)))
+/// Both of a page's stores, partitioned by the same site rule: its site's
+/// `localStorage` off disk, and its tab's `sessionStorage` out of `sessions`.
+/// Navigating away to another site and back finds the first site's keys still
+/// there in both, and the second site's kept apart from them.
+fn stores_for(
+    address: &str,
+    sessions: &Rc<crate::localstore::TabSessions>,
+    tab: usize,
+) -> crate::localstore::Stores {
+    let site = storage_site(address);
+    crate::localstore::Stores {
+        local: crate::localstore::site_store(&site),
+        session: sessions.for_site(&site),
+        site,
+        tab,
+    }
+}
+
+/// Whether a tab should be told about someone else's `localStorage` write.
+///
+/// Two rules, and both matter: the tab that made the write never hears its own
+/// (the web fires `storage` only on *other* documents, and a page that heard
+/// its own writes would loop if its handler wrote anything), and a tab on a
+/// different site shares no storage area to be told about.
+fn hears_storage(tab: usize, address: &str, notice: &crate::localstore::StorageNotice) -> bool {
+    tab != notice.tab && storage_site(address) == notice.site
+}
+
+/// The next tab identity. Monotonic, never reused, so a notice queued against
+/// a tab that has since closed matches nothing rather than the wrong tab.
+fn next_tab_id() -> usize {
+    thread_local! {
+        static NEXT: std::cell::Cell<usize> = const { std::cell::Cell::new(1) };
+    }
+    NEXT.with(|next| {
+        let id = next.get();
+        next.set(id + 1);
+        id
+    })
 }
 
 /// Undo `renderer::write_frame`'s RGBA packing.
@@ -951,6 +1019,8 @@ fn canvas_from_frame(frame: &renderer::Frame) -> Canvas {
 impl Tab {
     fn new(address: String, html: String, css: String) -> Tab {
         let loader = Rc::new(ShellLoader::new(address.clone()));
+        let sessions = Rc::new(crate::localstore::TabSessions::default());
+        let id = next_tab_id();
         let draw = |html: &str, css: &str| {
             TabRenderer::spawn(
                 html,
@@ -958,7 +1028,7 @@ impl Tab {
                 DEFAULT_VIEWPORT.0,
                 DEFAULT_VIEWPORT.1,
                 loader.clone(),
-                store_for(&address),
+                stores_for(&address, &sessions, id),
             )
         };
         // A page the renderer cannot draw costs this tab, not the window: the
@@ -976,6 +1046,7 @@ impl Tab {
             }
         };
         let mut tab = Tab {
+            id,
             loader,
             history: vec![address.clone()],
             address,
@@ -996,6 +1067,7 @@ impl Tab {
             selection: None,
             uses_hover: false,
             hovered_node: None,
+            sessions,
             source,
             cache_w: 0,
             cache_h: 0,
@@ -1044,8 +1116,14 @@ impl Tab {
         if self.source.is_empty() {
             return None; // nothing loaded yet to reload
         }
-        let (mut renderer, frame) =
-            TabRenderer::spawn(&self.source, "", w, h, self.loader.clone(), store_for(&self.address))?;
+        let (mut renderer, frame) = TabRenderer::spawn(
+            &self.source,
+            "",
+            w,
+            h,
+            self.loader.clone(),
+            stores_for(&self.address, &self.sessions, self.id),
+        )?;
         // A fresh renderer starts at the top of the page; this tab may not be.
         let frame = match band_top > 0.0 {
             true => renderer.resize(w, h, band_top).unwrap_or(frame),
@@ -1382,6 +1460,11 @@ impl ApplicationHandler for App {
             }
             _ => {}
         }
+        // Whatever just ran may have written to localStorage. The other tabs
+        // on that site are told here, at the end of the event that caused it,
+        // because a write arrives deep inside a renderer reply loop that is
+        // already talking to one tab and cannot start talking to another.
+        self.deliver_storage_events();
     }
 }
 
@@ -1440,6 +1523,40 @@ impl App {
         let (w, h) = (tab.cache_w, tab.cache_h);
         tab.apply_frame(frame, w, h);
         true
+    }
+
+    /// Hand every queued `localStorage` write to the other tabs on that site.
+    ///
+    /// Called once per window event rather than at the write itself: a write
+    /// arrives deep inside a renderer reply loop, which is talking to one tab
+    /// and cannot start talking to another without reentering itself.
+    ///
+    /// ponytail: every same-site tab pays a round trip whether or not it has a
+    /// `storage` listener, because only its own renderer knows whether it
+    /// does. Usually that is no tabs at all; a per-renderer "is anyone
+    /// listening" flag on the frame would cut it if a site ever opens many.
+    fn deliver_storage_events(&mut self) {
+        let notices = crate::localstore::take_writes();
+        if notices.is_empty() {
+            return;
+        }
+        let mut repaint = false;
+        for notice in notices {
+            for i in 0..self.tabs.len() {
+                if !hears_storage(self.tabs[i].id, &self.tabs[i].address, &notice) {
+                    continue;
+                }
+                let url = self.tabs[i].address.clone();
+                let (w, h) = (self.tabs[i].cache_w, self.tabs[i].cache_h);
+                if let Some(frame) = self.tabs[i].renderer.storage_event(&notice, &url) {
+                    self.tabs[i].apply_frame(frame, w, h);
+                    repaint = true;
+                }
+            }
+        }
+        if repaint {
+            self.request_redraw();
+        }
     }
 
     fn request_redraw(&self) {
@@ -2180,7 +2297,7 @@ impl App {
                 w,
                 h,
                 tab.loader.clone(),
-                store_for(&tab.address),
+                stores_for(&tab.address, &tab.sessions, tab.id),
             ),
             false => TabRenderer::spawn(
                 &fetched.body,
@@ -2188,7 +2305,7 @@ impl App {
                 w,
                 h,
                 tab.loader.clone(),
-                store_for(&tab.address),
+                stores_for(&tab.address, &tab.sessions, tab.id),
             )
             .map(|(renderer, frame)| {
                 tab.renderer = renderer; // dropping the old one kills its process
@@ -2207,7 +2324,7 @@ impl App {
                     w,
                     h,
                     tab.loader.clone(),
-                    store_for(&tab.address),
+                    stores_for(&tab.address, &tab.sessions, tab.id),
                 ) {
                     Some((renderer, frame)) => {
                         tab.renderer = renderer;
@@ -3738,6 +3855,60 @@ fn blit(buffer: &mut [u32], w: u32, h: u32, canvas: &Canvas, x0: u32, y0: u32) {
 
 #[cfg(test)]
 mod tests {
+    /// A storage area belongs to an origin. If this ever collapses back to a
+    /// bare host, a page served over http silently gains read and write access
+    /// to whatever the https site of the same name stored — a boundary that
+    /// fails open and shows no symptom until it is being exploited.
+    #[test]
+    fn a_storage_area_is_scoped_to_an_origin_not_just_a_host() {
+        let site = super::storage_site;
+        assert_ne!(
+            site("http://example.com/a"),
+            site("https://example.com/a"),
+            "http and https must not share a storage area"
+        );
+        assert_ne!(
+            site("https://example.com/a"),
+            site("https://example.com:8443/a"),
+            "an explicit port is a different origin"
+        );
+        // The things that must NOT split an area.
+        assert_eq!(site("https://example.com/a"), site("https://example.com/b/c?q=1"));
+        assert_eq!(site("https://EXAMPLE.com/a"), site("https://example.com/a"));
+        assert_eq!(site("https://user@example.com/a"), site("https://example.com/a"));
+        // A subdomain is its own origin, as on the web.
+        assert_ne!(site("https://app.example.com/"), site("https://example.com/"));
+    }
+
+    /// The two rules that decide who hears a `localStorage` write. Getting
+    /// either wrong is silent: a missed event looks like a page that just
+    /// did not react, and a self-delivered one looks like a page that
+    /// reacted twice — or, if its handler writes, that will not stop.
+    #[test]
+    fn a_storage_write_reaches_other_tabs_on_its_site_and_nobody_else() {
+        let notice = crate::localstore::StorageNotice {
+            // An origin, which is what `storage_site` yields.
+            site: "https://example.com".into(),
+            tab: 7,
+            key: Some("k".into()),
+            old: None,
+            new: Some("v".into()),
+        };
+
+        assert!(
+            super::hears_storage(8, "https://example.com/page", &notice),
+            "another tab on the same site should hear it"
+        );
+        assert!(
+            !super::hears_storage(7, "https://example.com/page", &notice),
+            "the tab that wrote it must never hear its own write"
+        );
+        assert!(
+            !super::hears_storage(8, "https://other.example/page", &notice),
+            "a tab on another site shares no storage area"
+        );
+    }
+
     use super::*;
 
     fn settings_with(layout: TabLayout, rail: Rail) -> Settings {
