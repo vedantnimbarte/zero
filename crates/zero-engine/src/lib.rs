@@ -632,6 +632,9 @@ const USER_AGENT_CSS: &str = "
     img { display: inline-block; }
     table { display: table; }
     pre { white-space: pre; }
+    /* Code is monospace unless the page says otherwise — the UA stylesheet is
+       what makes that true, and `font-family` can act on it now. */
+    code, pre, kbd, samp, tt { font-family: monospace; }
     td, th { display: block; padding: 6px; }
     input, textarea, select { background: #ffffff; color: #111111; padding: 7px;
         border-radius: 4px; width: 260px; }

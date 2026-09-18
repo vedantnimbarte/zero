@@ -14,6 +14,11 @@ fn load_system_fonts() -> Vec<Vec<u8>> {
         // Windows
         "C:/Windows/Fonts/segoeui.ttf",
         "C:/Windows/Fonts/seguisym.ttf", // arrows, stars and other UI symbols
+        // A serif and a monospace face, so `font-family: serif` and the
+        // `monospace` every code block on every docs site asks for resolve to
+        // something that looks like what was asked for.
+        "C:/Windows/Fonts/georgia.ttf",
+        "C:/Windows/Fonts/consola.ttf",
         // Devanagari/Tamil/Telugu/Bengali/… Windows ships this as a collection;
         // the loose `.ttf` only exists on some installs, and looking for it
         // alone is why Hindi came out as empty boxes on the ones it does not.
@@ -27,6 +32,8 @@ fn load_system_fonts() -> Vec<Vec<u8>> {
         // macOS
         "/System/Library/Fonts/Supplemental/Arial.ttf",
         "/System/Library/Fonts/Apple Symbols.ttf",
+        "/System/Library/Fonts/Supplemental/Georgia.ttf",
+        "/System/Library/Fonts/Menlo.ttc",
         "/System/Library/Fonts/Supplemental/Devanagari Sangam MN.ttc",
         "/System/Library/Fonts/PingFang.ttc",         // Chinese
         "/System/Library/Fonts/Hiragino Sans GB.ttc", // Japanese
@@ -35,6 +42,8 @@ fn load_system_fonts() -> Vec<Vec<u8>> {
         // Linux
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
         "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf",
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
