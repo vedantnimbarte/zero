@@ -1095,7 +1095,7 @@ impl<'a> LayoutBox<'a> {
                     if line.is_empty() {
                         continue; // a blank line still occupies its height
                     }
-                    let font_index = fonts.pick(line);
+                    let font_index = fonts.pick_in(&piece.families, line);
                     let (mut glyphs, width) =
                         shape_run(&fonts.entries[font_index], line, piece.size);
                     let width = width + spread_glyphs(&mut glyphs, piece.letter_spacing);
@@ -1135,7 +1135,7 @@ impl<'a> LayoutBox<'a> {
             for word in piece.text.split_ascii_whitespace() {
                 // Pick a font that can draw this word, then shape it: this is where
                 // Indic reordering/conjuncts happen.
-                let font_index = fonts.pick(word);
+                let font_index = fonts.pick_in(&piece.families, word);
                 let (mut glyphs, word_w) =
                     shape_run(&fonts.entries[font_index], word, piece.size);
                 let word_w = word_w + spread_glyphs(&mut glyphs, piece.letter_spacing);
@@ -1934,6 +1934,9 @@ fn place_out_of_flow(
 struct TextPiece {
     text: String,
     size: f32,
+    /// What the page asked for, best first. Shared rather than copied: every
+    /// run in a paragraph names the same list.
+    families: std::rc::Rc<Vec<String>>,
     line_height: f32,
     letter_spacing: f32,
     color: Color,
@@ -2063,6 +2066,14 @@ fn collect_inline_text(
             out.push(InlinePiece::Text(TextPiece {
                 text: t.clone(),
                 size,
+                families: std::rc::Rc::new(match styled.value("font-family") {
+                    Some(value) => crate::css::family_list(&match value {
+                        Value::Raw(text) => text,
+                        Value::Keyword(word) => word,
+                        _ => String::new(),
+                    }),
+                    None => Vec::new(),
+                }),
                 line_height: styled.line_height(),
                 letter_spacing: styled.px("letter-spacing", 0.0).unwrap_or(0.0),
                 color,

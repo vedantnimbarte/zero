@@ -559,9 +559,10 @@ fn resolve_vars(values: &mut PropertyMap, vars: &PropertyMap) {
 /// never declared it — but a text node here reads its own value with no such
 /// propagation mechanism, so treating it as inherited is what makes
 /// `p { text-decoration: underline }` reach the text at all.
-const INHERITED_PROPERTIES: [&str; 10] = [
+const INHERITED_PROPERTIES: [&str; 11] = [
     "color",
     "font-size",
+    "font-family",
     "text-align",
     "white-space",
     "visibility",

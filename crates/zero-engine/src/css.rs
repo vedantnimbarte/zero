@@ -12,6 +12,18 @@
 #[derive(Debug)]
 pub struct Stylesheet {
     pub rules: Vec<Rule>,
+    /// Every `@font-face` the sheet declared, in source order.
+    pub font_faces: Vec<FontFace>,
+}
+
+/// One `@font-face`: a name the page's `font-family` can ask for, and where to
+/// fetch the file that answers to it.
+#[derive(Debug)]
+pub struct FontFace {
+    pub family: String,
+    /// Every `url(...)` in `src`, in the order the page listed them — the
+    /// first one that downloads and parses is the one used.
+    pub srcs: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -390,6 +402,58 @@ impl Value {
     }
 }
 
+/// A declaration's text, whichever shape the parser gave it.
+///
+/// `@font-face`'s descriptors are not real properties, so they arrive
+/// classified as whatever they happened to look like — a bare family name as a
+/// keyword, a quoted one as raw text.
+fn value_text(value: &Value) -> String {
+    match value {
+        Value::Raw(text) => text.clone(),
+        Value::Keyword(word) => word.clone(),
+        other => format!("{other:?}"),
+    }
+}
+
+/// Strip one layer of matching quotes.
+fn unquote(text: &str) -> &str {
+    let text = text.trim();
+    for quote in ['"', '\''] {
+        if let Some(inner) = text.strip_prefix(quote).and_then(|t| t.strip_suffix(quote)) {
+            return inner;
+        }
+    }
+    text
+}
+
+/// Every `url(...)` in a value, in source order.
+fn url_tokens(text: &str) -> Vec<String> {
+    let mut urls = Vec::new();
+    let mut rest = text;
+    while let Some(open) = rest.find("url(") {
+        rest = &rest[open + 4..];
+        let Some(close) = rest.find(')') else { break };
+        let url = unquote(&rest[..close]).trim().to_string();
+        if !url.is_empty() {
+            urls.push(url);
+        }
+        rest = &rest[close + 1..];
+    }
+    urls
+}
+
+/// Split a `font-family` list into the names it asks for, best first.
+///
+/// Generic families (`sans-serif`, `monospace`, ...) are kept as written: the
+/// engine has no mapping from them to a file, so they simply match nothing and
+/// the fallback chain answers — which is what they mean anyway.
+pub fn family_list(text: &str) -> Vec<String> {
+    text.split(',')
+        .map(|name| unquote(name).trim().to_ascii_lowercase())
+        .filter(|name| !name.is_empty())
+        .collect()
+}
+
 /// Parse the contents of a `style` attribute: a declaration list with no
 /// selector or braces around it.
 ///
@@ -410,9 +474,8 @@ pub fn parse(source: String) -> Stylesheet {
         pos: 0,
         input: source,
     };
-    Stylesheet {
-        rules: parser.parse_rules(),
-    }
+    let (rules, font_faces) = parser.parse_rules();
+    Stylesheet { rules, font_faces }
 }
 
 /// Remove `/* ... */` from a value. Comments are whitespace between tokens, and
@@ -482,6 +545,12 @@ const RAW_VALUE_PROPERTIES: &[&str] = &[
     "transition",
     "transition-property",
     "transition-duration",
+    // A comma-separated list of names, often quoted: `"Helvetica Neue", Arial,
+    // sans-serif`. Classifying it would keep only the first token.
+    "font-family",
+    // `@font-face`'s file list: `url(a.woff2) format("woff2"), url(a.ttf)`.
+    // Nothing classifies as a value, so it would be dropped outright.
+    "src",
 ];
 
 /// The named colours worth carrying, plus `transparent`.
@@ -1015,8 +1084,9 @@ struct Parser {
 }
 
 impl Parser {
-    fn parse_rules(&mut self) -> Vec<Rule> {
+    fn parse_rules(&mut self) -> (Vec<Rule>, Vec<FontFace>) {
         let mut rules = Vec::new();
+        let mut font_faces = Vec::new();
         loop {
             self.consume_whitespace();
             if self.eof() {
@@ -1024,6 +1094,10 @@ impl Parser {
             }
             if self.starts_with("@media") {
                 rules.extend(self.parse_media_block());
+            } else if self.starts_with("@font-face") {
+                if let Some(face) = self.parse_font_face() {
+                    font_faces.push(face);
+                }
             } else if self.starts_with("@") {
                 self.skip_at_rule();
             } else if self.starts_with("}") {
@@ -1032,7 +1106,31 @@ impl Parser {
                 rules.push(rule);
             }
         }
-        rules
+        (rules, font_faces)
+    }
+
+    /// `@font-face { font-family: "Outfit"; src: url(a.woff2) format("woff2"),
+    /// url(a.woff) }` — the name a page's `font-family` can ask for, and where
+    /// the file is.
+    ///
+    /// ponytail: `font-weight`/`font-style`/`unicode-range` descriptors are
+    /// read past. A family with a separate file per weight loads them all under
+    /// one name, and the first that parses wins — so a page gets its typeface
+    /// but not its bold. Selecting within a family needs weight-aware matching,
+    /// which is the same work synthesized bold is standing in for today.
+    fn parse_font_face(&mut self) -> Option<FontFace> {
+        self.consume_while(|c| c != '{');
+        let declarations = self.parse_declarations();
+        let mut family = String::new();
+        let mut srcs = Vec::new();
+        for declaration in &declarations {
+            match declaration.name.as_str() {
+                "font-family" => family = unquote(&value_text(&declaration.value)).to_string(),
+                "src" => srcs = url_tokens(&value_text(&declaration.value)),
+                _ => {}
+            }
+        }
+        (!family.is_empty() && !srcs.is_empty()).then_some(FontFace { family, srcs })
     }
 
     fn parse_rule(&mut self) -> Option<Rule> {
@@ -1792,5 +1890,41 @@ mod tests {
         assert_eq!(chain.parts[3].simple.tag_name.as_deref(), Some("a"));
         // Four tag compounds, so it outranks any single-tag rule.
         assert_eq!(chain.specificity(), (0, 0, 4));
+    }
+}
+
+
+#[cfg(test)]
+mod font_face_tests {
+    use super::*;
+
+    #[test]
+    fn a_font_face_names_a_typeface_and_where_to_fetch_it() {
+        let sheet = parse(
+            "@font-face { font-family: 'Outfit';                src: url(outfit.woff2) format(\"woff2\"), url('outfit.ttf'); }              p { font-family: \"Outfit\", Helvetica, sans-serif; }"
+                .to_string(),
+        );
+        assert_eq!(sheet.font_faces.len(), 1);
+        assert_eq!(sheet.font_faces[0].family, "Outfit");
+        // Both files, in the order the page preferred them.
+        assert_eq!(sheet.font_faces[0].srcs, ["outfit.woff2", "outfit.ttf"]);
+        // The rule beside it survives, and keeps its whole family list.
+        assert_eq!(
+            sheet.rules[0].declarations[0].value,
+            Value::Raw("\"Outfit\", Helvetica, sans-serif".to_string())
+        );
+    }
+
+    #[test]
+    fn a_family_list_is_split_and_folded_but_not_otherwise_touched() {
+        assert_eq!(
+            family_list("\"Helvetica Neue\", Arial , sans-serif"),
+            ["helvetica neue", "arial", "sans-serif"]
+        );
+        // A face declaring neither a name nor a file is not a face.
+        assert!(parse("@font-face { font-weight: 700; }".to_string()).font_faces.is_empty());
+        assert!(parse("@font-face { font-family: X; }".to_string()).font_faces.is_empty());
+        // And an unknown at-rule is still skipped whole, not parsed as one.
+        assert!(parse("@supports (x:y) { p { color: #ff0000; } }".to_string()).rules.is_empty());
     }
 }
