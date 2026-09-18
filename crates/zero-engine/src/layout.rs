@@ -1114,7 +1114,15 @@ impl<'a> LayoutBox<'a> {
         // Percentages in the inline axis resolve against the containing block's width.
         let ctx = style.length_context(containing_block.content.width);
 
-        let mut width = style.value("width").unwrap_or_else(|| auto.clone());
+        // `flex-basis` is this box's starting main size when it's a flex item,
+        // taking priority over `width` the same way the flex sizing pass
+        // itself treats them — meaningless (and so harmless to prefer) on a
+        // box that isn't one.
+        let mut width = style
+            .value("flex-basis")
+            .filter(|v| !matches!(v, Value::Keyword(k) if k == "auto"))
+            .or_else(|| style.value("width"))
+            .unwrap_or_else(|| auto.clone());
         let mut margin_left = style.lookup("margin-left", "margin", &zero);
         let mut margin_right = style.lookup("margin-right", "margin", &zero);
         let border_left = style.lookup("border-left-width", "border-width", &zero);
@@ -1389,10 +1397,13 @@ impl<'a> LayoutBox<'a> {
             return;
         }
 
-        // Each item starts at its base size (explicit width, else content width).
+        // Each item starts at its base size: flex-basis if set (and not
+        // `auto`), else its width, else its content width — the same
+        // resolved-main-size order the flex spec itself defines.
         struct Item {
             base: f32,
             grow: f32,
+            shrink: f32,
         }
         let items: Vec<Item> = self
             .children
@@ -1401,13 +1412,17 @@ impl<'a> LayoutBox<'a> {
                 BoxType::AnonymousBlock => Item {
                     base: 0.0,
                     grow: 1.0,
+                    shrink: 1.0,
                 },
                 _ => {
                     let style = child.get_style_node();
                     let ctx = style.length_context(container.width);
                     // Base is the OUTER width, so gaps and free space line up with
                     // what layout actually produces (a border box, not content).
-                    let base = match style.value("width") {
+                    let explicit_basis = style
+                        .value("flex-basis")
+                        .filter(|v| !matches!(v, Value::Keyword(k) if k == "auto"));
+                    let base = match explicit_basis.or_else(|| style.value("width")) {
                         Some(v @ Value::Length(..)) => {
                             v.resolve(ctx) + horizontal_edges(style, ctx)
                         }
@@ -1419,7 +1434,10 @@ impl<'a> LayoutBox<'a> {
                         .or_else(|| style.value("flex"))
                         .and_then(|v| v.as_number())
                         .unwrap_or(0.0);
-                    Item { base, grow }
+                    // Items shrink by default (`flex-shrink: 1`) unless told not to.
+                    let shrink =
+                        style.value("flex-shrink").and_then(|v| v.as_number()).unwrap_or(1.0);
+                    Item { base, grow, shrink }
                 }
             })
             .collect();
@@ -1463,6 +1481,12 @@ impl<'a> LayoutBox<'a> {
             let used: f32 = line.iter().map(|&i| items[i].base).sum();
             let leftover = container.width - used - total_gap;
             let total_grow: f32 = line.iter().map(|&i| items[i].grow).sum();
+            // The shrink spec's own weight: how much of an over-full line's
+            // overflow each item absorbs is proportional to its own base size
+            // *and* its `flex-shrink` factor — a `flex-shrink: 0` item (or one
+            // with nothing to shrink from) takes none of it, unlike weighting
+            // by base size alone, which would still shrink a 0-shrink item.
+            let total_shrink: f32 = line.iter().map(|&i| items[i].shrink * items[i].base).sum();
 
             // Widths first, so justify-content knows how much space is really free.
             let widths: Vec<f32> = line
@@ -1471,8 +1495,8 @@ impl<'a> LayoutBox<'a> {
                     let mut w = items[i].base;
                     if leftover > 0.0 && total_grow > 0.0 {
                         w += leftover * items[i].grow / total_grow;
-                    } else if leftover < 0.0 && used > 0.0 {
-                        w += leftover * (items[i].base / used); // shrink proportionally
+                    } else if leftover < 0.0 && total_shrink > 0.0 {
+                        w += leftover * (items[i].shrink * items[i].base) / total_shrink;
                     }
                     w.max(0.0)
                 })
@@ -1492,16 +1516,58 @@ impl<'a> LayoutBox<'a> {
                     height: 0.0,
                 };
                 self.children[i].layout(slot, fonts, images);
+                // The line's own grow/shrink math wins over whatever the item's
+                // `width`/`flex-basis` resolved to on its own: `calculate_
+                // block_width` only ever pulls from the containing block when a
+                // box's width is `auto`, and when an explicit width overflows
+                // the slot it hides the difference in a negative margin instead
+                // — the margin *box* ends up the right size, but the box's own
+                // painted content stays wrong. Redo both: content width from
+                // the flex math, margins from the item's own declared style
+                // (not `calculate_block_width`'s over-constrained patch).
+                //
+                // ponytail: this corrects the box's own width, not a reflow of
+                // its children at the new width (wrapped text inside a shrunk
+                // item won't re-wrap) — the same class of limit
+                // `align_cross_axis`'s `stretch` already accepts.
+                let zero = Value::Length(0.0, Unit::Px);
+                let (margin_left, margin_right) = match self.children[i].box_type {
+                    BoxType::AnonymousBlock => (0.0, 0.0),
+                    _ => {
+                        let style = self.children[i].get_style_node();
+                        let ctx = style.length_context(container.width);
+                        (
+                            style.lookup("margin-left", "margin", &zero).resolve(ctx),
+                            style.lookup("margin-right", "margin", &zero).resolve(ctx),
+                        )
+                    }
+                };
+                let d = &mut self.children[i].dimensions;
+                let edges =
+                    margin_left + margin_right + d.border.left + d.border.right + d.padding.left + d.padding.right;
+                d.margin.left = margin_left;
+                d.margin.right = margin_right;
+                d.content.width = (widths[slot_index] - edges).max(0.0);
                 let placed = self.children[i].dimensions.margin_box();
                 cursor_x += placed.width + gap + between;
                 tallest = tallest.max(placed.height);
             }
 
             // Cross-axis alignment happens once the line's height is known.
+            // `align-self` on the item itself overrides the container's
+            // `align-items` for just that one item.
             for &i in line.iter() {
+                let own_align = match self.children[i].box_type {
+                    BoxType::AnonymousBlock => None,
+                    _ => self.children[i]
+                        .get_style_node()
+                        .value("align-self")
+                        .and_then(keyword_of)
+                        .filter(|k| k != "auto"),
+                };
                 align_cross_axis(
                     &mut self.children[i],
-                    &align,
+                    own_align.as_deref().unwrap_or(&align),
                     cursor_y,
                     tallest,
                     fonts,
@@ -2825,6 +2891,107 @@ mod tests {
             .map(|c| c.dimensions.content.width)
             .collect();
         assert_eq!(widths, vec![200.0, 0.0]);
+    }
+
+    #[test]
+    fn flex_shrink_weights_which_items_give_up_space_and_zero_opts_out() {
+        let node = dom::elem("div".into(), HashMap::new(), vec![]);
+        let item = |w: f32, shrink: Option<f32>| {
+            let mut v = HashMap::new();
+            v.insert("display".to_string(), Value::Keyword("block".into()));
+            v.insert("width".to_string(), Value::Length(w, Unit::Px));
+            if let Some(s) = shrink {
+                v.insert("flex-shrink".to_string(), Value::Number(s));
+            }
+            StyledNode { node: &node, specified_values: v, children: vec![] }
+        };
+        let mut values = HashMap::new();
+        values.insert("display".to_string(), Value::Keyword("flex".into()));
+        let root = StyledNode {
+            node: &node,
+            specified_values: values.clone(),
+            // 600 + 400 = 1000 into a 700-wide container: 300px must be given
+            // up. The `flex-shrink: 0` item must not give up any of it.
+            children: vec![item(600.0, None), item(400.0, Some(0.0))],
+        };
+        let mut viewport: Dimensions = Default::default();
+        viewport.content.width = 700.0;
+        let laid = layout_tree(&root, viewport, None, &ImageMap::new());
+        let widths: Vec<f32> =
+            laid.children.iter().map(|c| c.dimensions.content.width).collect();
+        assert_eq!(widths, vec![300.0, 400.0], "only the shrinkable item gives up space");
+
+        // With both items shrinkable (default flex-shrink: 1), the overflow
+        // splits by base-size weight: 600 gives up 600/1000 of it, 400 gives
+        // up 400/1000 — a real flex-shrink distribution, not an even split.
+        let root_both = StyledNode {
+            node: &node,
+            specified_values: values,
+            children: vec![item(600.0, None), item(400.0, None)],
+        };
+        let laid_both = layout_tree(&root_both, viewport, None, &ImageMap::new());
+        let widths_both: Vec<f32> =
+            laid_both.children.iter().map(|c| c.dimensions.content.width).collect();
+        assert_eq!(widths_both, vec![420.0, 280.0]);
+    }
+
+    #[test]
+    fn flex_basis_wins_over_width_as_the_starting_size() {
+        let node = dom::elem("div".into(), HashMap::new(), vec![]);
+        let mut item_values = HashMap::new();
+        item_values.insert("display".to_string(), Value::Keyword("block".into()));
+        item_values.insert("width".to_string(), Value::Length(100.0, Unit::Px));
+        item_values.insert("flex-basis".to_string(), Value::Length(250.0, Unit::Px));
+        let item = StyledNode { node: &node, specified_values: item_values, children: vec![] };
+        let mut values = HashMap::new();
+        values.insert("display".to_string(), Value::Keyword("flex".into()));
+        let root = StyledNode { node: &node, specified_values: values, children: vec![item] };
+        let mut viewport: Dimensions = Default::default();
+        viewport.content.width = 900.0;
+        let laid = layout_tree(&root, viewport, None, &ImageMap::new());
+        assert_eq!(laid.children[0].dimensions.content.width, 250.0);
+    }
+
+    #[test]
+    fn align_self_overrides_the_containers_align_items_per_item() {
+        let node = dom::elem("div".into(), HashMap::new(), vec![]);
+        let item = |align_self: Option<&str>| {
+            let mut v = HashMap::new();
+            v.insert("display".to_string(), Value::Keyword("block".into()));
+            v.insert("width".to_string(), Value::Length(20.0, Unit::Px));
+            v.insert("height".to_string(), Value::Length(20.0, Unit::Px));
+            if let Some(a) = align_self {
+                v.insert("align-self".to_string(), Value::Keyword(a.into()));
+            }
+            StyledNode { node: &node, specified_values: v, children: vec![] }
+        };
+        let mut values = HashMap::new();
+        values.insert("display".to_string(), Value::Keyword("flex".into()));
+        values.insert("align-items".to_string(), Value::Keyword("flex-start".into()));
+        // A 100px-tall sibling makes the line tall enough for alignment to move things.
+        let root = StyledNode {
+            node: &node,
+            specified_values: values,
+            children: vec![
+                item(None),
+                item(Some("flex-end")),
+                {
+                    let mut v = HashMap::new();
+                    v.insert("display".to_string(), Value::Keyword("block".into()));
+                    v.insert("width".to_string(), Value::Length(20.0, Unit::Px));
+                    v.insert("height".to_string(), Value::Length(100.0, Unit::Px));
+                    StyledNode { node: &node, specified_values: v, children: vec![] }
+                },
+            ],
+        };
+        let mut viewport: Dimensions = Default::default();
+        viewport.content.width = 900.0;
+        let laid = layout_tree(&root, viewport, None, &ImageMap::new());
+        // The plain item follows the container's flex-start: stays at the top.
+        assert_eq!(laid.children[0].dimensions.content.y, 0.0);
+        // Its align-self: flex-end sibling is pushed to the bottom of the
+        // 100px line instead, overriding the container's own flex-start.
+        assert_eq!(laid.children[1].dimensions.content.y, 80.0);
     }
 
     #[test]
