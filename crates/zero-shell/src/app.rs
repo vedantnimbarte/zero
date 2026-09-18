@@ -3869,6 +3869,30 @@ fn blit(buffer: &mut [u32], w: u32, h: u32, canvas: &Canvas, x0: u32, y0: u32) {
 
 #[cfg(test)]
 mod tests {
+    /// The boundary itself, end to end rather than at the string: a token the
+    /// secure origin stored must be unreachable from the plaintext one. This
+    /// is the assertion that actually fails if `storage_site` and
+    /// `site_store` ever stop agreeing about what an area is.
+    #[test]
+    fn a_plaintext_origin_cannot_read_what_the_secure_one_stored() {
+        use zero_engine::KeyValueStore;
+        let secure = crate::localstore::site_store(&storage_site("https://bank.example/x"));
+        let plain = crate::localstore::site_store(&storage_site("http://bank.example/x"));
+
+        assert!(secure.set("session_token", "secret"));
+        assert_eq!(
+            plain.get("session_token"),
+            None,
+            "a page served over http must not read the https origin's storage"
+        );
+        assert!(!std::rc::Rc::ptr_eq(&secure, &plain), "they must not even be the same area");
+
+        // And the reverse: what http writes cannot be mistaken for the secure
+        // origin's own data.
+        assert!(plain.set("session_token", "planted"));
+        assert_eq!(secure.get("session_token").as_deref(), Some("secret"));
+    }
+
     /// A storage area belongs to an origin. If this ever collapses back to a
     /// bare host, a page served over http silently gains read and write access
     /// to whatever the https site of the same name stored — a boundary that
