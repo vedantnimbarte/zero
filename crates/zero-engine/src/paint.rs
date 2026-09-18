@@ -41,7 +41,10 @@ enum DisplayCommand {
         blur: f32,
         color: Color,
     },
-    Text(TextFragment),
+    /// A shaped run, and the rectangle it may draw inside. Text is the one
+    /// command the painter cannot trim by moving its box — the glyphs are
+    /// already placed — so the clip travels with it and is applied per pixel.
+    Text(TextFragment, Rect),
     /// image src, destination content box, and how it fits that box.
     Image(String, Rect, ObjectFit),
     /// `background-image: url(...)`, resolved and tiled at paint time once the
@@ -318,11 +321,18 @@ impl Canvas {
     /// Rasterize a shaped run glyph-by-glyph and alpha-blend it onto the canvas.
     /// Positions come from the shaper, so scripts that reorder or stack marks land correctly.
     /// Uses the same font the shaper picked, so glyph ids resolve correctly.
-    fn paint_text(&mut self, frag: &TextFragment, fonts: &FontSet) {
+    ///
+    /// `clip` is where the run is allowed to draw. It and the canvas bound the
+    /// same thing — which pixels may be written — so they fold into one pair of
+    /// tests per pixel rather than two, and clipping costs nothing.
+    fn paint_text(&mut self, frag: &TextFragment, clip: Rect, fonts: &FontSet) {
         let font = match fonts.entries.get(frag.font_index).and_then(|entry| entry.raster()) {
             Some(raster) => raster,
             None => return,
         };
+        let (x0, y0) = (clip.x.max(0.0) as i32, clip.y.max(0.0) as i32);
+        let x1 = (clip.x + clip.width).min(self.width as f32).max(0.0) as i32;
+        let y1 = (clip.y + clip.height).min(self.height as f32).max(0.0) as i32;
         let ascent = font
             .horizontal_line_metrics(frag.size)
             .map_or(frag.size, |m| m.ascent);
@@ -344,7 +354,7 @@ impl Canvas {
             for row in 0..m.height {
                 let row_shear = (shear * (m.height - row) as f32).round() as i32;
                 let py = gy + row as i32;
-                if py < 0 || py >= self.height as i32 {
+                if py < y0 || py >= y1 {
                     continue;
                 }
                 for col in 0..m.width {
@@ -354,7 +364,7 @@ impl Canvas {
                     }
                     for dx in 0..=stroke {
                         let px = gx + col as i32 + row_shear + dx;
-                        if px < 0 || px >= self.width as i32 {
+                        if px < x0 || px >= x1 {
                             continue;
                         }
                         let idx = py as usize * self.width + px as usize;
@@ -365,14 +375,20 @@ impl Canvas {
         }
 
         // A stroke's own thickness, not part of any glyph's rasterized coverage.
+        // A rule under clipped-away words must not outlive them, so both are
+        // trimmed to the same clip the glyphs were.
         let stroke = (frag.size / 16.0).max(1.0);
+        let mut rule = |y: f32| {
+            let line = Rect { x: frag.x, y, width: frag.width, height: stroke };
+            if let Some(visible) = intersect(line, clip) {
+                self.paint_solid(frag.color, visible);
+            }
+        };
         if frag.underline {
-            let y = baseline + stroke;
-            self.paint_solid(frag.color, Rect { x: frag.x, y, width: frag.width, height: stroke });
+            rule(baseline + stroke);
         }
         if frag.strikethrough {
-            let y = baseline - frag.size * 0.3;
-            self.paint_solid(frag.color, Rect { x: frag.x, y, width: frag.width, height: stroke });
+            rule(baseline - frag.size * 0.3);
         }
     }
 
@@ -624,9 +640,9 @@ pub fn paint(
                     blur,
                     color,
                 } => canvas.paint_shadow(*rect, *radius, *blur, *color),
-                DisplayCommand::Text(frag) => {
+                DisplayCommand::Text(frag, clip) => {
                     if let Some(fonts) = fonts {
-                        canvas.paint_text(frag, fonts);
+                        canvas.paint_text(frag, *clip, fonts);
                     }
                 }
                 DisplayCommand::Image(src, rect, fit) => {
@@ -654,7 +670,7 @@ enum Pass {
 
 fn pass_of(item: &DisplayCommand) -> Pass {
     match item {
-        DisplayCommand::Text(_) => Pass::Text,
+        DisplayCommand::Text(..) => Pass::Text,
         _ => Pass::Boxes,
     }
 }
@@ -678,7 +694,7 @@ fn highlight_rects(list: &DisplayList, query: &str) -> Vec<Rect> {
     }
     list.iter()
         .filter_map(|item| match item {
-            DisplayCommand::Text(frag) if frag.text.to_lowercase().contains(&needle) => {
+            DisplayCommand::Text(frag, _) if frag.text.to_lowercase().contains(&needle) => {
                 Some(Rect {
                     x: frag.x,
                     y: frag.y,
@@ -741,7 +757,13 @@ fn clip_command(item: DisplayCommand, clip: Rect) -> Option<DisplayCommand> {
         DisplayCommand::Image(src, rect, fit) => {
             DisplayCommand::Image(src, intersect(rect, clip)?, fit)
         }
-        DisplayCommand::Text(frag) => {
+        // The glyphs are already placed, so a run cannot be trimmed by moving
+        // its box the way a background can. It carries the clip instead, and
+        // the rasterizer drops the pixels that fall outside — which is what
+        // makes a box collapsed to 1x1 (how every large site hides a
+        // screen-reader heading) hide its text rather than print it in full.
+        DisplayCommand::Text(frag, existing) => {
+            let clip = intersect(existing, clip)?;
             let rect = Rect {
                 x: frag.x,
                 y: frag.y,
@@ -749,7 +771,7 @@ fn clip_command(item: DisplayCommand, clip: Rect) -> Option<DisplayCommand> {
                 height: frag.size * 1.25,
             };
             intersect(rect, clip)?;
-            DisplayCommand::Text(frag)
+            DisplayCommand::Text(frag, clip)
         }
         other => other,
     })
@@ -853,10 +875,10 @@ fn fade(item: DisplayCommand, alpha: f32) -> DisplayCommand {
             blur,
             color: dim(color),
         },
-        DisplayCommand::Text(frag) => DisplayCommand::Text(TextFragment {
-            color: dim(frag.color),
-            ..frag
-        }),
+        DisplayCommand::Text(frag, clip) => DisplayCommand::Text(
+            TextFragment { color: dim(frag.color), ..frag },
+            clip,
+        ),
         other => other,
     }
 }
@@ -1017,24 +1039,43 @@ fn transform(item: DisplayCommand, xf: Xf) -> DisplayCommand {
         }
         // Glyphs were shaped at `size`, and their offsets are in those units, so
         // both scale together or the run comes apart.
-        DisplayCommand::Text(frag) => DisplayCommand::Text(TextFragment {
-            x: frag.x * xf.scale + xf.dx,
-            y: frag.y * xf.scale + xf.dy,
-            width: frag.width * xf.scale,
-            size: frag.size * xf.scale,
-            line_height: frag.line_height * xf.scale,
-            glyphs: frag
-                .glyphs
-                .into_iter()
-                .map(|g| crate::text::PositionedGlyph {
-                    x: g.x * xf.scale,
-                    y: g.y * xf.scale,
-                    ..g
-                })
-                .collect(),
-            ..frag
-        }),
+        // The clip is in the same space as the run, so it moves with it —
+        // otherwise a transformed box would keep clipping where it used to be.
+        DisplayCommand::Text(frag, clip) => DisplayCommand::Text(
+            TextFragment {
+                x: frag.x * xf.scale + xf.dx,
+                y: frag.y * xf.scale + xf.dy,
+                width: frag.width * xf.scale,
+                size: frag.size * xf.scale,
+                line_height: frag.line_height * xf.scale,
+                glyphs: frag
+                    .glyphs
+                    .into_iter()
+                    .map(|g| crate::text::PositionedGlyph {
+                        x: g.x * xf.scale,
+                        y: g.y * xf.scale,
+                        ..g
+                    })
+                    .collect(),
+                ..frag
+            },
+            xf.rect(clip),
+        ),
     }
+}
+
+/// Whether `position` is anything but `static` — which decides, among siblings
+/// sharing a `z-index`, who paints on top.
+fn is_positioned(layout_box: &LayoutBox) -> bool {
+    let style = match layout_box.box_type {
+        BoxType::BlockNode(s) | BoxType::InlineNode(s) => s,
+        BoxType::AnonymousBlock => return false,
+    };
+    matches!(
+        style.value("position"),
+        Some(Value::Keyword(ref k))
+            if k == "relative" || k == "absolute" || k == "fixed" || k == "sticky"
+    )
 }
 
 /// `z-index`, which decides paint order among siblings. Everything else keeps
@@ -1082,8 +1123,12 @@ fn render_layout_box(
     // ponytail: one flat order rather than real stacking contexts, so a child's
     // z-index competes with its uncles. Nested contexts need the display list to
     // become a tree.
+    // Within one z-index, a positioned box paints above the in-flow content it
+    // overlaps — CSS puts positioned descendants in a later layer than block
+    // ones. Without this a sticky header's *background* painted under the rows
+    // it was pinned over while its text, which paints in a later pass, did not.
     let mut order: Vec<&LayoutBox> = layout_box.children.iter().collect();
-    order.sort_by_key(|child| z_index_of(child));
+    order.sort_by_key(|child| (z_index_of(child), is_positioned(child)));
     for child in order {
         render_layout_box(list, child, inner, alpha, xf);
     }
@@ -1141,7 +1186,7 @@ fn render_own(list: &mut DisplayList, layout_box: &LayoutBox) {
     }
     // Text sits above this box's background/borders.
     for frag in &layout_box.text_fragments {
-        list.push(DisplayCommand::Text(frag.clone()));
+        list.push(DisplayCommand::Text(frag.clone(), UNCLIPPED));
     }
 }
 
@@ -1757,5 +1802,73 @@ fn get_color(layout_box: &LayoutBox, name: &str) -> Option<Color> {
             _ => None,
         },
         BoxType::AnonymousBlock => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(x: f32, y: f32, width: f32) -> TextFragment {
+        TextFragment {
+            glyphs: Vec::new(),
+            text: "word".to_string(),
+            width,
+            x,
+            y,
+            size: 16.0,
+            line_height: 20.0,
+            color: Color { r: 0, g: 0, b: 0, a: 255 },
+            underline: false,
+            strikethrough: false,
+            bold: false,
+            italic: false,
+            font_index: 0,
+        }
+    }
+
+    #[test]
+    fn a_clipped_run_carries_its_clip_instead_of_being_kept_whole() {
+        // The glyphs are already placed, so a run cannot be trimmed by moving
+        // its box. It has to carry the clip to the rasterizer — otherwise a box
+        // collapsed to a pixel, which is how every large site hides a heading
+        // it keeps for screen readers, prints that heading across the page.
+        let narrow = Rect { x: 10.0, y: 100.0, width: 1.0, height: 1.0 };
+        let Some(DisplayCommand::Text(_, clip)) =
+            clip_command(DisplayCommand::Text(run(10.0, 100.0, 90.0), UNCLIPPED), narrow)
+        else {
+            panic!("a run overlapping its clip should survive, carrying it");
+        };
+        assert_eq!((clip.width, clip.height), (1.0, 1.0));
+
+        // Clips compose: an inner one can only ever narrow an outer one.
+        let outer = Rect { x: 0.0, y: 100.0, width: 40.0, height: 20.0 };
+        let Some(DisplayCommand::Text(_, clip)) =
+            clip_command(DisplayCommand::Text(run(10.0, 100.0, 90.0), narrow), outer)
+        else {
+            panic!("overlapping clips should intersect, not cancel");
+        };
+        assert_eq!((clip.width, clip.height), (1.0, 1.0));
+
+        // A run wholly outside its clip is dropped, as before.
+        let elsewhere = Rect { x: 500.0, y: 500.0, width: 10.0, height: 10.0 };
+        assert!(clip_command(DisplayCommand::Text(run(10.0, 100.0, 90.0), UNCLIPPED), elsewhere)
+            .is_none());
+    }
+
+    #[test]
+    fn a_transform_moves_a_runs_clip_along_with_the_run() {
+        // Otherwise a transformed box goes on clipping where it used to be,
+        // and its text is cut against empty space.
+        let clip = Rect { x: 10.0, y: 10.0, width: 20.0, height: 20.0 };
+        let xf = Xf { scale: 2.0, dx: 5.0, dy: 7.0 };
+        let DisplayCommand::Text(frag, moved) =
+            transform(DisplayCommand::Text(run(10.0, 10.0, 20.0), clip), xf)
+        else {
+            panic!("a text command stays a text command");
+        };
+        assert_eq!((frag.x, frag.y), (25.0, 27.0));
+        assert_eq!((moved.x, moved.y), (25.0, 27.0));
+        assert_eq!((moved.width, moved.height), (40.0, 40.0));
     }
 }

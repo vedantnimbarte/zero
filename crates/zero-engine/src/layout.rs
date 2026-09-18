@@ -153,6 +153,14 @@ pub struct LayoutBox<'a> {
     pub link_areas: Vec<LinkArea>,
     /// Backgrounds/borders for inline elements, painted beneath their text.
     pub inline_boxes: Vec<InlineBox>,
+    /// Where this box would have gone had it stayed in flow, recorded by its
+    /// parent while laying its in-flow children out.
+    ///
+    /// CSS calls this the static position, and it is what an out-of-flow box
+    /// that states neither `top` nor `left` keeps. `None` means nothing ever
+    /// placed it — a positioned child of a flex or grid container, which those
+    /// paths skip — and the containing block's own origin stands in.
+    static_position: Option<(f32, f32)>,
 }
 
 pub enum BoxType<'a> {
@@ -220,6 +228,7 @@ impl<'a> LayoutBox<'a> {
             text_fragments: Vec::new(),
             link_areas: Vec::new(),
             inline_boxes: Vec::new(),
+            static_position: None,
         }
     }
 
@@ -252,13 +261,38 @@ impl<'a> LayoutBox<'a> {
         }
     }
 
+    /// This box's `position`, as far as layout cares: out of flow and anchored
+    /// to what.
+    fn out_of_flow(&self) -> Option<OutOfFlow> {
+        match self.box_type {
+            BoxType::AnonymousBlock => None,
+            _ => match self.get_style_node().value("position") {
+                Some(Value::Keyword(ref k)) if k == "absolute" => Some(OutOfFlow::Absolute),
+                Some(Value::Keyword(ref k)) if k == "fixed" => Some(OutOfFlow::Fixed),
+                _ => None,
+            },
+        }
+    }
+
     /// True when this box is taken out of normal flow (`absolute` or `fixed`).
     fn is_out_of_flow(&self) -> bool {
+        self.out_of_flow().is_some()
+    }
+
+    /// Whether an `absolute` descendant resolves its offsets against this box.
+    ///
+    /// CSS says the containing block is the nearest ancestor whose `position`
+    /// is anything but `static` — not the parent. An overlay is almost always
+    /// written as a deeply nested child of one `position: relative` wrapper,
+    /// so anchoring it to its parent instead lands it in the middle of the
+    /// content rather than over the corner it was aimed at.
+    fn is_containing_block(&self) -> bool {
         match self.box_type {
             BoxType::AnonymousBlock => false,
             _ => matches!(
                 self.get_style_node().value("position"),
-                Some(Value::Keyword(ref k)) if k == "absolute" || k == "fixed"
+                Some(Value::Keyword(ref k))
+                    if k == "relative" || k == "absolute" || k == "fixed" || k == "sticky"
             ),
         }
     }
@@ -317,37 +351,69 @@ impl<'a> LayoutBox<'a> {
         }
         self.calculate_block_height(containing_block);
         // A replaced element (<img>) overrides content size with its resolved dimensions.
-        if let Some((w, h)) = self.resolved_image_size(images) {
+        if let Some((w, h)) = self.resolved_image_size(images, (containing_block.content.width, containing_block.content.height)) {
             self.dimensions.content.width = w;
             self.dimensions.content.height = h;
         }
-        // Positioned children resolve against this box's *final* size, so they run
-        // last — `bottom`/`right` are meaningless until the height/width are known.
-        self.layout_positioned_children(fonts, images);
+        // `text-overflow` belongs to the block, not to the runs inside it, and
+        // it is not inherited — so this is the only place that knows both the
+        // setting and the width the lines had to fit.
+        self.truncate_overflowing_lines(fonts);
+        // Positioned descendants resolve against this box's *final* size, so they
+        // run last — `bottom`/`right` are meaningless until the height/width are
+        // known. Only a box that is actually a containing block does this; a
+        // static box's positioned descendants belong to an ancestor, and
+        // `fixed` ones belong to the viewport, which `layout_tree` handles.
+        if self.is_containing_block() {
+            self.place_descendants(OutOfFlow::Absolute, fonts, images);
+        }
     }
 
-    fn layout_positioned_children(&mut self, fonts: Option<&FontSet>, images: &ImageMap) {
-        let container = self.dimensions;
-        for child in &mut self.children {
-            if !child.is_out_of_flow() {
-                continue;
-            }
-            // Pass 1 measures the box so `right`/`bottom` can be resolved.
-            child.layout(container, fonts, images);
-            let (x, y) = child.positioned_origin(container);
-            // Pass 2 lays the whole subtree out at its final origin, so descendants
-            // and text land in the right place instead of being moved afterwards.
-            let mut slot = container;
-            slot.content.x = x;
-            slot.content.y = y;
-            slot.content.height = 0.0;
-            child.layout(slot, fonts, images);
+    /// Apply this block's `text-overflow: ellipsis` to the lines inside it.
+    ///
+    /// The runs live on this box or on the anonymous block that holds its
+    /// inline content, depending on what else the block contains — both are the
+    /// same one line of text as far as the reader is concerned.
+    fn truncate_overflowing_lines(&mut self, fonts: Option<&FontSet>) {
+        let Some(fonts) = fonts else { return };
+        let ellipsis = match self.box_type {
+            BoxType::AnonymousBlock => false,
+            _ => matches!(
+                self.get_style_node().value("text-overflow"),
+                Some(Value::Keyword(ref k)) if k == "ellipsis"
+            ),
+        };
+        if !ellipsis {
+            return;
         }
+        let limit = self.dimensions.content.x + self.dimensions.content.width;
+        apply_ellipsis(&mut self.text_fragments, limit, fonts);
+        for child in &mut self.children {
+            if matches!(child.box_type, BoxType::AnonymousBlock) {
+                apply_ellipsis(&mut child.text_fragments, limit, fonts);
+            }
+        }
+    }
+
+    /// Lay out every out-of-flow descendant of the given kind that this box is
+    /// the containing block for, and place it.
+    fn place_descendants(
+        &mut self,
+        want: OutOfFlow,
+        fonts: Option<&FontSet>,
+        images: &ImageMap,
+    ) {
+        let container = self.dimensions;
+        place_out_of_flow(&mut self.children, container, want, fonts, images);
     }
 
     /// If this box is an `<img>`, resolve its display size from CSS width/height,
     /// else the `width`/`height` attributes, else the image's intrinsic size.
-    fn resolved_image_size(&self, images: &ImageMap) -> Option<(f32, f32)> {
+    fn resolved_image_size(
+        &self,
+        images: &ImageMap,
+        available: (f32, f32),
+    ) -> Option<(f32, f32)> {
         let styled = match self.box_type {
             BoxType::BlockNode(n) | BoxType::InlineNode(n) => n,
             BoxType::AnonymousBlock => return None,
@@ -364,21 +430,34 @@ impl<'a> LayoutBox<'a> {
             _ => return None,
         };
         let img = images.get(&src);
-        let css_px = |name: &str| styled.px(name, 0.0).filter(|v| *v > 0.0);
+        // Percentages resolve against the containing block, not against zero —
+        // `width: 100%` is how nearly every photo on a news or product page is
+        // sized, and resolving it to nothing fell through to the file's own
+        // pixel size. A 1536px press photo then covered whatever column it was
+        // supposed to sit inside.
+        let css_px = |name: &str, base: f32| styled.px(name, base).filter(|v| *v > 0.0);
         let attr_px = |name: &str| {
             elem.attributes
                 .get(name)
                 .and_then(|s| s.trim().parse::<f32>().ok())
         };
 
-        let w = css_px("width")
-            .or_else(|| attr_px("width"))
-            .or_else(|| img.map(|i| i.width as f32))?;
-        let h = css_px("height")
-            .or_else(|| attr_px("height"))
-            .or_else(|| img.map(|i| i.height as f32))
-            .unwrap_or(w);
-        Some((w, h))
+        let given_w = css_px("width", available.0).or_else(|| attr_px("width"));
+        let given_h = css_px("height", available.1).or_else(|| attr_px("height"));
+        let natural = img.map(|i| (i.width as f32, i.height as f32));
+        // With one axis given and a picture to measure, the other follows the
+        // aspect ratio. Keeping the file's own height beside a scaled width is
+        // what stretched a wide photo down over the text beneath it.
+        Some(match (given_w, given_h, natural) {
+            (Some(w), Some(h), _) => (w, h),
+            (Some(w), None, Some((nw, nh))) if nw > 0.0 => (w, w * nh / nw),
+            (None, Some(h), Some((nw, nh))) if nh > 0.0 => (h * nw / nh, h),
+            // No picture, or one with no measurable size: no ratio to keep.
+            (Some(w), None, _) => (w, w),
+            (None, Some(h), _) => (h, h),
+            (None, None, Some(size)) => size,
+            (None, None, None) => return None,
+        })
     }
 
     /// Table layout: align cells into shared columns, honouring colspan/rowspan.
@@ -846,9 +925,17 @@ impl<'a> LayoutBox<'a> {
                 BoxType::AnonymousBlock => None,
             }),
         };
+        let white_space = styled.and_then(|s| s.value("white-space"));
         let preserve_whitespace = matches!(
-            styled.and_then(|s| s.value("white-space")),
+            white_space,
             Some(Value::Keyword(ref k)) if k == "pre" || k == "pre-wrap"
+        );
+        // `nowrap` is half of the truncation idiom every site's card titles and
+        // breadcrumbs use (`overflow: hidden; text-overflow: ellipsis` is the
+        // other half). Wrapping anyway turned a one-line label into a paragraph.
+        let nowrap = matches!(
+            white_space,
+            Some(Value::Keyword(ref k)) if k == "nowrap" || k == "pre"
         );
 
         // Flatten the inline subtree into a stream of text runs and element
@@ -1058,7 +1145,8 @@ impl<'a> LayoutBox<'a> {
                     0.0
                 };
                 // Wrap if this word overflows and we're not at line start.
-                if cursor_x > start_x && cursor_x + lead + word_w > start_x + max_width {
+                if !nowrap && cursor_x > start_x && cursor_x + lead + word_w > start_x + max_width
+                {
                     lead = 0.0;
                     // Close each open element on the line it is leaving, then
                     // reopen it on the next one, so a wrapped span paints twice.
@@ -1387,7 +1475,11 @@ impl<'a> LayoutBox<'a> {
         let mut floats: Vec<FloatRect> = Vec::new();
         for (i, child) in self.children.iter_mut().enumerate() {
             if child.is_out_of_flow() {
-                continue; // positioned later, once the container's size is final
+                // Positioned later, once the container's size is final — but
+                // where it *would* have gone is only knowable here, and a box
+                // stating neither `top` nor `left` is supposed to stay there.
+                child.static_position = Some((d.content.x, d.content.y + d.content.height));
+                continue;
             }
             // `clear` drops this child below the floats it names.
             if let Some(cleared) = child.clear_sides() {
@@ -1737,17 +1829,106 @@ impl<'a> LayoutBox<'a> {
     }
 }
 
+/// Lay a styled tree out inside `containing_block`.
+///
+/// `scroll_top` is the first document row the reader can see. Layout is
+/// otherwise scroll-independent; this exists for `position: sticky`, which is
+/// the one thing whose *position* depends on how far down the page you are.
 pub fn layout_tree<'a>(
+    node: &'a StyledNode<'a>,
+    containing_block: Dimensions,
+    fonts: Option<&FontSet>,
+    images: &ImageMap,
+) -> LayoutBox<'a> {
+    layout_tree_scrolled(node, containing_block, fonts, images, 0.0)
+}
+
+pub fn layout_tree_scrolled<'a>(
     node: &'a StyledNode<'a>,
     mut containing_block: Dimensions,
     fonts: Option<&FontSet>,
     images: &ImageMap,
+    scroll_top: f32,
 ) -> LayoutBox<'a> {
     // Height starts at 0 so children accumulate into it.
+    let viewport = containing_block;
     containing_block.content.height = 0.0;
     let mut root_box = build_layout_tree(node);
     root_box.layout(containing_block, fonts, images);
+    // The root is the last containing block standing: an `absolute` box with no
+    // positioned ancestor anywhere above it anchors to the page, and every
+    // `fixed` box anchors to the viewport no matter what it sits inside.
+    root_box.place_descendants(OutOfFlow::Absolute, fonts, images);
+    place_out_of_flow(&mut root_box.children, viewport, OutOfFlow::Fixed, fonts, images);
+    // Last, because a sticky box is pinned relative to where flow left it, and
+    // an out-of-flow one inside it has to have been placed first.
+    if scroll_top > 0.0 {
+        apply_sticky(&mut root_box, scroll_top);
+    }
     root_box
+}
+
+/// Which out-of-flow boxes a placing walk is looking for.
+#[derive(Clone, Copy, PartialEq)]
+enum OutOfFlow {
+    /// Anchored to the nearest positioned ancestor.
+    Absolute,
+    /// Anchored to the viewport.
+    ///
+    /// ponytail: anchored, but not *stuck* — the engine paints a document and
+    /// the embedder scrolls through it, so a fixed header sits at the top of
+    /// the page rather than riding the window down. Making it ride needs the
+    /// scroll offset to reach layout, which is a compositing change.
+    Fixed,
+}
+
+/// Place every out-of-flow box of kind `want` in this subtree against
+/// `container`, descending through anything that is not itself responsible for
+/// them.
+///
+/// A box already placed here is not descended into: it is the containing block
+/// for its own positioned descendants, and laying it out placed them.
+fn place_out_of_flow(
+    children: &mut [LayoutBox],
+    container: Dimensions,
+    want: OutOfFlow,
+    fonts: Option<&FontSet>,
+    images: &ImageMap,
+) {
+    for child in children {
+        if child.out_of_flow() == Some(want) {
+            // Pass 1 measures the box, so `right`/`bottom` can be resolved —
+            // and it runs at the static position, so a box stating neither
+            // `top` nor `left` is measured where it already belongs. Measuring
+            // against the containing block instead left it at the *bottom* of
+            // that block, which is how a card's own placeholder image came to
+            // be painted over the headline beneath it.
+            let (sx, sy) = child
+                .static_position
+                .unwrap_or((container.content.x, container.content.y));
+            let mut probe = container;
+            probe.content.x = sx;
+            probe.content.y = sy;
+            probe.content.height = 0.0;
+            child.layout(probe, fonts, images);
+            let (x, y) = child.positioned_origin(container);
+            // Pass 2 lays the whole subtree out at its final origin, so descendants
+            // and text land in the right place instead of being moved afterwards.
+            let mut slot = container;
+            slot.content.x = x;
+            slot.content.y = y;
+            slot.content.height = 0.0;
+            child.layout(slot, fonts, images);
+            continue;
+        }
+        // An `absolute` walk stops at the next containing block down — that box
+        // owns what is inside it. A `fixed` walk stops at nothing, because
+        // nothing but the viewport ever owns a fixed box.
+        if want == OutOfFlow::Absolute && child.is_containing_block() {
+            continue;
+        }
+        place_out_of_flow(&mut child.children, container, want, fonts, images);
+    }
 }
 
 struct TextPiece {
@@ -2475,6 +2656,119 @@ pub fn collect_element_rects(bx: &LayoutBox, out: &mut Vec<ElementRect>) {
     }
 }
 
+/// Pin every `position: sticky` box the page has scrolled past.
+///
+/// Run after layout rather than during it, because what a sticky box does
+/// depends on where it ended up — and on where its parent ended up, which is
+/// only settled once the flow above it has been placed. Everything inside the
+/// box was laid out at its natural position, so pinning it moves the subtree.
+///
+/// ponytail: `top` only, and no clamp to the containing block — a sticky box
+/// stays pinned past the end of the section it belongs to, where a browser
+/// would let it scroll away with its container. `top: 0` on a page-level header
+/// is the case that matters and the one this gets right; a sticky table header
+/// inside a scrolling panel over-sticks. `bottom` needs the same treatment from
+/// the other end.
+fn apply_sticky(bx: &mut LayoutBox, scroll_top: f32) {
+    if let Some(shift) = sticky_shift(bx, scroll_top) {
+        translate_subtree(bx, shift);
+        return; // its own descendants moved with it; nothing below is sticky *and* independent
+    }
+    for child in &mut bx.children {
+        apply_sticky(child, scroll_top);
+    }
+}
+
+/// How far down a sticky box has to move to stay at its threshold, or `None`
+/// when it is not sticky or the page has not reached it yet.
+fn sticky_shift(bx: &LayoutBox, scroll_top: f32) -> Option<f32> {
+    let style = match bx.box_type {
+        BoxType::BlockNode(s) | BoxType::InlineNode(s) => s,
+        BoxType::AnonymousBlock => return None,
+    };
+    match style.value("position") {
+        Some(Value::Keyword(ref k)) if k == "sticky" => {}
+        _ => return None,
+    }
+    let ctx = style.length_context(bx.dimensions.content.height);
+    let top = style.value("top")?.resolve(ctx);
+    // A sticky box never rises above where flow put it — it only ever waits
+    // there until the page catches up with it.
+    let shift = (scroll_top + top) - bx.dimensions.margin_box().y;
+    (shift > 0.0).then_some(shift)
+}
+
+/// Move a box and everything it contains down the page by `dy`.
+fn translate_subtree(bx: &mut LayoutBox, dy: f32) {
+    bx.dimensions.content.y += dy;
+    for frag in &mut bx.text_fragments {
+        frag.y += dy;
+    }
+    for link in &mut bx.link_areas {
+        link.y += dy;
+    }
+    for inline in &mut bx.inline_boxes {
+        inline.y += dy;
+    }
+    for child in &mut bx.children {
+        translate_subtree(child, dy);
+    }
+}
+
+/// Cut each overflowing line short at `limit` and mark it with an ellipsis.
+///
+/// `text-overflow` only says what to do with text that has already overflowed
+/// — the clipping itself is `overflow`'s job, at paint time. This replaces the
+/// run straddling the edge with as much of itself as fits beside a `…`, and
+/// drops whatever followed it on that line.
+///
+/// ponytail: one ellipsis per line, and only at the end (`text-overflow` can
+/// also take a string, or clip from the start in a right-to-left run). The
+/// engine has no bidi, so there is no second end to truncate from yet.
+fn apply_ellipsis(fragments: &mut Vec<TextFragment>, limit: f32, fonts: &FontSet) {
+    let mut dropped: Vec<usize> = Vec::new();
+    let mut line_start = 0;
+    while line_start < fragments.len() {
+        let y = fragments[line_start].y;
+        let line_end = fragments[line_start..]
+            .iter()
+            .position(|f| f.y != y)
+            .map_or(fragments.len(), |n| line_start + n);
+        if let Some(over) = (line_start..line_end).find(|&i| fragments[i].x + fragments[i].width > limit)
+        {
+            shorten_to_fit(&mut fragments[over], limit, fonts);
+            dropped.extend(over + 1..line_end);
+        }
+        line_start = line_end;
+    }
+    for i in dropped.into_iter().rev() {
+        fragments.remove(i);
+    }
+}
+
+/// Re-shape a run as however much of itself fits before `limit`, ending in `…`.
+fn shorten_to_fit(frag: &mut TextFragment, limit: f32, fonts: &FontSet) {
+    const ELLIPSIS: char = '\u{2026}';
+    let Some(entry) = fonts.entries.get(frag.font_index) else { return };
+    let room = (limit - frag.x).max(0.0);
+    // A fragment is one word, so walking back a character at a time is a
+    // handful of steps — not a search worth being clever about.
+    let mut chars: Vec<char> = frag.text.chars().collect();
+    loop {
+        let candidate: String = chars.iter().copied().chain(std::iter::once(ELLIPSIS)).collect();
+        let (glyphs, width) = shape_run(entry, &candidate, frag.size);
+        // The ellipsis alone may not fit either, and it is still what the line
+        // ends with — paint clips whatever hangs past the box.
+        if width <= room || chars.is_empty() {
+            frag.glyphs = glyphs;
+            frag.width = width;
+            frag.text = candidate;
+            return;
+        }
+        chars.pop();
+    }
+}
+
 /// Gather every painted word from the laid-out tree, in document order —
 /// which is reading order, and so the order a selection runs through.
 pub fn collect_text_runs(bx: &LayoutBox, out: &mut Vec<TextRun>) {
@@ -3079,6 +3373,100 @@ mod tests {
         let placed = laid.children[0].dimensions.margin_box();
         assert_eq!(placed.x, 900.0 - 20.0 - 100.0); // right edge is 20 from the container's
         assert_eq!(placed.y, 200.0 - 10.0 - 40.0); // bottom edge is 10 from the container's
+    }
+
+    #[test]
+    fn an_ellipsis_cuts_each_overflowing_line_and_leaves_the_rest_alone() {
+        // Only the bookkeeping is checked here — which run straddles the edge,
+        // and what is dropped after it. Re-shaping that run to end in `…` needs
+        // a real font, which the engine never owns (the embedder supplies the
+        // bytes), so an empty set leaves each surviving run's text as it was.
+        let fonts = FontSet { entries: Vec::new() };
+        let run = |x: f32, y: f32, text: &str| TextFragment {
+            glyphs: Vec::new(),
+            text: text.to_string(),
+            width: 40.0,
+            x,
+            y,
+            size: 16.0,
+            line_height: 20.0,
+            color: Color { r: 0, g: 0, b: 0, a: 255 },
+            underline: false,
+            strikethrough: false,
+            bold: false,
+            italic: false,
+            font_index: 0,
+        };
+
+        // Two lines of three runs each, in a box 100 wide. On each line the
+        // third run starts at 90 and so runs past the edge.
+        let mut fragments = vec![
+            run(0.0, 0.0, "one"),
+            run(45.0, 0.0, "two"),
+            run(90.0, 0.0, "three"),
+            run(0.0, 20.0, "four"),
+            run(45.0, 20.0, "five"),
+            run(90.0, 20.0, "six"),
+        ];
+        apply_ellipsis(&mut fragments, 100.0, &fonts);
+
+        let kept: Vec<&str> = fragments.iter().map(|f| f.text.as_str()).collect();
+        // The straddling run stays (shortened, given a font); everything after
+        // it on that line goes — and the *next* line is judged on its own.
+        assert_eq!(kept, ["one", "two", "three", "four", "five", "six"]);
+
+        // A fourth run past the edge on the first line is dropped outright.
+        let mut spilling = vec![
+            run(0.0, 0.0, "one"),
+            run(90.0, 0.0, "two"),
+            run(140.0, 0.0, "three"),
+            run(0.0, 20.0, "next line"),
+        ];
+        apply_ellipsis(&mut spilling, 100.0, &fonts);
+        let kept: Vec<&str> = spilling.iter().map(|f| f.text.as_str()).collect();
+        assert_eq!(kept, ["one", "two", "next line"]);
+
+        // Nothing overflows: nothing is touched.
+        let mut fits = vec![run(0.0, 0.0, "one"), run(45.0, 0.0, "two")];
+        apply_ellipsis(&mut fits, 200.0, &fonts);
+        assert_eq!(fits.len(), 2);
+    }
+
+    #[test]
+    fn a_percentage_width_on_a_picture_measures_its_box_and_takes_the_height_with_it() {
+        // `width: 100%` used to resolve against a base of zero, so it was
+        // discarded and the file's own pixel size took over — a 1536px press
+        // photo then covered whatever column it was supposed to sit in. And a
+        // scaled width with the original height is a picture stretched down
+        // over the text beneath it, so the ratio has to come along.
+        let node = dom::elem("img".into(), HashMap::from([("src".into(), "pic".into())]), vec![]);
+        let mut values = HashMap::new();
+        values.insert("display".to_string(), Value::Keyword("block".into()));
+        values.insert("width".to_string(), Value::Length(50.0, Unit::Percent));
+        let img = StyledNode { node: &node, specified_values: values, children: vec![] };
+
+        let root_node = dom::elem("div".into(), HashMap::new(), vec![]);
+        let mut root_values = HashMap::new();
+        root_values.insert("display".to_string(), Value::Keyword("block".into()));
+        let root = StyledNode {
+            node: &root_node,
+            specified_values: root_values,
+            children: vec![img],
+        };
+
+        // A 40x20 picture, half of a 200px-wide page: 100 across, and the
+        // height halves with it rather than staying at the file's 20.
+        let mut images = ImageMap::new();
+        images.insert(
+            "pic".to_string(),
+            crate::resource::DecodedImage { width: 40, height: 20, pixels: vec![] },
+        );
+        let mut viewport: Dimensions = Default::default();
+        viewport.content.width = 200.0;
+        let laid = layout_tree(&root, viewport, None, &images);
+
+        let picture = laid.children[0].dimensions.content;
+        assert_eq!((picture.width, picture.height), (100.0, 50.0));
     }
 
     #[test]

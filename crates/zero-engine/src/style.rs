@@ -413,6 +413,19 @@ fn specified_values(
             values.insert(declaration.name.clone(), declaration.value.clone());
         }
     }
+    // An inline `style` attribute is the last word in the cascade, whatever any
+    // rule's specificity. It is where a page puts what it worked out for itself
+    // — a bar's width, a card's background image, a tooltip's offsets — so a
+    // page that computes its layout has none of it without this.
+    //
+    // ponytail: `!important` is not modelled anywhere in this engine, so there
+    // is nothing here for an important declaration to lose to. When it is,
+    // this is the arm that has to stop being unconditional.
+    if let Some(inline) = cursor.elem().attributes.get("style") {
+        for declaration in crate::css::parse_style_attribute(inline) {
+            values.insert(declaration.name, declaration.value);
+        }
+    }
     values
 }
 
@@ -667,6 +680,11 @@ fn style_tree_inner<'a>(
         Some(Value::Length(v, Unit::Em)) => v * parent_font,
         Some(Value::Length(v, Unit::Rem)) => v * DEFAULT_FONT_SIZE,
         Some(Value::Length(v, Unit::Percent)) => v / 100.0 * parent_font,
+        // CSS lets a zero length go without a unit, so it arrives as a bare
+        // number rather than a length — and `font-size: 0` is how a control
+        // hides its own label while leaving it in the document for a screen
+        // reader. Falling through to the inherited size printed it instead.
+        Some(Value::Number(v)) => *v,
         _ => parent_font,
     };
     specified.insert("font-size".to_string(), Value::Length(font_px, Unit::Px));
@@ -770,6 +788,48 @@ mod tests {
         assert_eq!(by_id[0].line_height(), 40.0); // 2 * its own 20px font-size
         assert_eq!(by_id[1].line_height(), 30.0); // an absolute length, untouched
         assert_eq!(by_id[2].line_height(), 50.0); // absent: the 1.25 fallback
+    }
+
+    #[test]
+    fn a_unitless_zero_font_size_is_zero_and_does_not_inherit() {
+        // CSS lets a zero length go without a unit, so `font-size: 0` arrives
+        // as a bare number rather than a length. It is how a control hides its
+        // own label while leaving it in the document for a screen reader —
+        // rustdoc's "Copy item path" button, among many — and falling through
+        // to the inherited size printed the label across the page.
+        let html = "<body><p id=a>x</p><p id=b>x</p></body>";
+        let css = "body { font-size: 30px; } #a { font-size: 0; }";
+        let dom = crate::html::parse(html.to_string());
+        let sheet = crate::css::parse(css.to_string());
+        let styled = style_tree(&dom, &sheet);
+        let by_id = elements(&styled);
+
+        assert_eq!(by_id[0].font_size(), 0.0);
+        assert_eq!(by_id[1].font_size(), 30.0); // its sibling still inherits
+    }
+
+    #[test]
+    fn an_inline_style_attribute_is_the_last_word_in_the_cascade() {
+        let html = "<body>\
+            <p id=a class=wide>plain</p>\
+            <p id=b class=wide style='width: 120px'>inline wins</p>\
+            <p id=c class=wide style='--w: 200px; width: var(--w)'>inline var</p>\
+            <p id=d class=wide style='malformed; width: 300px'>broken, then good</p>\
+            </body>";
+        // `#id` beats `.class`, so the stylesheet here is as specific as it gets
+        // short of `!important` — which this engine does not model at all.
+        let css = "#a, #b, #c, #d { width: 400px; } .wide { width: 500px; }";
+        let dom = crate::html::parse(html.to_string());
+        let sheet = crate::css::parse(css.to_string());
+        let styled = style_tree(&dom, &sheet);
+        let by_id = elements(&styled);
+
+        assert_eq!(by_id[0].px("width", 0.0), Some(400.0)); // no attribute: the rule stands
+        assert_eq!(by_id[1].px("width", 0.0), Some(120.0));
+        assert_eq!(by_id[2].px("width", 0.0), Some(200.0)); // `var()` resolves inline too
+        // A declaration the parser cannot read must not swallow the ones after
+        // it — a page's inline styles are often machine-written and untidy.
+        assert_eq!(by_id[3].px("width", 0.0), Some(300.0));
     }
 
     #[test]

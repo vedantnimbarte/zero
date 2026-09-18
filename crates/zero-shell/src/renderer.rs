@@ -221,6 +221,9 @@ impl Session {
                 self.width = request.num_at(0) as f32;
                 self.height = request.num_at(1) as f32;
                 self.band = band_of(request);
+                // The band may start above what the reader can see; sticky
+                // boxes are pinned against the viewport, not the band.
+                self.doc.set_scroll(request.num_at(3) as f32);
             }
             "find" => {
                 let query = request.str_at(0);
@@ -247,7 +250,8 @@ impl Session {
 ///
 /// Packed into `Msg`'s plain `text`/`nums` arrays rather than a new format —
 /// `nums` lays out as `[w, h, uses_hover, animating, is_focused, rect_count,
-/// link_count, match_count, doc_height, band_top, run_count]` followed by
+/// link_count, match_count, doc_height, band_top, run_count, uses_sticky]`
+/// followed by
 /// `rect_count` groups of `[node_id, x, y, w, h]`, then `link_count` groups of
 /// `[x, y, w, h]`, then `match_count` groups of `[x, y, w, h]`, then
 /// `run_count` groups of `[x, y, w, h]`, then two trailing flags,
@@ -282,7 +286,8 @@ fn write_frame(engine: &Engine, session: &mut Session, output: &mut std::io::Std
         // against the document rather than against what was painted.
         .num(page.doc_height as f64)
         .num(page.band_top as f64)
-        .num(page.text_runs.len() as f64);
+        .num(page.text_runs.len() as f64)
+        .num(page.uses_sticky as u8 as f64);
     for r in &page.element_rects {
         answer = answer.num(r.node_id as f64).num(r.x as f64).num(r.y as f64);
         answer = answer.num(r.width as f64).num(r.height as f64);
@@ -426,6 +431,9 @@ pub struct Frame {
     /// The first document row this band stands for.
     pub band_top: f32,
     pub uses_hover: bool,
+    /// Whether the band this frame carries survives a scroll, or whether the
+    /// page has to be laid out again for its sticky boxes to move.
+    pub uses_sticky: bool,
     pub animating: bool,
     pub is_focused: bool,
     pub element_rects: Vec<zero_engine::ElementRect>,
@@ -452,8 +460,9 @@ fn decode_frame(msg: Msg) -> Frame {
     let (rect_count, link_count, match_count) = (get(5) as usize, get(6) as usize, get(7) as usize);
     let (doc_height, band_top) = (get(8) as f32, get(9) as f32);
     let run_count = get(10) as usize;
+    let uses_sticky = get(11) != 0.0;
 
-    let mut at = 11;
+    let mut at = 12;
     let mut element_rects = Vec::with_capacity(rect_count);
     for i in 0..rect_count {
         let rect = zero_engine::ElementRect {
@@ -515,6 +524,7 @@ fn decode_frame(msg: Msg) -> Frame {
         doc_height,
         band_top,
         uses_hover: get(2) != 0.0,
+        uses_sticky,
         animating: get(3) != 0.0,
         is_focused: get(4) != 0.0,
         element_rects,
@@ -1022,12 +1032,13 @@ impl TabRenderer {
 
     /// Ask for the band starting at `band_top`, `height` rows tall. Doubles as
     /// "the window changed size" and as "the page scrolled".
-    pub fn resize(&mut self, width: f32, height: f32, band_top: f32) -> Option<Frame> {
+    pub fn resize(&mut self, width: f32, height: f32, band_top: f32, scroll_top: f32) -> Option<Frame> {
         self.send(
             Msg::new("resize")
                 .num(width as f64)
                 .num(height as f64)
-                .num(band_top as f64),
+                .num(band_top as f64)
+                .num(scroll_top as f64),
         )
     }
 
@@ -1272,10 +1283,11 @@ impl FakeRenderer {
         Some(self.snapshot())
     }
 
-    pub fn resize(&mut self, width: f32, height: f32, band_top: f32) -> Option<Frame> {
+    pub fn resize(&mut self, width: f32, height: f32, band_top: f32, scroll_top: f32) -> Option<Frame> {
         self.width = width;
         self.height = height;
         self.band_top = band_top;
+        self.doc.set_scroll(scroll_top);
         Some(self.snapshot())
     }
 
@@ -1318,6 +1330,7 @@ impl FakeRenderer {
             band_top: page.band_top,
             pixels,
             uses_hover: page.uses_hover,
+            uses_sticky: page.uses_sticky,
             animating: page.animating,
             is_focused: self.doc.is_focused(),
             element_rects: page.element_rects,

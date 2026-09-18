@@ -62,6 +62,9 @@ pub struct Page {
     /// Whether any rule used `:hover`. Without this the embedder would repaint
     /// on every mouse move for pages that do not react to the cursor at all.
     pub uses_hover: bool,
+    /// Whether anything on the page is `position: sticky`, and so whether the
+    /// band the embedder is holding survives a scroll. See `set_scroll`.
+    pub uses_sticky: bool,
     /// Whether a transition is still running, and so whether another frame is
     /// worth drawing. An idle page answers `false` and the embedder can rest.
     pub animating: bool,
@@ -95,6 +98,8 @@ pub struct Document {
     hovered: style::HoverChain,
     /// Properties mid-transition, and the clock they are moving against.
     anim: anim::Animator,
+    /// The first document row the reader can see, for `position: sticky`.
+    scroll_top: f32,
     pub console: Vec<String>,
 }
 
@@ -152,6 +157,7 @@ impl Document {
             sheet: None,
             hovered: Default::default(),
             anim: Default::default(),
+            scroll_top: 0.0,
             console: Vec::new(),
         };
         doc.assign_node_ids();
@@ -315,6 +321,17 @@ impl Document {
     /// Highlight every occurrence of `query` on the next render; `None` clears it.
     pub fn set_find(&mut self, query: Option<String>) {
         self.find = query.filter(|q| !q.is_empty());
+    }
+
+    /// The first document row the reader can see.
+    ///
+    /// Layout is otherwise independent of scrolling — the engine draws a whole
+    /// document and the embedder moves through it — and this is the exception:
+    /// `position: sticky` is the one thing whose position depends on how far
+    /// down the page you are. An embedder that never calls this gets the top of
+    /// the page, where a sticky box sits at its natural place anyway.
+    pub fn set_scroll(&mut self, top: f32) {
+        self.scroll_top = top.max(0.0);
     }
 
     /// Which field has focus, so the embedder can act on it (submit, say).
@@ -483,11 +500,19 @@ impl Document {
                     }
                 }
                 NodeType::Element(ref e) => {
-                    // `nav` is navigation chrome, not readable content.
+                    // `nav` is navigation chrome, not readable content, and a
+                    // `<template>`'s children are markup a script has not used
+                    // yet — `{{ message }}`, not a sentence anyone wrote.
                     if matches!(
                         e.tag_name.as_str(),
-                        "script" | "style" | "head" | "noscript" | "nav"
+                        "script" | "style" | "head" | "noscript" | "nav" | "template"
                     ) {
+                        return;
+                    }
+                    // Not rendered, so not read out either. This is the tag-free
+                    // half of `[hidden]`; a thing hidden by a *stylesheet* still
+                    // reads, because this walks the DOM and never the cascade.
+                    if e.attributes.contains_key("hidden") {
                         return;
                     }
                     for child in &node.children {
@@ -608,6 +633,17 @@ const USER_AGENT_CSS: &str = "
     button { background: #e6e8ec; color: #111111; padding: 8px; border-radius: 4px;
         width: 160px; }
     head, script, style, meta, link, title, noscript, base { display: none; }
+    /* A <template>'s children are inert: parsed, but not rendered until a
+       script clones them. Without this, a site that ships its client-side
+       markup as a template — which is most of them — prints the `{{ }}`
+       placeholders in the middle of the page. */
+    template { display: none; }
+    /* The HTML `hidden` attribute, which the UA stylesheet is what makes mean
+       anything at all. A site's collapsed menus are marked with it, so
+       without this its navigation renders a second time, inline, under the
+       bar it belongs to. An author rule of the same specificity still wins,
+       which is how `[hidden] { display: block }` stays possible. */
+    [hidden] { display: none; }
     /* An <svg> is a picture, not a box of markup: it sits in a line like an
        image, and the shapes inside it are drawn by the rasterizer rather than
        laid out. Without this the source of every icon reads as text. */
@@ -807,6 +843,17 @@ impl Engine {
                         .any(|p| p.simple.pseudos.contains(&css::Pseudo::Hover))
                 })
             });
+        // Whether anything on the page is `position: sticky`. Layout is
+        // scroll-independent for every other page, so the embedder can keep
+        // reusing the band it has while scrolling — and must not, here, because
+        // where a sticky box sits is a function of how far down the page you
+        // are. Same bargain as `uses_hover`: the pages that need the extra work
+        // say so, and the rest pay nothing.
+        let uses_sticky = stylesheet.rules.iter().any(|rule| {
+            rule.declarations.iter().any(|d| {
+                d.name == "position" && matches!(&d.value, css::Value::Keyword(k) if k == "sticky")
+            })
+        });
         let style_root =
             style::style_tree_animated(root, stylesheet, rule_index, &doc.hovered, &mut doc.anim);
 
@@ -841,7 +888,13 @@ impl Engine {
             Some(FontSet { entries })
         };
 
-        let layout_root = layout::layout_tree(&style_root, viewport, fonts.as_ref(), &images);
+        let layout_root = layout::layout_tree_scrolled(
+            &style_root,
+            viewport,
+            fonts.as_ref(),
+            &images,
+            doc.scroll_top,
+        );
         let doc_height = layout::content_bottom(&layout_root).max(height);
         // Only the band the caller asked for is painted. `band` is `None` for a
         // caller that wants the page whole — a screenshot, or an embedder that
@@ -884,6 +937,7 @@ impl Engine {
             find_matches,
             text_runs,
             uses_hover,
+            uses_sticky,
             animating: doc.anim.is_active(),
         }
     }
@@ -1990,5 +2044,118 @@ p { color: #0000ff }", &Sheets, &mut out, 0);
         );
         let centre = canvas.pixels[30 * canvas.width + 30];
         assert!(centre.r > 200 && centre.b < 60, "expected the gradient's centre stop, got {centre:?}");
+    }
+
+    /// Red at this point, or a description of what was there instead.
+    fn red_at(canvas: &crate::Canvas, x: usize, y: usize) -> bool {
+        let p = canvas.pixels[y * canvas.width + x];
+        p.r > 200 && p.g < 80 && p.b < 80
+    }
+
+    #[test]
+    fn an_absolute_box_anchors_to_the_nearest_positioned_ancestor_not_its_parent() {
+        // The overlay is a grandchild: its own parent is static and has been
+        // pushed 40px down the page by the filler above it. `top: 0` means the
+        // top of the *relative* grandparent, not of that parent — which is the
+        // difference between an overlay on the corner it was aimed at and one
+        // dropped into the middle of the text.
+        let engine = super::Engine::shapes_only();
+        let canvas = engine.render(
+            "<body><div id=outer><div id=filler></div><div id=inner>\
+             <div id=overlay></div></div></div></body>",
+            "body { margin: 0; }
+             #outer { position: relative; height: 100px; }
+             #filler { height: 40px; }
+             #overlay { position: absolute; top: 0; left: 0;
+                        width: 10px; height: 10px; background: #ff0000; }",
+            100.0,
+            100.0,
+        );
+        assert!(red_at(&canvas, 5, 5), "the overlay belongs at the relative ancestor's top");
+        assert!(!red_at(&canvas, 5, 45), "it must not sit at its static parent's top");
+    }
+
+    #[test]
+    fn a_fixed_box_anchors_to_the_viewport_however_deep_it_sits() {
+        let engine = super::Engine::shapes_only();
+        let canvas = engine.render(
+            "<body><div id=pad></div><div id=outer><div id=banner></div></div></body>",
+            "body { margin: 0; }
+             #pad { height: 60px; }
+             #outer { position: relative; height: 40px; }
+             #banner { position: fixed; top: 0; left: 0;
+                       width: 10px; height: 10px; background: #ff0000; }",
+            100.0,
+            100.0,
+        );
+        assert!(red_at(&canvas, 5, 5), "a fixed box starts at the viewport's own corner");
+        assert!(!red_at(&canvas, 5, 65), "not at the ancestor it happens to sit in");
+    }
+
+    #[test]
+    fn an_absolute_box_with_no_offsets_stays_where_it_would_have_been() {
+        // CSS calls this the static position. Falling back to the bottom of the
+        // containing block instead is how a card's own placeholder image came
+        // to be painted over the headline underneath it.
+        let engine = super::Engine::shapes_only();
+        let canvas = engine.render(
+            "<body><div id=outer><div id=ghost></div><div id=rest></div></div></body>",
+            "body { margin: 0; }
+             #outer { position: relative; height: 100px; }
+             #ghost { position: absolute; width: 10px; height: 10px; background: #ff0000; }
+             #rest { height: 100px; }",
+            100.0,
+            100.0,
+        );
+        assert!(red_at(&canvas, 5, 5), "it stays at the top, where it was written");
+        assert!(!red_at(&canvas, 5, 95), "and does not fall to the bottom of its container");
+    }
+
+    #[test]
+    fn a_sticky_box_waits_where_flow_put_it_and_is_then_pinned() {
+        let engine = super::Engine::shapes_only();
+        let css = "body { margin: 0; }
+                   #bar { position: sticky; top: 0; height: 20px; background: #ff0000; }
+                   #rest { height: 400px; }";
+        let mut doc = crate::Document::load("<body><div id=bar></div><div id=rest></div></body>", css);
+
+        // At the top of the page a sticky box is just a box.
+        let page = engine.render_band(&mut doc, 50.0, 300.0, Some((0.0, 300.0)), &crate::resource::NullLoader);
+        assert!(page.uses_sticky, "the embedder has to know to re-render on scroll");
+        assert!(red_at(&page.canvas, 5, 5));
+
+        // Scrolled past, it is pinned to the row the reader can see first, and
+        // has left the place flow gave it.
+        doc.set_scroll(100.0);
+        let page = engine.render_band(&mut doc, 50.0, 300.0, Some((0.0, 300.0)), &crate::resource::NullLoader);
+        assert!(red_at(&page.canvas, 5, 105), "pinned at the scroll position");
+        assert!(!red_at(&page.canvas, 5, 5), "and no longer at the top of the document");
+    }
+
+    #[test]
+    fn a_template_and_a_hidden_element_are_not_rendered_and_are_not_page_text() {
+        // Both are how a site ships markup it does not mean to show yet: the
+        // client-side template with its `{{ }}` placeholders, and the collapsed
+        // menu that would otherwise render the navigation a second time.
+        let engine = super::Engine::shapes_only();
+        let canvas = engine.render(
+            "<body><template><div id=t></div></template>\
+             <div id=h hidden></div><div id=shown></div></body>",
+            "body { margin: 0; }
+             #t, #h { height: 40px; background: #ff0000; }
+             #shown { height: 10px; background: #00ff00; }",
+            50.0,
+            50.0,
+        );
+        // Neither took a line: the green box is at the very top of the page.
+        let top = canvas.pixels[2 * canvas.width + 5];
+        assert_eq!((top.r, top.g, top.b), (0, 255, 0), "hidden markup still took space");
+
+        let doc = crate::Document::load(
+            "<body><template>{{ message }}</template>\
+             <p hidden>collapsed menu</p><p>real words</p></body>",
+            "",
+        );
+        assert_eq!(doc.page_text(), "real words");
     }
 }

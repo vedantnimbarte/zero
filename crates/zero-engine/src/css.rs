@@ -390,6 +390,21 @@ impl Value {
     }
 }
 
+/// Parse the contents of a `style` attribute: a declaration list with no
+/// selector or braces around it.
+///
+/// Wrapped rather than given a parser of its own, because a `style` attribute
+/// is exactly a rule's body — and the two have to agree about shorthands,
+/// `var()`, comments and malformed input, or the same text would mean something
+/// subtly different inline than it does in a stylesheet.
+pub fn parse_style_attribute(text: &str) -> Vec<Declaration> {
+    if text.trim().is_empty() {
+        return Vec::new();
+    }
+    let mut parser = Parser { pos: 0, input: format!("{{{text}}}") };
+    parser.parse_declarations()
+}
+
 pub fn parse(source: String) -> Stylesheet {
     let mut parser = Parser {
         pos: 0,

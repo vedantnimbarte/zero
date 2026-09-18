@@ -127,13 +127,17 @@ forms.
   pseudo-classes (`:hover`, `:nth-child()`, `:first-child`, `:not()`, `:checked`),
   `visibility`, `opacity`, `z-index`, `transform` (translate/scale),
   `transition` (any property that interpolates),
-  `overflow` clipping, custom properties (`var()`, defined on `:root`), the cascade with specificity, HTML presentation attributes (`bgcolor`, `width`, `align`),
+  `overflow` clipping (including per-glyph text clipping, so a box collapsed to
+  a pixel hides its words the way a screen-reader-only heading is meant to),
+  custom properties (`var()`, defined on `:root`), the cascade with specificity, HTML presentation attributes (`bgcolor`, `width`, `align`),
   named colours, `rgb()`/`hsl()`, alpha
 - **Layout**: block, inline (including replaced elements nested in one, so an
   icon inside a link sits on its line), inline-block, flex (wrap/grow/justify/align), grid
   (`repeat()`, `fr`, `minmax()`, spans, named areas), tables (colspan/rowspan),
-  floats and `clear`, out-of-flow positioning, intrinsic sizing, `text-align`,
-  `white-space: pre`
+  floats and `clear`, out-of-flow positioning (`absolute` against the nearest
+  positioned ancestor, `fixed` against the viewport, and the static position for
+  a box that states no offsets), images sized by percentage with their aspect
+  ratio kept, intrinsic sizing, `text-align`, `white-space: pre`
 - **Text**: shaping via HarfBuzz with a font fallback chain — Latin, Indic
   (Devanagari, Tamil, Telugu, Bengali and more) and CJK
 - **JavaScript**: own lexer, parser and interpreter — closures, classes with
@@ -166,6 +170,8 @@ an unseen script pauses once while its font is read. Layout and paint are
 single-threaded, and a page is painted in full rather than by viewport. A
 selection is whole words: shaping throws characters away, so half a word cannot
 be selected and the copied text has its spacing rebuilt rather than preserved.
+The `style` attribute is ignored — only stylesheets are read — and a `fixed`
+box is anchored to the viewport but does not ride the window as you scroll.
 
 ## The documents
 

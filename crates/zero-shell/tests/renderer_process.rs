@@ -533,8 +533,8 @@ fn decode_frame(msg: RawMsg) -> TestFrame {
     let is_focused = get(4) != 0.0;
     let rect_count = get(5) as usize;
     // past the fixed header: [w, h, uses_hover, animating, is_focused,
-    // rects, links, matches, doc_height, band_top, text_runs]
-    let mut at = 11;
+    // rects, links, matches, doc_height, band_top, text_runs, uses_sticky]
+    let mut at = 12;
     let mut element_rects = Vec::with_capacity(rect_count);
     for i in 0..rect_count {
         let (node_id, x, y, w, h) =
