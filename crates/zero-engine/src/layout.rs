@@ -685,7 +685,8 @@ impl<'a> LayoutBox<'a> {
 
     /// Grid layout: place items into a track grid, honouring explicit placement.
     ///
-    /// ponytail: no named lines, `grid-area`, `auto-fit/minmax`, or alignment.
+    /// ponytail: `grid-template-areas` and `minmax()` are read; named lines,
+    /// full `grid-area` shorthand, and `auto-fit`/`auto-fill` sizing are not.
     /// Rows beyond `grid-template-rows` are sized to their tallest item.
     fn layout_grid_children(&mut self, fonts: Option<&FontSet>, images: &ImageMap) {
         let style = self.get_style_node();
@@ -1556,10 +1557,10 @@ impl<'a> LayoutBox<'a> {
 
     /// Single-line flex layout.
     ///
-    /// ponytail: no wrapping, no `flex-grow/shrink/basis`, no `justify-content` or
-    /// `align-items`, and no intrinsic content sizing. Items with an explicit main
-    /// size keep it; the rest split the leftover space equally (which is what
-    /// `flex: 1` does, and covers most real column/nav layouts).
+    /// ponytail: `flex-wrap`, `justify-content`, `align-items`, `align-self`, and
+    /// `flex-grow` are read. Still missing: `flex-shrink`, `flex-basis`, and
+    /// intrinsic content sizing. Items with an explicit main size keep it; the
+    /// rest split leftover space (covers most real column/nav layouts).
     fn layout_flex_children(&mut self, fonts: Option<&FontSet>, images: &ImageMap) {
         let style = self.get_style_node();
         let is_column =
