@@ -62,6 +62,9 @@ pub struct Page {
     /// Whether any rule used `:hover`. Without this the embedder would repaint
     /// on every mouse move for pages that do not react to the cursor at all.
     pub uses_hover: bool,
+    /// Whether anything on the page is `position: sticky`, and so whether the
+    /// band the embedder is holding survives a scroll. See `set_scroll`.
+    pub uses_sticky: bool,
     /// Whether a transition is still running, and so whether another frame is
     /// worth drawing. An idle page answers `false` and the embedder can rest.
     pub animating: bool,
@@ -95,6 +98,8 @@ pub struct Document {
     hovered: style::HoverChain,
     /// Properties mid-transition, and the clock they are moving against.
     anim: anim::Animator,
+    /// The first document row the reader can see, for `position: sticky`.
+    scroll_top: f32,
     pub console: Vec<String>,
 }
 
@@ -148,6 +153,7 @@ impl Document {
             sheet: None,
             hovered: Default::default(),
             anim: Default::default(),
+            scroll_top: 0.0,
             console: Vec::new(),
         };
         doc.assign_node_ids();
@@ -311,6 +317,17 @@ impl Document {
     /// Highlight every occurrence of `query` on the next render; `None` clears it.
     pub fn set_find(&mut self, query: Option<String>) {
         self.find = query.filter(|q| !q.is_empty());
+    }
+
+    /// The first document row the reader can see.
+    ///
+    /// Layout is otherwise independent of scrolling — the engine draws a whole
+    /// document and the embedder moves through it — and this is the exception:
+    /// `position: sticky` is the one thing whose position depends on how far
+    /// down the page you are. An embedder that never calls this gets the top of
+    /// the page, where a sticky box sits at its natural place anyway.
+    pub fn set_scroll(&mut self, top: f32) {
+        self.scroll_top = top.max(0.0);
     }
 
     /// Which field has focus, so the embedder can act on it (submit, say).
@@ -804,6 +821,17 @@ impl Engine {
                         .any(|p| p.simple.pseudos.contains(&css::Pseudo::Hover))
                 })
             });
+        // Whether anything on the page is `position: sticky`. Layout is
+        // scroll-independent for every other page, so the embedder can keep
+        // reusing the band it has while scrolling — and must not, here, because
+        // where a sticky box sits is a function of how far down the page you
+        // are. Same bargain as `uses_hover`: the pages that need the extra work
+        // say so, and the rest pay nothing.
+        let uses_sticky = stylesheet.rules.iter().any(|rule| {
+            rule.declarations.iter().any(|d| {
+                d.name == "position" && matches!(&d.value, css::Value::Keyword(k) if k == "sticky")
+            })
+        });
         let style_root =
             style::style_tree_animated(root, stylesheet, rule_index, &doc.hovered, &mut doc.anim);
 
@@ -838,7 +866,13 @@ impl Engine {
             Some(FontSet { entries })
         };
 
-        let layout_root = layout::layout_tree(&style_root, viewport, fonts.as_ref(), &images);
+        let layout_root = layout::layout_tree_scrolled(
+            &style_root,
+            viewport,
+            fonts.as_ref(),
+            &images,
+            doc.scroll_top,
+        );
         let doc_height = layout::content_bottom(&layout_root).max(height);
         // Only the band the caller asked for is painted. `band` is `None` for a
         // caller that wants the page whole — a screenshot, or an embedder that
@@ -881,6 +915,7 @@ impl Engine {
             find_matches,
             text_runs,
             uses_hover,
+            uses_sticky,
             animating: doc.anim.is_active(),
         }
     }
@@ -2052,6 +2087,27 @@ p { color: #0000ff }", &Sheets, &mut out, 0);
         );
         assert!(red_at(&canvas, 5, 5), "it stays at the top, where it was written");
         assert!(!red_at(&canvas, 5, 95), "and does not fall to the bottom of its container");
+    }
+
+    #[test]
+    fn a_sticky_box_waits_where_flow_put_it_and_is_then_pinned() {
+        let engine = super::Engine::shapes_only();
+        let css = "body { margin: 0; }
+                   #bar { position: sticky; top: 0; height: 20px; background: #ff0000; }
+                   #rest { height: 400px; }";
+        let mut doc = crate::Document::load("<body><div id=bar></div><div id=rest></div></body>", css);
+
+        // At the top of the page a sticky box is just a box.
+        let page = engine.render_band(&mut doc, 50.0, 300.0, Some((0.0, 300.0)), &crate::resource::NullLoader);
+        assert!(page.uses_sticky, "the embedder has to know to re-render on scroll");
+        assert!(red_at(&page.canvas, 5, 5));
+
+        // Scrolled past, it is pinned to the row the reader can see first, and
+        // has left the place flow gave it.
+        doc.set_scroll(100.0);
+        let page = engine.render_band(&mut doc, 50.0, 300.0, Some((0.0, 300.0)), &crate::resource::NullLoader);
+        assert!(red_at(&page.canvas, 5, 105), "pinned at the scroll position");
+        assert!(!red_at(&page.canvas, 5, 5), "and no longer at the top of the document");
     }
 
     #[test]

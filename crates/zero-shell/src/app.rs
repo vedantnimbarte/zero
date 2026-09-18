@@ -901,6 +901,11 @@ struct Tab {
     selection: Option<Selection>,
     /// Whether the last render's stylesheet reacted to the cursor at all.
     uses_hover: bool,
+    /// Whether anything on the page is `position: sticky` — if so the band it
+    /// sent is only good for the scroll it was laid out at.
+    uses_sticky: bool,
+    /// The scroll position the held band was laid out for.
+    rendered_scroll: f32,
     /// The page element the cursor was over last, so `update_hover` only
     /// sends a `hover` message — and pays for a round trip and a repaint —
     /// when it has actually changed, not on every mouse-move pixel.
@@ -995,6 +1000,8 @@ impl Tab {
             text_runs: Vec::new(),
             selection: None,
             uses_hover: false,
+            uses_sticky: false,
+            rendered_scroll: 0.0,
             hovered_node: None,
             source,
             cache_w: 0,
@@ -1024,6 +1031,7 @@ impl Tab {
         self.title = frame.title.clone();
         self.is_focused = frame.is_focused;
         self.uses_hover = frame.uses_hover;
+        self.uses_sticky = frame.uses_sticky;
         self.element_rects = frame.element_rects.clone();
         self.links = frame.links.clone();
         self.matches = frame.find_matches.clone();
@@ -1048,7 +1056,7 @@ impl Tab {
             TabRenderer::spawn(&self.source, "", w, h, self.loader.clone(), store_for(&self.address))?;
         // A fresh renderer starts at the top of the page; this tab may not be.
         let frame = match band_top > 0.0 {
-            true => renderer.resize(w, h, band_top).unwrap_or(frame),
+            true => renderer.resize(w, h, band_top, band_top).unwrap_or(frame),
             false => frame,
         };
         self.renderer = renderer;
@@ -3047,6 +3055,11 @@ impl App {
             && tab.cache_h == h as u32
             && tab.band_covers(visible, h)
             && !animating
+            // A sticky box moves with the reader, so the band a page like that
+            // sent is only good for the scroll position it was laid out at.
+            // Every other page is laid out once and scrolled through, which is
+            // what makes holding a band worth doing at all.
+            && !(tab.uses_sticky && tab.rendered_scroll != visible)
             // A renderer found dead by some other call (a click, typing, ...)
             // must not stay "settled" on its last good frame forever — this
             // is the one call site every unsettled tab passes through, so it
@@ -3073,9 +3086,10 @@ impl App {
         let band_height = h * (1.0 + 2.0 * BAND_MARGIN);
         let frame = match tab.renderer.is_dead() {
             true => tab.respawn(w, band_height, band_top),
-            false => tab.renderer.resize(w, band_height, band_top),
+            false => tab.renderer.resize(w, band_height, band_top, visible),
         };
         let Some(frame) = frame else { return };
+        tab.rendered_scroll = visible;
         if timing_wanted() {
             eprintln!("page render {:?}", render_start.elapsed());
         }

@@ -413,6 +413,19 @@ fn specified_values(
             values.insert(declaration.name.clone(), declaration.value.clone());
         }
     }
+    // An inline `style` attribute is the last word in the cascade, whatever any
+    // rule's specificity. It is where a page puts what it worked out for itself
+    // — a bar's width, a card's background image, a tooltip's offsets — so a
+    // page that computes its layout has none of it without this.
+    //
+    // ponytail: `!important` is not modelled anywhere in this engine, so there
+    // is nothing here for an important declaration to lose to. When it is,
+    // this is the arm that has to stop being unconditional.
+    if let Some(inline) = cursor.elem().attributes.get("style") {
+        for declaration in crate::css::parse_style_attribute(inline) {
+            values.insert(declaration.name, declaration.value);
+        }
+    }
     values
 }
 
@@ -793,6 +806,30 @@ mod tests {
 
         assert_eq!(by_id[0].font_size(), 0.0);
         assert_eq!(by_id[1].font_size(), 30.0); // its sibling still inherits
+    }
+
+    #[test]
+    fn an_inline_style_attribute_is_the_last_word_in_the_cascade() {
+        let html = "<body>\
+            <p id=a class=wide>plain</p>\
+            <p id=b class=wide style='width: 120px'>inline wins</p>\
+            <p id=c class=wide style='--w: 200px; width: var(--w)'>inline var</p>\
+            <p id=d class=wide style='malformed; width: 300px'>broken, then good</p>\
+            </body>";
+        // `#id` beats `.class`, so the stylesheet here is as specific as it gets
+        // short of `!important` — which this engine does not model at all.
+        let css = "#a, #b, #c, #d { width: 400px; } .wide { width: 500px; }";
+        let dom = crate::html::parse(html.to_string());
+        let sheet = crate::css::parse(css.to_string());
+        let styled = style_tree(&dom, &sheet);
+        let by_id = elements(&styled);
+
+        assert_eq!(by_id[0].px("width", 0.0), Some(400.0)); // no attribute: the rule stands
+        assert_eq!(by_id[1].px("width", 0.0), Some(120.0));
+        assert_eq!(by_id[2].px("width", 0.0), Some(200.0)); // `var()` resolves inline too
+        // A declaration the parser cannot read must not swallow the ones after
+        // it — a page's inline styles are often machine-written and untidy.
+        assert_eq!(by_id[3].px("width", 0.0), Some(300.0));
     }
 
     #[test]

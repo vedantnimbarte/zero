@@ -1064,6 +1064,20 @@ fn transform(item: DisplayCommand, xf: Xf) -> DisplayCommand {
     }
 }
 
+/// Whether `position` is anything but `static` — which decides, among siblings
+/// sharing a `z-index`, who paints on top.
+fn is_positioned(layout_box: &LayoutBox) -> bool {
+    let style = match layout_box.box_type {
+        BoxType::BlockNode(s) | BoxType::InlineNode(s) => s,
+        BoxType::AnonymousBlock => return false,
+    };
+    matches!(
+        style.value("position"),
+        Some(Value::Keyword(ref k))
+            if k == "relative" || k == "absolute" || k == "fixed" || k == "sticky"
+    )
+}
+
 /// `z-index`, which decides paint order among siblings. Everything else keeps
 /// document order, so 0 is both the default and what an unpositioned box gets.
 fn z_index_of(layout_box: &LayoutBox) -> i32 {
@@ -1109,8 +1123,12 @@ fn render_layout_box(
     // ponytail: one flat order rather than real stacking contexts, so a child's
     // z-index competes with its uncles. Nested contexts need the display list to
     // become a tree.
+    // Within one z-index, a positioned box paints above the in-flow content it
+    // overlaps — CSS puts positioned descendants in a later layer than block
+    // ones. Without this a sticky header's *background* painted under the rows
+    // it was pinned over while its text, which paints in a later pass, did not.
     let mut order: Vec<&LayoutBox> = layout_box.children.iter().collect();
-    order.sort_by_key(|child| z_index_of(child));
+    order.sort_by_key(|child| (z_index_of(child), is_positioned(child)));
     for child in order {
         render_layout_box(list, child, inner, alpha, xf);
     }
