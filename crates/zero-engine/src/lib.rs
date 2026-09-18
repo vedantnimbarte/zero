@@ -28,6 +28,7 @@ pub mod resource;
 pub mod style;
 pub mod svg;
 pub mod text;
+pub mod woff2;
 
 pub use css::Color;
 pub use layout::{ElementRect, LinkArea, TextRun};
@@ -987,12 +988,66 @@ pub fn is_text_field(tag: &str) -> bool {
 fn collect_linked_css(node: &Node, loader: &dyn ResourceLoader, out: &mut String) {
     let mut hrefs = Vec::new();
     collect_stylesheet_hrefs(node, &mut hrefs);
-    for bytes in loader.load_all(&hrefs).into_iter().flatten() {
-        if let Ok(text) = String::from_utf8(bytes) {
-            out.push('\n');
-            expand_imports(&text, loader, out, 0);
-        }
+    for (href, bytes) in hrefs.iter().zip(loader.load_all(&hrefs)) {
+        let Some(text) = bytes.and_then(|b| String::from_utf8(b).ok()) else { continue };
+        out.push('\n');
+        expand_imports(&rebase_urls(&text, href), loader, out, 0);
     }
+}
+
+/// Rewrite every relative `url(...)` in a sheet to sit against the sheet's own
+/// address rather than against the page's.
+///
+/// A stylesheet's `url()`s are relative to *it*, not to the document that
+/// linked it: a font beside `/static/site.css` is `/static/font.woff2`, and
+/// resolving it against the page asks for `/font.woff2` and gets nothing. The
+/// engine has no URL type and the loader resolves against the page, so the
+/// sheet's own directory is pasted on here — which is all "relative to the
+/// sheet" amounts to for the forms sheets actually use.
+///
+/// ponytail: no `../` climbing. A sheet that reaches up out of its own
+/// directory still resolves wrongly; that needs real path normalisation, and
+/// nothing in the survey corpus does it.
+fn rebase_urls(text: &str, sheet_url: &str) -> String {
+    let Some(dir) = sheet_url.rfind('/').map(|cut| &sheet_url[..=cut]) else {
+        return text.to_string(); // no directory to be relative to
+    };
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find("url(") {
+        let (before, after) = rest.split_at(open + 4);
+        out.push_str(before);
+        let Some(close) = after.find(')') else { break };
+        let (inside, tail) = after.split_at(close);
+        let trimmed = inside.trim();
+        // A quote is syntax, not part of the URL, and has to go back around
+        // whatever this writes.
+        let quote = trimmed.chars().next().filter(|c| *c == '"' || *c == '\'');
+        let url = trimmed.trim_matches(|c| c == '"' || c == '\'').trim();
+        if let Some(q) = quote {
+            out.push(q);
+        }
+        if is_relative_url(url) {
+            out.push_str(dir);
+        }
+        out.push_str(url);
+        if let Some(q) = quote {
+            out.push(q);
+        }
+        rest = tail;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Whether a URL needs a base to mean anything. One already absolute, or rooted
+/// at the host, or carrying its own data, is left exactly as written.
+fn is_relative_url(url: &str) -> bool {
+    !url.is_empty()
+        && !url.starts_with('/')
+        && !url.starts_with('#')
+        && !url.contains("://")
+        && !url.starts_with("data:")
 }
 
 /// Append a sheet, with anything it `@import`s placed ahead of it.
@@ -1023,11 +1078,9 @@ fn expand_imports(text: &str, loader: &dyn ResourceLoader, out: &mut String, dep
 /// absent: `font-family` then falls through the embedder's chain, which is what
 /// a page looks like today and no worse.
 ///
-/// ponytail: `.woff2` is not decompressed, so a page serving only WOFF2 — which
-/// is most of them — still falls back. The bytes are handed to rustybuzz as-is,
-/// which reads bare `.ttf`/`.otf`, and the `src` list is tried in order, so a
-/// page that also offers a TrueType file gets its typeface. Decompression needs
-/// a Brotli decoder, which is the next increment and a real dependency decision.
+/// `.woff2` is unpacked back into a plain sfnt on the way in (see
+/// [`woff2`]), which is what makes this work on real sites at all: nearly
+/// every page that ships a typeface ships only WOFF2.
 fn load_web_fonts(
     faces: &[css::FontFace],
     loader: &dyn ResourceLoader,
@@ -1042,17 +1095,20 @@ fn load_web_fonts(
     let mut loaded = Vec::new();
     for face in faces {
         let candidates: Vec<Option<Vec<u8>>> = bytes.by_ref().take(face.srcs.len()).collect();
-        // The first file that is actually a font wins, which is how `src`'s
+        // The first file that turns out to be a font wins, which is how `src`'s
         // preference order is meant to work.
-        if let Some(usable) = candidates
-            .into_iter()
-            .flatten()
-            .find(|b| rustybuzz::Face::from_slice(b, 0).is_some())
-        {
+        if let Some(usable) = candidates.into_iter().flatten().find_map(readable_font) {
             loaded.push((face.family.clone(), LoadedFont::new(usable)));
         }
     }
     loaded
+}
+
+/// A downloaded font file as bytes the shaper can read, unpacking WOFF2 first.
+/// `None` for anything that is not a font this engine understands.
+fn readable_font(bytes: Vec<u8>) -> Option<Vec<u8>> {
+    let bytes = woff2::to_sfnt(&bytes).unwrap_or(bytes);
+    rustybuzz::Face::from_slice(&bytes, 0).is_some().then_some(bytes)
 }
 
 /// URLs from `@import "a.css";` and `@import url(a.css) screen;`.
@@ -2174,6 +2230,35 @@ p { color: #0000ff }", &Sheets, &mut out, 0);
         );
         assert!(red_at(&canvas, 5, 5), "it stays at the top, where it was written");
         assert!(!red_at(&canvas, 5, 95), "and does not fall to the bottom of its container");
+    }
+
+    #[test]
+    fn a_sheets_urls_are_rebased_onto_the_sheet_rather_than_the_page() {
+        // A font beside `/static.files/site.css` is `/static.files/font.woff2`.
+        // Resolving it against the page asked for `/font.woff2` and got nothing,
+        // which is why a site's own typeface never arrived.
+        let sheet = "https://doc.rust-lang.org/static.files/rustdoc-1ed9.css";
+        let rebased = crate::rebase_urls(
+            "@font-face{src:url(\"FiraSans-0fe4.woff2\") format(\"woff2\")}\
+             .a{background:url(img/bg.png)}\
+             .b{background:url('/rooted.png')}\
+             .c{background:url(https://cdn.example/x.png)}\
+             .d{background:url(data:image/gif;base64,AAA)}",
+            sheet,
+        );
+        assert!(rebased.contains("url(\"https://doc.rust-lang.org/static.files/FiraSans-0fe4.woff2\")"));
+        assert!(rebased.contains("url(https://doc.rust-lang.org/static.files/img/bg.png)"));
+        // Already absolute, rooted at the host, or carrying its own data: left
+        // exactly as written, quotes and all.
+        assert!(rebased.contains("url('/rooted.png')"));
+        assert!(rebased.contains("url(https://cdn.example/x.png)"));
+        assert!(rebased.contains("url(data:image/gif;base64,AAA)"));
+        // Everything that is not a url is untouched.
+        assert!(rebased.contains("format(\"woff2\")"));
+
+        // A base with no directory leaves the sheet alone rather than guessing.
+        assert_eq!(crate::rebase_urls("a{background:url(x.png)}", "sheet.css"),
+                   "a{background:url(x.png)}");
     }
 
     #[test]
