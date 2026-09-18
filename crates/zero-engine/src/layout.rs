@@ -161,6 +161,10 @@ pub struct LayoutBox<'a> {
     /// placed it — a positioned child of a flex or grid container, which those
     /// paths skip — and the containing block's own origin stands in.
     static_position: Option<(f32, f32)>,
+    /// The block whose line content this anonymous box holds, when it has one.
+    /// A block lays out no line of its own, so its `::before`/`::after` are
+    /// generated here, where the line is.
+    generated_from: Option<&'a StyledNode<'a>>,
 }
 
 pub enum BoxType<'a> {
@@ -229,6 +233,7 @@ impl<'a> LayoutBox<'a> {
             link_areas: Vec::new(),
             inline_boxes: Vec::new(),
             static_position: None,
+            generated_from: None,
         }
     }
 
@@ -941,6 +946,12 @@ impl<'a> LayoutBox<'a> {
         // Flatten the inline subtree into a stream of text runs and element
         // boundaries, carrying the nearest ancestor link's href with each run.
         let mut pieces: Vec<InlinePiece> = Vec::new();
+        // A block never lays out a line itself — this anonymous box holds its
+        // content — so a block's own `::before`/`::after` belong here, around
+        // everything the block contains.
+        if let Some(owner) = self.generated_from {
+            push_generated(owner, "::before:content", default_size, &None, &mut pieces);
+        }
         for (index, child) in self.children.iter().enumerate() {
             // Inside an inline container, a block-level box can only be an
             // inline-block, so it joins the line as one indivisible item.
@@ -949,6 +960,9 @@ impl<'a> LayoutBox<'a> {
             } else {
                 collect_inline_text(child, default_size, None, &mut pieces, &[index]);
             }
+        }
+        if let Some(owner) = self.generated_from {
+            push_generated(owner, "::after:content", default_size, &None, &mut pieces);
         }
 
         let mut inline_boxes: Vec<InlineBox> = Vec::new();
@@ -1095,7 +1109,7 @@ impl<'a> LayoutBox<'a> {
                     if line.is_empty() {
                         continue; // a blank line still occupies its height
                     }
-                    let font_index = fonts.pick(line);
+                    let font_index = fonts.pick_in(&piece.families, line);
                     let (mut glyphs, width) =
                         shape_run(&fonts.entries[font_index], line, piece.size);
                     let width = width + spread_glyphs(&mut glyphs, piece.letter_spacing);
@@ -1135,7 +1149,7 @@ impl<'a> LayoutBox<'a> {
             for word in piece.text.split_ascii_whitespace() {
                 // Pick a font that can draw this word, then shape it: this is where
                 // Indic reordering/conjuncts happen.
-                let font_index = fonts.pick(word);
+                let font_index = fonts.pick_in(&piece.families, word);
                 let (mut glyphs, word_w) =
                     shape_run(&fonts.entries[font_index], word, piece.size);
                 let word_w = word_w + spread_glyphs(&mut glyphs, piece.letter_spacing);
@@ -1814,14 +1828,16 @@ impl<'a> LayoutBox<'a> {
     fn get_inline_container(&mut self) -> &mut LayoutBox<'a> {
         match self.box_type {
             BoxType::InlineNode(_) | BoxType::AnonymousBlock => self,
-            BoxType::BlockNode(_) => {
+            BoxType::BlockNode(styled) => {
                 // Inline children of a block box go in an anonymous block wrapper.
                 let needs_new = !matches!(
                     self.children.last().map(|c| &c.box_type),
                     Some(BoxType::AnonymousBlock)
                 );
                 if needs_new {
-                    self.children.push(LayoutBox::new(BoxType::AnonymousBlock));
+                    let mut anon = LayoutBox::new(BoxType::AnonymousBlock);
+                    anon.generated_from = Some(styled);
+                    self.children.push(anon);
                 }
                 self.children.last_mut().unwrap()
             }
@@ -1934,6 +1950,9 @@ fn place_out_of_flow(
 struct TextPiece {
     text: String,
     size: f32,
+    /// What the page asked for, best first. Shared rather than copied: every
+    /// run in a paragraph names the same list.
+    families: std::rc::Rc<Vec<String>>,
     line_height: f32,
     letter_spacing: f32,
     color: Color,
@@ -2031,6 +2050,7 @@ fn collect_inline_text(
                 out.push(InlinePiece::Enter(style));
                 decorated = true;
             }
+            push_generated(styled, "::before:content", default_size, &current_href, out);
         }
         if let NodeType::Text(ref t) = styled.node.node_type {
             let size = if styled.font_size() > 0.0 {
@@ -2063,6 +2083,14 @@ fn collect_inline_text(
             out.push(InlinePiece::Text(TextPiece {
                 text: t.clone(),
                 size,
+                families: std::rc::Rc::new(match styled.value("font-family") {
+                    Some(value) => crate::css::family_list(&match value {
+                        Value::Raw(text) => text,
+                        Value::Keyword(word) => word,
+                        _ => String::new(),
+                    }),
+                    None => Vec::new(),
+                }),
                 line_height: styled.line_height(),
                 letter_spacing: styled.px("letter-spacing", 0.0).unwrap_or(0.0),
                 color,
@@ -2087,9 +2115,86 @@ fn collect_inline_text(
             collect_inline_text(child, default_size, current_href.as_deref(), out, &child_path);
         }
     }
+    if let BoxType::InlineNode(styled) | BoxType::BlockNode(styled) = bx.box_type {
+        push_generated(styled, "::after:content", default_size, &current_href, out);
+    }
     if decorated {
         out.push(InlinePiece::Exit);
     }
+}
+
+/// Emit a `::before`/`::after` box's text, if the page asked for one.
+///
+/// ponytail: the generated box takes the *element's* own styling rather than
+/// the pseudo-rule's, so its `content` arrives but a `::before` with a colour,
+/// size or background of its own does not get them. Giving it those means a
+/// styled node with no DOM node behind it, which the styled tree has no room
+/// for yet. The common cases — a bullet, a quote mark, a disclosure arrow, a
+/// separator — inherit anyway and come out right. `attr()`, counters and
+/// `url()` are not resolved; a quoted string is.
+fn push_generated(
+    styled: &StyledNode,
+    key: &str,
+    default_size: f32,
+    href: &Option<String>,
+    out: &mut Vec<InlinePiece>,
+) {
+    let Some(Value::Raw(raw)) = styled.value(key) else { return };
+    let text = unquote_content(&raw);
+    if text.is_empty() {
+        return; // `content: ""` marks a box to style, and there is no box yet
+    }
+    let size = match styled.font_size() > 0.0 {
+        true => styled.font_size(),
+        false => default_size,
+    };
+    out.push(InlinePiece::Text(TextPiece {
+        text,
+        size,
+        families: std::rc::Rc::new(match styled.value("font-family") {
+            Some(Value::Raw(list)) => crate::css::family_list(&list),
+            _ => Vec::new(),
+        }),
+        line_height: styled.line_height(),
+        letter_spacing: styled.px("letter-spacing", 0.0).unwrap_or(0.0),
+        color: match styled.value("color") {
+            Some(Value::ColorValue(c)) => c,
+            _ => Color { r: 0, g: 0, b: 0, a: 255 },
+        },
+        underline: false,
+        strikethrough: false,
+        bold: false,
+        italic: false,
+        href: href.clone(),
+    }));
+}
+
+/// A `content` string, with its quotes stripped and its escapes resolved.
+fn unquote_content(raw: &str) -> String {
+    let raw = raw.trim();
+    let inner = ['"', '\'']
+        .iter()
+        .find_map(|q| raw.strip_prefix(*q).and_then(|r| r.strip_suffix(*q)))
+        .unwrap_or("");
+    // `content: "\201C"` is how a sheet writes a character it cannot type.
+    let mut out = String::new();
+    let mut chars = inner.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        let mut hex = String::new();
+        while hex.len() < 6 && chars.peek().is_some_and(|c| c.is_ascii_hexdigit()) {
+            hex.push(chars.next().expect("peeked"));
+        }
+        match u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+            Some(escaped) => out.push(escaped),
+            // Not an escape sequence: a literal backslash before something else.
+            None => out.push_str(&hex),
+        }
+    }
+    out
 }
 
 /// The box a [`InlinePiece::Atomic`] path names, walking down from `root`.
@@ -3373,6 +3478,23 @@ mod tests {
         let placed = laid.children[0].dimensions.margin_box();
         assert_eq!(placed.x, 900.0 - 20.0 - 100.0); // right edge is 20 from the container's
         assert_eq!(placed.y, 200.0 - 10.0 - 40.0); // bottom edge is 10 from the container's
+    }
+
+    #[test]
+    fn generated_content_loses_its_quotes_and_resolves_its_escapes() {
+        // A sheet writes a character it cannot type as `\201C`, which is how
+        // nearly every quote mark, bullet and arrow on the web is spelled.
+        assert_eq!(unquote_content("'\\2022  '"), "\u{2022}  ");
+        assert_eq!(unquote_content("\"\\201C\""), "\u{201C}");
+        assert_eq!(unquote_content("' \\25B8'"), " \u{25B8}");
+        assert_eq!(unquote_content("\"plain text\""), "plain text");
+        // An escape runs to at most six hex digits, so text may follow it.
+        assert_eq!(unquote_content("'\\2022 x'"), "\u{2022} x");
+        // Nothing to generate: an empty string, and anything not a string at
+        // all (`attr(href)`, `counter(n)`, `none`) which this cannot resolve.
+        assert_eq!(unquote_content("''"), "");
+        assert_eq!(unquote_content("attr(href)"), "");
+        assert_eq!(unquote_content("none"), "");
     }
 
     #[test]

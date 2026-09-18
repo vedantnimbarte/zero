@@ -100,6 +100,9 @@ pub struct Document {
     anim: anim::Animator,
     /// The first document row the reader can see, for `position: sticky`.
     scroll_top: f32,
+    /// Typefaces the page shipped through `@font-face`, under the names it gave
+    /// them. Fetched when the stylesheet changes, not once per render.
+    web_fonts: Vec<(String, LoadedFont)>,
     pub console: Vec<String>,
 }
 
@@ -158,6 +161,7 @@ impl Document {
             hovered: Default::default(),
             anim: Default::default(),
             scroll_top: 0.0,
+            web_fonts: Vec::new(),
             console: Vec::new(),
         };
         doc.assign_node_ids();
@@ -688,6 +692,10 @@ pub(crate) struct LoadedFont {
 }
 
 impl LoadedFont {
+    pub(crate) fn new(bytes: Vec<u8>) -> LoadedFont {
+        LoadedFont { bytes, raster: std::cell::OnceCell::new() }
+    }
+
     /// This font's rasterizer, parsed on first use. `None` if the bytes are not
     /// a font this can read — which is as good as a font covering nothing.
     pub(crate) fn raster(&self) -> Option<&Font> {
@@ -827,6 +835,10 @@ impl Engine {
                 .rules
                 .retain(|rule| css::media_matches(rule.media.as_deref(), width, height));
             let index = style::RuleIndex::build(&parsed);
+            // The page's own typefaces, fetched once per sheet rather than per
+            // render — a font file is the largest subresource on many pages and
+            // nothing about it changes between frames.
+            doc.web_fonts = load_web_fonts(&parsed.font_faces, loader);
             doc.sheet = Some((key, parsed, index));
         }
         let (_, stylesheet, rule_index) = doc.sheet.as_ref().expect("just cached");
@@ -871,16 +883,31 @@ impl Engine {
         viewport.content.height = height;
 
         // Shaping faces are built per render; they borrow the stored font bytes.
+        // The page's own `@font-face` files come first, so a site asking for the
+        // typeface it shipped gets it rather than whatever the system happens to
+        // call by the same name.
+        let web = &doc.web_fonts;
+        let web_faces: Vec<Option<rustybuzz::Face>> = web
+            .iter()
+            .map(|(_, f)| rustybuzz::Face::from_slice(&f.bytes, 0))
+            .collect();
         let faces: Vec<Option<rustybuzz::Face>> = self
             .fonts
             .iter()
             .map(|f| rustybuzz::Face::from_slice(&f.bytes, 0))
             .collect();
-        let entries: Vec<FontEntry> = self
-            .fonts
+        let entries: Vec<FontEntry> = web
             .iter()
-            .zip(faces.iter())
-            .filter_map(|(f, face)| face.as_ref().map(|shaper| FontEntry::new(f, shaper)))
+            .zip(web_faces.iter())
+            .filter_map(|((family, f), face)| {
+                face.as_ref().map(|shaper| FontEntry::named(f, shaper, family))
+            })
+            .chain(
+                self.fonts
+                    .iter()
+                    .zip(faces.iter())
+                    .filter_map(|(f, face)| face.as_ref().map(|shaper| FontEntry::new(f, shaper))),
+            )
             .collect();
         let fonts = if entries.is_empty() {
             None
@@ -988,6 +1015,44 @@ fn expand_imports(text: &str, loader: &dyn ResourceLoader, out: &mut String, dep
         }
     }
     out.push_str(text);
+}
+
+/// Fetch every `@font-face` file the sheet declared, in one batch.
+///
+/// A face whose file will not download, or will not parse as a font, is simply
+/// absent: `font-family` then falls through the embedder's chain, which is what
+/// a page looks like today and no worse.
+///
+/// ponytail: `.woff2` is not decompressed, so a page serving only WOFF2 — which
+/// is most of them — still falls back. The bytes are handed to rustybuzz as-is,
+/// which reads bare `.ttf`/`.otf`, and the `src` list is tried in order, so a
+/// page that also offers a TrueType file gets its typeface. Decompression needs
+/// a Brotli decoder, which is the next increment and a real dependency decision.
+fn load_web_fonts(
+    faces: &[css::FontFace],
+    loader: &dyn ResourceLoader,
+) -> Vec<(String, LoadedFont)> {
+    if faces.is_empty() {
+        return Vec::new();
+    }
+    // One round trip for every candidate file, rather than one per face in
+    // turn — the loader batches, and a page declares a dozen of these.
+    let urls: Vec<String> = faces.iter().flat_map(|f| f.srcs.iter().cloned()).collect();
+    let mut bytes = loader.load_all(&urls).into_iter();
+    let mut loaded = Vec::new();
+    for face in faces {
+        let candidates: Vec<Option<Vec<u8>>> = bytes.by_ref().take(face.srcs.len()).collect();
+        // The first file that is actually a font wins, which is how `src`'s
+        // preference order is meant to work.
+        if let Some(usable) = candidates
+            .into_iter()
+            .flatten()
+            .find(|b| rustybuzz::Face::from_slice(b, 0).is_some())
+        {
+            loaded.push((face.family.clone(), LoadedFont::new(usable)));
+        }
+    }
+    loaded
 }
 
 /// URLs from `@import "a.css";` and `@import url(a.css) screen;`.
@@ -2109,6 +2174,41 @@ p { color: #0000ff }", &Sheets, &mut out, 0);
         );
         assert!(red_at(&canvas, 5, 5), "it stays at the top, where it was written");
         assert!(!red_at(&canvas, 5, 95), "and does not fall to the bottom of its container");
+    }
+
+    #[test]
+    fn a_pseudo_element_rule_is_kept_for_its_own_box_and_not_applied_to_the_element() {
+        // These rules used to be dropped whole, which is why bullets, quote
+        // marks and disclosure arrows were simply absent. They are kept now —
+        // under a name no property can collide with, so that a `::before`'s
+        // `content` and `color` never land on the element they hang off.
+        let sheet = crate::css::parse(
+            "li::before { content: '\\2022  '; color: #ff0000; } li { color: #00ff00; }"
+                .to_string(),
+        );
+        assert_eq!(sheet.rules.len(), 2, "the pseudo rule is no longer thrown away");
+
+        let dom = crate::html::parse("<body><li>x</li></body>".to_string());
+        let styled = crate::style::style_tree(&dom, &sheet);
+        fn find<'a>(
+            node: &'a crate::style::StyledNode<'a>,
+            tag: &str,
+        ) -> Option<&'a crate::style::StyledNode<'a>> {
+            if let crate::dom::NodeType::Element(ref e) = node.node.node_type {
+                if e.tag_name == tag {
+                    return Some(node);
+                }
+            }
+            node.children.iter().find_map(|c| find(c, tag))
+        }
+        let li = find(&styled, "li").expect("the list item");
+        assert!(li.value("::before:content").is_some());
+        assert!(li.value("content").is_none(), "content must not leak onto the element");
+        // The element keeps its *own* colour, not the pseudo-element's.
+        assert_eq!(
+            li.value("color"),
+            Some(crate::css::Value::ColorValue(crate::Color { r: 0, g: 255, b: 0, a: 255 }))
+        );
     }
 
     #[test]

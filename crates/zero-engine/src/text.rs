@@ -17,11 +17,30 @@
 pub struct FontEntry<'a> {
     font: &'a crate::LoadedFont,
     pub shaper: &'a rustybuzz::Face<'a>,
+    /// What this font calls itself, lowercased — what a page's `font-family`
+    /// is matched against. A face the page supplied through `@font-face` is
+    /// known by the name the page gave it instead, which is the whole point of
+    /// that at-rule: the file's own name need not be the one it is asked for.
+    family: String,
+    /// Whether the page supplied this face through `@font-face`. Such a font
+    /// answers when it is asked for by name and at no other time: it is the
+    /// page's typeface, not a fallback for text that named something else.
+    page_supplied: bool,
 }
 
 impl<'a> FontEntry<'a> {
     pub(crate) fn new(font: &'a crate::LoadedFont, shaper: &'a rustybuzz::Face<'a>) -> FontEntry<'a> {
-        FontEntry { font, shaper }
+        let family = family_of(shaper);
+        FontEntry { font, shaper, family, page_supplied: false }
+    }
+
+    /// Same, but answering to the name a page's `@font-face` gave it.
+    pub(crate) fn named(
+        font: &'a crate::LoadedFont,
+        shaper: &'a rustybuzz::Face<'a>,
+        family: &str,
+    ) -> FontEntry<'a> {
+        FontEntry { font, shaper, family: family.to_ascii_lowercase(), page_supplied: true }
     }
 
     /// The rasterizer, parsed the first time it is asked for. `None` when the
@@ -36,7 +55,39 @@ pub struct FontSet<'a> {
     pub entries: Vec<FontEntry<'a>>,
 }
 
+/// A font's own family name, lowercased, from its `name` table.
+fn family_of(shaper: &rustybuzz::Face) -> String {
+    shaper
+        .names()
+        .into_iter()
+        .find(|name| name.name_id == rustybuzz::ttf_parser::name_id::FAMILY)
+        .and_then(|name| name.to_string())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+}
+
 impl FontSet<'_> {
+    /// Index of the best font for `text` given what the page asked for.
+    ///
+    /// Each family is tried in the order the page listed them, and a font only
+    /// answers if it can actually draw the text — so a page asking for a Latin
+    /// face and then writing Devanagari still falls through to a font that
+    /// covers it rather than drawing boxes. Nothing matching means the page
+    /// asked for something nobody here has, which is what the fallback chain
+    /// exists for.
+    pub fn pick_in(&self, families: &[String], text: &str) -> usize {
+        for wanted in families {
+            if let Some(i) = self
+                .entries
+                .iter()
+                .position(|e| e.family == *wanted && covers(e, text))
+            {
+                return i;
+            }
+        }
+        self.pick(text)
+    }
+
     /// Index of the first font that can draw every character of `text`,
     /// falling back to the primary font when none covers it fully.
     pub fn pick(&self, text: &str) -> usize {
@@ -48,12 +99,15 @@ impl FontSet<'_> {
         // than drawing the text. Now only a font that actually draws is parsed.
         self.entries
             .iter()
-            .position(|e| {
-                text.chars()
-                    .all(|c| c.is_whitespace() || e.shaper.glyph_index(c).is_some())
-            })
-            .unwrap_or(0)
+            .position(|e| !e.page_supplied && covers(e, text))
+            .unwrap_or_else(|| self.entries.iter().position(|e| covers(e, text)).unwrap_or(0))
     }
+}
+
+/// Whether this font has a glyph for every character of `text`.
+fn covers(entry: &FontEntry, text: &str) -> bool {
+    text.chars()
+        .all(|c| c.is_whitespace() || entry.shaper.glyph_index(c).is_some())
 }
 
 /// A glyph placed relative to the start of its run (y is up-positive, like the font).
