@@ -25,12 +25,14 @@ enum DisplayCommand {
     SolidColor(Color, Rect),
     /// A rounded rectangle: same as SolidColor but with a corner radius.
     RoundedColor(Color, Rect, f32),
-    /// A linear gradient between stops, vertical unless `horizontal`.
+    /// A linear or radial gradient between stops.
     Gradient {
         rect: Rect,
         radius: f32,
-        stops: Vec<Color>,
-        horizontal: bool,
+        /// Each stop's colour and position (0.0..=1.0 along the gradient line
+        /// for `Linear`, or from the centre outward for `Radial`).
+        stops: Vec<(Color, f32)>,
+        shape: GradientShape,
     },
     /// A soft drop shadow behind a box.
     Shadow {
@@ -51,6 +53,24 @@ enum DisplayCommand {
         position: (BgAxis, BgAxis),
         repeat: BgRepeat,
     },
+}
+
+/// A gradient's geometry — everything but its colour stops.
+#[derive(Clone, Copy, PartialEq)]
+enum GradientShape {
+    /// A direction (already resolved from an angle or `to <side>` keyword) as
+    /// a unit vector, CSS's own convention: `(0, -1)` is "to top", `(0, 1)` is
+    /// "to bottom" (the default with no direction given), etc.
+    Linear { dx: f32, dy: f32 },
+    /// Centred in the box, sized to its half-width/half-height — an ellipse
+    /// matching the box's own aspect ratio rather than a circle.
+    ///
+    /// ponytail: only `ellipse ... at center` — no `circle`, no explicit
+    /// position/size keywords (`closest-side`, `at top left`, ...). Covers the
+    /// overwhelming common case (`radial-gradient(red, blue)`); add a keyword
+    /// parser alongside `linear-gradient`'s `to <side>` parsing if a page
+    /// needs more.
+    Radial,
 }
 
 /// `object-fit` on a replaced element (`<img>`, inline `<svg>`).
@@ -177,21 +197,24 @@ impl Canvas {
         }
     }
 
-    /// Fill a rect by interpolating between colour stops along one axis.
-    fn paint_gradient(&mut self, rect: Rect, radius: f32, stops: &[Color], horizontal: bool) {
-        if stops.is_empty() {
+    /// Fill a rect by interpolating between colour stops along a gradient's geometry.
+    fn paint_gradient(&mut self, rect: Rect, radius: f32, stops: &[(Color, f32)], shape: GradientShape) {
+        if stops.is_empty() || rect.width <= 0.0 || rect.height <= 0.0 {
             return;
         }
         let x0 = rect.x.clamp(0.0, self.width as f32) as usize;
         let y0 = rect.y.clamp(0.0, self.height as f32) as usize;
         let x1 = (rect.x + rect.width).clamp(0.0, self.width as f32) as usize;
         let y1 = (rect.y + rect.height).clamp(0.0, self.height as f32) as usize;
-        let span = if horizontal { rect.width } else { rect.height };
-        if span <= 0.0 {
-            return;
-        }
         let (left, right) = (rect.x + radius, rect.x + rect.width - radius);
         let (top, bottom) = (rect.y + radius, rect.y + rect.height - radius);
+        // A linear gradient's line runs the length of the box's own diagonal
+        // projection onto its direction — computed once, not per pixel, the
+        // same way `rect`/`radius` already are.
+        let linear_span = match shape {
+            GradientShape::Linear { dx, dy } => Some(linear_gradient_span(rect, dx, dy)),
+            GradientShape::Radial => None,
+        };
 
         for y in y0..y1 {
             for x in x0..x1 {
@@ -223,12 +246,23 @@ impl Canvas {
                 if coverage <= 0.0 {
                     continue;
                 }
-                let t = if horizontal {
-                    (px - rect.x) / span
-                } else {
-                    (py - rect.y) / span
+                let t = match (shape, linear_span) {
+                    (GradientShape::Linear { dx, dy }, Some((lo, span))) => {
+                        ((px * dx + py * dy - lo) / span).clamp(0.0, 1.0)
+                    }
+                    _ => {
+                        // Radial: distance from the box's centre, normalized by
+                        // its own half-width/half-height — an ellipse matching
+                        // the box's aspect ratio rather than a circle.
+                        let (cx, cy) = (rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
+                        let (nx, ny) = (
+                            (px - cx) / (rect.width / 2.0).max(0.001),
+                            (py - cy) / (rect.height / 2.0).max(0.001),
+                        );
+                        (nx * nx + ny * ny).sqrt().clamp(0.0, 1.0)
+                    }
                 };
-                let color = sample_stops(stops, t.clamp(0.0, 1.0));
+                let color = sample_stops(stops, t);
                 let idx = y * self.width + x;
                 self.pixels[idx] = blend(self.pixels[idx], color, (coverage * 255.0) as u8);
             }
@@ -559,8 +593,8 @@ pub fn paint(
                     rect,
                     radius,
                     stops,
-                    horizontal,
-                } => canvas.paint_gradient(*rect, *radius, stops, *horizontal),
+                    shape,
+                } => canvas.paint_gradient(*rect, *radius, stops, *shape),
                 DisplayCommand::Shadow {
                     rect,
                     radius,
@@ -784,11 +818,11 @@ fn fade(item: DisplayCommand, alpha: f32) -> DisplayCommand {
         DisplayCommand::RoundedColor(c, rect, radius) => {
             DisplayCommand::RoundedColor(dim(c), rect, radius)
         }
-        DisplayCommand::Gradient { rect, radius, stops, horizontal } => DisplayCommand::Gradient {
+        DisplayCommand::Gradient { rect, radius, stops, shape } => DisplayCommand::Gradient {
             rect,
             radius,
-            stops: stops.into_iter().map(dim).collect(),
-            horizontal,
+            stops: stops.into_iter().map(|(c, pos)| (dim(c), pos)).collect(),
+            shape,
         },
         DisplayCommand::Shadow { rect, radius, blur, color } => DisplayCommand::Shadow {
             rect,
@@ -921,11 +955,11 @@ fn transform(item: DisplayCommand, xf: Xf) -> DisplayCommand {
         DisplayCommand::RoundedColor(c, rect, radius) => {
             DisplayCommand::RoundedColor(c, xf.rect(rect), radius * xf.scale)
         }
-        DisplayCommand::Gradient { rect, radius, stops, horizontal } => DisplayCommand::Gradient {
+        DisplayCommand::Gradient { rect, radius, stops, shape } => DisplayCommand::Gradient {
             rect: xf.rect(rect),
             radius: radius * xf.scale,
             stops,
-            horizontal,
+            shape,
         },
         DisplayCommand::Shadow { rect, radius, blur, color } => DisplayCommand::Shadow {
             rect: xf.rect(rect),
@@ -1175,8 +1209,8 @@ fn render_background(list: &mut DisplayList, layout_box: &LayoutBox) {
     // A gradient fully covers the box, the same as `background-image` wins
     // over `background-color` in a real cascade — nothing paints beneath it.
     if let Some(spec) = &spec {
-        if let Some((stops, horizontal)) = parse_gradient(spec) {
-            list.push(DisplayCommand::Gradient { rect: box_rect, radius, stops, horizontal });
+        if let Some((shape, stops)) = parse_gradient(spec) {
+            list.push(DisplayCommand::Gradient { rect: box_rect, radius, stops, shape });
             return;
         }
     }
@@ -1319,52 +1353,242 @@ fn parse_bg_position(
     }
 }
 
-/// Parse `linear-gradient(<direction>?, stop, stop, ...)` into colour stops.
-/// ponytail: no angles, no explicit stop positions — stops are spaced evenly.
-fn parse_gradient(spec: &str) -> Option<(Vec<Color>, bool)> {
-    let inner = spec
-        .trim()
-        .strip_prefix("linear-gradient(")?
-        .strip_suffix(')')?;
-    let mut horizontal = false;
-    let mut stops = Vec::new();
-    for (i, part) in inner.split(',').enumerate() {
-        let part = part.trim();
-        if i == 0 && part.starts_with("to ") {
-            horizontal = part.contains("right") || part.contains("left");
-            continue;
+/// Parse `linear-gradient(<direction>?, stop, ...)` or `radial-gradient(stop,
+/// ...)` into its geometry and colour stops.
+fn parse_gradient(spec: &str) -> Option<(GradientShape, Vec<(Color, f32)>)> {
+    let spec = spec.trim();
+    let (is_radial, inner) = if let Some(inner) =
+        spec.strip_prefix("linear-gradient(").and_then(|s| s.strip_suffix(')'))
+    {
+        (false, inner)
+    } else if let Some(inner) =
+        spec.strip_prefix("radial-gradient(").and_then(|s| s.strip_suffix(')'))
+    {
+        (true, inner)
+    } else {
+        return None;
+    };
+
+    let parts = split_top_level_commas(inner);
+    let Some(first) = parts.first() else { return None };
+
+    let mut start = 0;
+    let shape = if is_radial {
+        // A leading shape/position descriptor (`ellipse`, `circle at center`,
+        // ...) is skipped rather than parsed — see `GradientShape::Radial`.
+        if parse_color_stop(first).is_none() {
+            start = 1;
         }
-        // Take the colour token, ignoring any stop position that follows it.
-        if let Some(token) = part.split_whitespace().next() {
-            if let Some(hex) = token.strip_prefix('#') {
-                if let Some(Value::ColorValue(c)) = crate::css::parse_color_token(hex) {
-                    stops.push(c);
-                }
+        GradientShape::Radial
+    } else {
+        match parse_linear_direction(first) {
+            Some((dx, dy)) => {
+                start = 1;
+                GradientShape::Linear { dx, dy }
             }
+            // No direction given: CSS's own default is "to bottom".
+            None => GradientShape::Linear { dx: 0.0, dy: 1.0 },
         }
-    }
+    };
+
+    let mut stops: Vec<(Color, Option<f32>)> =
+        parts[start..].iter().filter_map(|part| parse_color_stop(part)).collect();
     if stops.len() < 2 {
         return None;
     }
-    Some((stops, horizontal))
+    fill_stop_positions(&mut stops);
+    let stops = stops.into_iter().map(|(c, p)| (c, p.unwrap())).collect();
+    Some((shape, stops))
+}
+
+/// `to <side>...` or an angle (`45deg`/`0.5turn`/`1.2rad`/`50grad`) into a
+/// unit direction vector, in CSS's own convention: `0deg` is "to top" and
+/// angles increase clockwise, so `(0, -1)` is up and `(1, 0)` is right.
+fn parse_linear_direction(spec: &str) -> Option<(f32, f32)> {
+    let spec = spec.trim();
+    if let Some(sides) = spec.strip_prefix("to ") {
+        let (mut dx, mut dy): (f32, f32) = (0.0, 0.0);
+        for word in sides.split_whitespace() {
+            match word {
+                "top" => dy -= 1.0,
+                "bottom" => dy += 1.0,
+                "left" => dx -= 1.0,
+                "right" => dx += 1.0,
+                _ => return None,
+            }
+        }
+        if dx == 0.0 && dy == 0.0 {
+            return None;
+        }
+        let len = (dx * dx + dy * dy).sqrt();
+        return Some((dx / len, dy / len));
+    }
+    for (suffix, to_deg) in [
+        ("deg", 1.0),
+        ("grad", 0.9),
+        ("rad", 180.0 / std::f32::consts::PI),
+        ("turn", 360.0),
+    ] {
+        if let Some(num) = spec.strip_suffix(suffix) {
+            if let Ok(n) = num.trim().parse::<f32>() {
+                let radians = (n * to_deg).to_radians();
+                return Some((radians.sin(), -radians.cos()));
+            }
+        }
+    }
+    None
+}
+
+/// One `<color> <position>?` gradient stop. `None` position defers to
+/// `fill_stop_positions`; only a percentage position is understood (a length
+/// would need the gradient line's px length, not just its direction, to
+/// place) — falls back to auto-spacing rather than a wrong placement.
+fn parse_color_stop(part: &str) -> Option<(Color, Option<f32>)> {
+    let (color_token, position_token) = split_color_and_position(part);
+    let color = crate::css::parse_color_str(color_token)?;
+    let position = position_token
+        .and_then(|p| p.strip_suffix('%'))
+        .and_then(|n| n.trim().parse::<f32>().ok())
+        .map(|n| n / 100.0);
+    Some((color, position))
+}
+
+/// Split a gradient's argument list on top-level commas only — one nested
+/// inside a colour function (`rgba(0, 0, 0, 0.5)`) must not end a stop early.
+fn split_top_level_commas(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0;
+    let mut start = 0;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                parts.push(s[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(s[start..].trim());
+    parts
+}
+
+/// A stop's colour token and, if present, its trailing position token — split
+/// right after a colour *function*'s closing paren rather than on whitespace,
+/// since the modern `rgb(0 0 0 / 50%)` form has spaces of its own.
+fn split_color_and_position(part: &str) -> (&str, Option<&str>) {
+    let part = part.trim();
+    if let Some(open) = part.find('(') {
+        let mut depth = 0;
+        for (i, c) in part.char_indices().skip(open) {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let rest = part[i + 1..].trim();
+                        return (&part[..=i], (!rest.is_empty()).then_some(rest));
+                    }
+                }
+                _ => {}
+            }
+        }
+        (part, None) // unterminated function — colour parsing will reject it
+    } else {
+        match part.split_once(char::is_whitespace) {
+            Some((color, rest)) => (color, Some(rest.trim())),
+            None => (part, None),
+        }
+    }
+}
+
+/// Fill in stop positions CSS leaves implicit: the first/last default to
+/// 0%/100%, a run of unspecified stops between two given ones spreads evenly
+/// across the gap, and a position earlier than its predecessor's is raised to
+/// match it (a gradient never runs backwards).
+fn fill_stop_positions(stops: &mut [(Color, Option<f32>)]) {
+    if stops.is_empty() {
+        return;
+    }
+    if stops[0].1.is_none() {
+        stops[0].1 = Some(0.0);
+    }
+    let last = stops.len() - 1;
+    if stops[last].1.is_none() {
+        stops[last].1 = Some(1.0);
+    }
+    for i in 1..stops.len() {
+        if let (Some(prev), Some(cur)) = (stops[i - 1].1, stops[i].1) {
+            if cur < prev {
+                stops[i].1 = Some(prev);
+            }
+        }
+    }
+    let mut i = 0;
+    while i < stops.len() {
+        if stops[i].1.is_some() {
+            i += 1;
+            continue;
+        }
+        let start = i - 1; // always Some: stops[0] was defaulted above
+        let start_pos = stops[start].1.unwrap();
+        let mut end = i;
+        while stops[end].1.is_none() {
+            end += 1;
+        }
+        let end_pos = stops[end].1.unwrap();
+        let n = (end - start) as f32;
+        for (k, stop) in stops[start + 1..end].iter_mut().enumerate() {
+            stop.1 = Some(start_pos + (end_pos - start_pos) * (k as f32 + 1.0) / n);
+        }
+        i = end;
+    }
 }
 
 /// Interpolate between evenly spaced stops at position `t` in 0..=1.
-fn sample_stops(stops: &[Color], t: f32) -> Color {
+fn sample_stops(stops: &[(Color, f32)], t: f32) -> Color {
     if stops.len() == 1 {
-        return stops[0];
+        return stops[0].0;
     }
-    let scaled = t * (stops.len() - 1) as f32;
-    let i = (scaled.floor() as usize).min(stops.len() - 2);
-    let f = scaled - i as f32;
-    let (a, b) = (stops[i], stops[i + 1]);
-    let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * f).round() as u8;
-    Color {
-        r: mix(a.r, b.r),
-        g: mix(a.g, b.g),
-        b: mix(a.b, b.b),
-        a: mix(a.a, b.a),
+    let t = t.clamp(0.0, 1.0);
+    for pair in stops.windows(2) {
+        let (a, pos_a) = pair[0];
+        let (b, pos_b) = pair[1];
+        if t <= pos_b {
+            let span = (pos_b - pos_a).max(0.0001);
+            let f = ((t - pos_a) / span).clamp(0.0, 1.0);
+            let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * f).round() as u8;
+            return Color {
+                r: mix(a.r, b.r),
+                g: mix(a.g, b.g),
+                b: mix(a.b, b.b),
+                a: mix(a.a, b.a),
+            };
+        }
     }
+    // Past the last stop's own position (it need not be 1.0) — clamp to it.
+    stops.last().unwrap().0
+}
+
+/// The range a linear gradient's direction vector spans across `rect`'s four
+/// corners — `t=0` at the corner the gradient line starts from, `t=1` at the
+/// one it ends at, exactly reproducing CSS's own "gradient line" geometry
+/// (including that a diagonal direction's line is longer than either side).
+fn linear_gradient_span(rect: Rect, dx: f32, dy: f32) -> (f32, f32) {
+    let corners = [
+        (rect.x, rect.y),
+        (rect.x + rect.width, rect.y),
+        (rect.x, rect.y + rect.height),
+        (rect.x + rect.width, rect.y + rect.height),
+    ];
+    let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+    for (cx, cy) in corners {
+        let p = cx * dx + cy * dy;
+        lo = lo.min(p);
+        hi = hi.max(p);
+    }
+    (lo, (hi - lo).max(0.0001))
 }
 
 /// Resolve `border-radius`, with percentages relative to the box's smaller side.

@@ -1759,4 +1759,81 @@ p { color: #0000ff }", &Sheets, &mut out, 0);
         assert!(!blue_at(&contained.canvas, 10, 2), "contain must not stretch past the image's own ratio");
         assert!(blue_at(&contained.canvas, 10, 10), "the fitted image still covers the box's middle");
     }
+
+    #[test]
+    fn gradient_angles_point_the_line_the_way_css_says() {
+        let engine = super::Engine::shapes_only();
+        let canvas = engine.render(
+            "<body><div id=\"g\"></div></body>",
+            // 90deg is "to right" in CSS's clockwise-from-top convention.
+            "body { margin: 0; }
+             #g { width: 100px; height: 20px; background: linear-gradient(90deg, #ff0000, #0000ff); }",
+            100.0,
+            20.0,
+        );
+        let at = |x: usize, y: usize| canvas.pixels[y * canvas.width + x];
+        let left = at(2, 10);
+        let right = at(97, 10);
+        assert!(left.r > 200 && left.b < 60, "the start of the line is red, got {left:?}");
+        assert!(right.b > 200 && right.r < 60, "the end of the line is blue, got {right:?}");
+    }
+
+    #[test]
+    fn radial_gradient_radiates_from_the_boxs_centre() {
+        let engine = super::Engine::shapes_only();
+        let canvas = engine.render(
+            "<body><div id=\"g\"></div></body>",
+            "body { margin: 0; }
+             #g { width: 100px; height: 100px; background: radial-gradient(#ff0000, #0000ff); }",
+            100.0,
+            100.0,
+        );
+        let at = |x: usize, y: usize| canvas.pixels[y * canvas.width + x];
+        let centre = at(50, 50);
+        let corner = at(97, 97);
+        assert!(centre.r > 200 && centre.b < 60, "the centre is red, got {centre:?}");
+        assert!(corner.b > 200 && corner.r < 60, "a far corner is blue, got {corner:?}");
+    }
+
+    #[test]
+    fn rgba_gradient_stops_carry_real_alpha_and_explicit_positions() {
+        let engine = super::Engine::shapes_only();
+        let canvas = engine.render(
+            "<body><div id=\"g\"></div></body>",
+            "body { margin: 0; }
+             #g { width: 100px; height: 20px; background-color: #ffffff;
+                  background-image: linear-gradient(to right, red 0%, rgba(0,0,255,0.5) 100%); }",
+            100.0,
+            20.0,
+        );
+        let at = |x: usize, y: usize| canvas.pixels[y * canvas.width + x];
+        let start = at(2, 10);
+        let end = at(97, 10);
+        assert!(start.r > 200 && start.b < 60, "the 0% stop is opaque red, got {start:?}");
+        // A half-alpha blue stop blends with the white background beneath it —
+        // neither pure blue (were alpha ignored) nor pure white (were the
+        // gradient not reaching 100%).
+        assert!(
+            end.b > 200 && end.r > 50 && end.r < 200,
+            "the 50%-alpha blue stop should read as a blend, not pure blue or white, got {end:?}"
+        );
+    }
+
+    #[test]
+    fn a_gradient_in_the_background_shorthand_is_not_torn_apart_by_tokenizing() {
+        // Regression: `background`'s shorthand parser used to naively split
+        // the whole declaration on whitespace before looking at it, which
+        // tore a multi-word gradient argument list into fragments and
+        // silently dropped the whole declaration.
+        let engine = super::Engine::shapes_only();
+        let canvas = engine.render(
+            "<body><div id=\"g\"></div></body>",
+            "body { margin: 0; }
+             #g { width: 60px; height: 60px; background: radial-gradient(#ff0000, #0000ff); }",
+            60.0,
+            60.0,
+        );
+        let centre = canvas.pixels[30 * canvas.width + 30];
+        assert!(centre.r > 200 && centre.b < 60, "expected the gradient's centre stop, got {centre:?}");
+    }
 }

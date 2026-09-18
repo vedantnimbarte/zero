@@ -390,6 +390,24 @@ const NAMED_COLORS: &[(&str, u32)] = &[
     ("slategrey", 0x708090ff),
 ];
 
+/// Parse one colour token — hex, `rgb()`/`rgba()`/`hsl()`/`hsla()`, or a named
+/// colour — outside the context of a whole declaration. Used by gradient
+/// stops, which sit inside a `background-image` spec `classify_value` never
+/// gets to run on directly.
+pub(crate) fn parse_color_str(token: &str) -> Option<Color> {
+    let value = if let Some(hex) = token.strip_prefix('#') {
+        parse_hex_color(hex)
+    } else if token.contains('(') {
+        parse_color_function(token)
+    } else {
+        named_color(token)
+    }?;
+    match value {
+        Value::ColorValue(c) => Some(c),
+        _ => None,
+    }
+}
+
 fn named_color(name: &str) -> Option<Value> {
     let name = name.to_ascii_lowercase();
     NAMED_COLORS.iter().find(|(n, _)| *n == name).map(|(_, rgba)| {
@@ -567,6 +585,15 @@ fn border_like_longhands(
 /// yet, so there is no consumer to feed. Add it alongside that support instead
 /// of guessing its shape now.
 fn expand_shorthand(name: &str, raw: &str) -> Option<Vec<Declaration>> {
+    // `background` gets its own tokenizer: a naive whitespace split (used by
+    // every shorthand below) tears a gradient or a space-separated colour
+    // function apart (`linear-gradient(to right, red, blue)`,
+    // `rgb(0 0 0 / 50%)`), and a background can legitimately be *one* token
+    // (`background: radial-gradient(red, blue)`, no space after the commas) —
+    // which the `tokens.len() < 2` guard below would otherwise drop entirely.
+    if name == "background" {
+        return expand_background_shorthand(raw);
+    }
     let tokens: Vec<&str> = raw.split_whitespace().collect();
     if tokens.len() < 2 {
         return None;
@@ -610,46 +637,80 @@ fn expand_shorthand(name: &str, raw: &str) -> Option<Vec<Declaration>> {
                     .collect(),
             )
         }
-        "background" => {
-            // ponytail: the `<position> / <size>` slash syntax inside the
-            // shorthand (`center / cover`) is not split out — write
-            // `background-size` as its own declaration instead. Every other
-            // token order this grammar allows is understood.
-            const REPEAT_KEYWORDS: [&str; 6] =
-                ["repeat", "no-repeat", "repeat-x", "repeat-y", "space", "round"];
-            let mut out = Vec::new();
-            let mut position_tokens: Vec<&str> = Vec::new();
-            for token in &tokens {
-                if token.starts_with("url(") || token.starts_with("linear-gradient(") {
-                    out.push(Declaration {
-                        name: "background-image".to_string(),
-                        value: Value::Raw(token.to_string()),
-                    });
-                } else if REPEAT_KEYWORDS.contains(token) {
-                    out.push(Declaration {
-                        name: "background-repeat".to_string(),
-                        value: Value::Keyword(token.to_string()),
-                    });
-                } else if let Some(v @ Value::ColorValue(_)) = classify_value(token) {
-                    out.push(Declaration { name: "background-color".to_string(), value: v });
-                } else if matches!(
-                    token.to_ascii_lowercase().as_str(),
-                    "left" | "right" | "top" | "bottom" | "center"
-                ) || matches!(classify_value(token), Some(Value::Length(..)))
-                {
-                    position_tokens.push(token);
-                }
-            }
-            if !position_tokens.is_empty() {
-                out.push(Declaration {
-                    name: "background-position".to_string(),
-                    value: Value::Raw(position_tokens.join(" ")),
-                });
-            }
-            (!out.is_empty()).then_some(out)
-        }
         _ => None,
     }
+}
+
+/// ponytail: the `<position> / <size>` slash syntax inside the shorthand
+/// (`center / cover`) is not split out — write `background-size` as its own
+/// declaration instead. Every other token order this grammar allows is
+/// understood.
+fn expand_background_shorthand(raw: &str) -> Option<Vec<Declaration>> {
+    const REPEAT_KEYWORDS: [&str; 6] =
+        ["repeat", "no-repeat", "repeat-x", "repeat-y", "space", "round"];
+    let tokens = split_top_level_whitespace(raw);
+    let mut out = Vec::new();
+    let mut position_tokens: Vec<&str> = Vec::new();
+    for token in &tokens {
+        if token.starts_with("url(")
+            || token.starts_with("linear-gradient(")
+            || token.starts_with("radial-gradient(")
+        {
+            out.push(Declaration {
+                name: "background-image".to_string(),
+                value: Value::Raw(token.to_string()),
+            });
+        } else if REPEAT_KEYWORDS.contains(token) {
+            out.push(Declaration {
+                name: "background-repeat".to_string(),
+                value: Value::Keyword(token.to_string()),
+            });
+        } else if let Some(v @ Value::ColorValue(_)) = classify_value(token) {
+            out.push(Declaration { name: "background-color".to_string(), value: v });
+        } else if matches!(
+            token.to_ascii_lowercase().as_str(),
+            "left" | "right" | "top" | "bottom" | "center"
+        ) || matches!(classify_value(token), Some(Value::Length(..)))
+        {
+            position_tokens.push(token);
+        }
+    }
+    if !position_tokens.is_empty() {
+        out.push(Declaration {
+            name: "background-position".to_string(),
+            value: Value::Raw(position_tokens.join(" ")),
+        });
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// Like `str::split_whitespace`, but text inside a balanced `(...)` counts as
+/// one token even if it has spaces of its own — `rgb(0 0 0 / 50%)`,
+/// `linear-gradient(to right, red, blue)`.
+fn split_top_level_whitespace(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0;
+    let mut start: Option<usize> = None;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            c if c.is_whitespace() && depth == 0 => {
+                if let Some(st) = start.take() {
+                    parts.push(&s[st..i]);
+                }
+                continue;
+            }
+            _ => {}
+        }
+        if start.is_none() {
+            start = Some(i);
+        }
+    }
+    if let Some(st) = start {
+        parts.push(&s[st..]);
+    }
+    parts
 }
 
 /// Parse a bare hex colour body (no leading `#`).
