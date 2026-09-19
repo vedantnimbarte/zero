@@ -14,6 +14,19 @@ pub struct Stylesheet {
     pub rules: Vec<Rule>,
     /// Every `@font-face` the sheet declared, in source order.
     pub font_faces: Vec<FontFace>,
+    /// Every `@keyframes` rule, by name. A later definition of the same name
+    /// replaces an earlier one, as the cascade says it should.
+    pub keyframes: Vec<Keyframes>,
+}
+
+/// One `@keyframes` rule: a name an `animation` can call for, and the stops it
+/// passes through.
+#[derive(Debug, Clone)]
+pub struct Keyframes {
+    pub name: String,
+    /// Each stop's position (0.0 to 1.0) and what it sets, sorted by position.
+    /// `from` and `to` are 0% and 100%.
+    pub stops: Vec<(f32, Vec<Declaration>)>,
 }
 
 /// One `@font-face`: a name the page's `font-family` can ask for, and where to
@@ -153,7 +166,7 @@ impl SimpleSelector {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Declaration {
     pub name: String,
     pub value: Value,
@@ -190,6 +203,20 @@ pub enum CalcOp {
 pub enum CalcExpr {
     Value(Box<Value>),
     Op(Box<CalcExpr>, CalcOp, Box<CalcExpr>),
+}
+
+impl CalcExpr {
+    /// Whether any term is a percentage, which decides whether the whole
+    /// expression can be resolved against a containing block that has not
+    /// sized itself yet.
+    pub fn mentions_percentage(&self) -> bool {
+        match self {
+            CalcExpr::Value(value) => matches!(**value, Value::Length(_, Unit::Percent)),
+            CalcExpr::Op(left, _, right) => {
+                left.mentions_percentage() || right.mentions_percentage()
+            }
+        }
+    }
 }
 
 fn resolve_calc(expr: &CalcExpr, ctx: LengthContext) -> f32 {
@@ -493,8 +520,12 @@ pub fn parse(source: String) -> Stylesheet {
         pos: 0,
         input: source,
     };
-    let (rules, font_faces) = parser.parse_rules();
-    Stylesheet { rules, font_faces }
+    let (rules, font_faces, keyframes) = parser.parse_rules();
+    Stylesheet {
+        rules,
+        font_faces,
+        keyframes,
+    }
 }
 
 /// Remove `/* ... */` from a value. Comments are whitespace between tokens, and
@@ -552,27 +583,51 @@ const RAW_VALUE_PROPERTIES: &[&str] = &[
     "grid-template-areas",
     "grid-template",
     "box-shadow",
+    // A comma-separated list, the colour of each entry possibly a function.
+    "text-shadow",
     "background-image",
     // Both can be one or two space-separated tokens (`center bottom`, `50% 50%`).
     "background-position",
     "background-size",
     // `overflow: hidden auto` sets the two axes at once.
     "overflow",
+    // `url(pointer.png), pointer` — a list whose last entry is the keyword.
+    "cursor",
+    // Function lists read at paint time.
+    "filter",
+    "backdrop-filter",
     // `translate(-50%, -50%)`, read at paint time.
     "transform",
-    // `color 300ms, opacity 1s` — a list, read when styling.
+    // Up to two tokens (`left top`, `50% 50%`), read with the transform.
+    "transform-origin",
+    // `spin 1s linear infinite` and `color 300ms, opacity 1s` — lists, read
+    // when styling.
+    "animation",
+    "animation-name",
+    "animation-duration",
+    "animation-timing-function",
+    "animation-delay",
+    "animation-iteration-count",
+    "animation-direction",
+    "animation-fill-mode",
+    "animation-play-state",
     "transition",
     "transition-property",
     "transition-duration",
+    "transition-timing-function",
     // A comma-separated list of names, often quoted: `"Helvetica Neue", Arial,
     // sans-serif`. Classifying it would keep only the first token.
     "font-family",
     // `@font-face`'s file list: `url(a.woff2) format("woff2"), url(a.ttf)`.
     // Nothing classifies as a value, so it would be dropped outright.
     "src",
-    // Generated content: a quoted string, kept exactly as written so an
-    // escape or a leading space survives to be unquoted at use.
+    // Generated content: a component list, kept exactly as written so an
+    // escape, a leading space or a `counter()` survives to be read at use.
     "content",
+    "counter-increment",
+    "counter-reset",
+    "counter-set",
+    "quotes",
 ];
 
 /// The named colours worth carrying, plus `transparent`.
@@ -862,15 +917,40 @@ fn border_like_longhands(
     (!out.is_empty()).then_some(out)
 }
 
+/// Turn a property and its value text into the declarations the rest of the
+/// engine reads: raw text for the list-shaped properties, a classified value
+/// where one parses, or a shorthand's longhands.
+///
+/// The declaration parser and `var()` substitution both need this, and they
+/// need to agree — a value that arrives through a variable is a declaration
+/// like any other, shorthand expansion included.
+pub(crate) fn declarations_for(name: &str, raw: &str) -> Vec<Declaration> {
+    let raw = raw.trim();
+    if RAW_VALUE_PROPERTIES.contains(&name) {
+        return vec![Declaration {
+            name: name.to_string(),
+            value: Value::Raw(raw.to_string()),
+        }];
+    }
+    if let Some(value) = classify_value(raw) {
+        return vec![Declaration {
+            name: name.to_string(),
+            value,
+        }];
+    }
+    expand_shorthand(name, raw).unwrap_or_default()
+}
+
 /// Split a multi-token shorthand into the longhands the rest of the engine
 /// already reads. Only reached once [`classify_value`] has failed on the whole
 /// string, so the common single-token case (`padding: 10px`, `flex: 1`) is
 /// untouched and keeps working exactly as it did.
-///
-/// ponytail: `font` is not expanded — nothing reads `font-family`/`font-weight`
-/// yet, so there is no consumer to feed. Add it alongside that support instead
-/// of guessing its shape now.
 fn expand_shorthand(name: &str, raw: &str) -> Option<Vec<Declaration>> {
+    // `font`, like `background`, cannot be split on whitespace: the family runs
+    // to the end of the value and may carry commas and quoted names.
+    if name == "font" {
+        return expand_font_shorthand(raw);
+    }
     // `background` gets its own tokenizer: a naive whitespace split (used by
     // every shorthand below) tears a gradient or a space-separated colour
     // function apart (`linear-gradient(to right, red, blue)`,
@@ -950,6 +1030,111 @@ fn expand_shorthand(name: &str, raw: &str) -> Option<Vec<Declaration>> {
 /// (`center / cover`) is not split out — write `background-size` as its own
 /// declaration instead. Every other token order this grammar allows is
 /// understood.
+/// `font: [ <style> || <variant> || <weight> || <stretch> ]? <size>[/<line-height>]? <family>`
+///
+/// The size is the pivot. Everything before it is the optional leading
+/// keywords in any order; everything after it is the family list, which runs
+/// to the end of the value. The system keywords (`caption`, `menu`, ...) are
+/// one token and so never reach here — they fall out as an unexpandable
+/// value, which leaves the element on the default face, which is what they
+/// mean anyway.
+///
+/// Per spec the shorthand resets every sub-property it does not mention, so
+/// `body { font: 1rem/1.5 Arial }` has to clear an inherited bold rather than
+/// quietly keeping it.
+fn expand_font_shorthand(raw: &str) -> Option<Vec<Declaration>> {
+    let mut leading: Vec<Declaration> = Vec::new();
+    let mut rest = raw.trim();
+    loop {
+        // The family is the only part that may contain whitespace, and it
+        // always follows the size, so a leading keyword is always one token.
+        let (token, tail) = rest.split_once(char::is_whitespace)?;
+        let lower = token.to_ascii_lowercase();
+        let name = match lower.as_str() {
+            "italic" | "oblique" => "font-style",
+            "small-caps" => "font-variant",
+            "bold" | "bolder" | "lighter" => "font-weight",
+            "condensed" | "expanded" | "semi-condensed" | "semi-expanded" | "extra-condensed"
+            | "extra-expanded" | "ultra-condensed" | "ultra-expanded" => "font-stretch",
+            // `normal` stands for whichever of the four has not been given.
+            // They all reset to it below, so there is nothing to record.
+            "normal" => {
+                rest = tail.trim_start();
+                continue;
+            }
+            // A bare number is a weight: a font size always carries a unit or
+            // is one of the named sizes.
+            _ if lower.parse::<f32>().is_ok() => "font-weight",
+            _ => break,
+        };
+        leading.push(Declaration {
+            name: name.to_string(),
+            value: classify_value(&lower)?,
+        });
+        rest = tail.trim_start();
+    }
+    let (size_token, family) = rest.split_once(char::is_whitespace)?;
+    let family = family.trim();
+    if family.is_empty() {
+        return None;
+    }
+    let (size, line_height) = match size_token.split_once('/') {
+        Some((size, line_height)) => (size, Some(line_height)),
+        None => (size_token, None),
+    };
+
+    // Reset the sub-properties no leading keyword gave a value to.
+    let mut out = leading;
+    for name in ["font-style", "font-weight"] {
+        if !out.iter().any(|d| d.name == name) {
+            out.push(Declaration {
+                name: name.to_string(),
+                value: Value::Keyword("normal".to_string()),
+            });
+        }
+    }
+    out.push(Declaration {
+        name: "font-size".to_string(),
+        value: font_size_value(size)?,
+    });
+    out.push(Declaration {
+        name: "line-height".to_string(),
+        value: match line_height {
+            Some(text) => classify_value(text)?,
+            None => Value::Keyword("normal".to_string()),
+        },
+    });
+    out.push(Declaration {
+        name: "font-family".to_string(),
+        value: Value::Raw(family.to_string()),
+    });
+    Some(out)
+}
+
+/// A font size, which unlike other lengths may also be one of the named
+/// absolute sizes. `medium` is the initial value and the scale hangs off it.
+fn font_size_value(text: &str) -> Option<Value> {
+    const ABSOLUTE: &[(&str, f32)] = &[
+        ("xx-small", 9.0),
+        ("x-small", 10.0),
+        ("small", 13.0),
+        ("medium", 16.0),
+        ("large", 18.0),
+        ("x-large", 24.0),
+        ("xx-large", 32.0),
+    ];
+    let lower = text.trim().to_ascii_lowercase();
+    if let Some((_, px)) = ABSOLUTE.iter().find(|(name, _)| *name == lower) {
+        return Some(Value::Length(*px, Unit::Px));
+    }
+    // `smaller`/`larger` are relative to the parent's size, which is not
+    // knowable here; they resolve during the style walk like `em` does.
+    match classify_value(text)? {
+        value @ (Value::Length(..) | Value::Calc(..)) => Some(value),
+        _ => None,
+    }
+}
+
 fn expand_background_shorthand(raw: &str) -> Option<Vec<Declaration>> {
     const REPEAT_KEYWORDS: [&str; 6] = [
         "repeat",
@@ -1079,6 +1264,622 @@ fn parse_hex_color(hex: &str) -> Option<Value> {
     Some(Value::ColorValue(color))
 }
 
+/// Offset of the `)` closing the paren this text is already inside of.
+pub(crate) fn matching_paren(text: &str) -> Option<usize> {
+    scan_top_level(text, &[')']).map(|(offset, _)| offset)
+}
+
+/// Split at the first comma that is not inside parens or a string.
+pub(crate) fn split_top_level_comma(text: &str) -> Option<(&str, &str)> {
+    scan_top_level(text, &[',']).map(|(offset, _)| (&text[..offset], &text[offset + 1..]))
+}
+
+/// First occurrence of any `stops` character that is not nested inside parens
+/// or a quoted string.
+///
+/// A custom property's value is an arbitrary token stream, so neither the
+/// closing paren nor the fallback comma can be found by scanning for the
+/// character itself: `var(--c, rgb(1, 2, 3))` has three commas and two parens
+/// before the ones that matter.
+fn scan_top_level(text: &str, stops: &[char]) -> Option<(usize, char)> {
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (offset, c) in text.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match quote {
+            Some(q) => match c {
+                '\\' => escaped = true,
+                _ if c == q => quote = None,
+                _ => {}
+            },
+            None => match c {
+                '"' | '\'' => quote = Some(c),
+                '(' => depth += 1,
+                _ if depth == 0 && stops.contains(&c) => return Some((offset, c)),
+                ')' => depth = depth.saturating_sub(1),
+                _ => {}
+            },
+        }
+    }
+    None
+}
+
+/// A keyframe selector as a fraction: `from` is 0, `to` is 1, `35%` is 0.35.
+fn keyframe_position(selector: &str) -> Option<f32> {
+    match selector.to_ascii_lowercase().as_str() {
+        "from" => Some(0.0),
+        "to" => Some(1.0),
+        other => other
+            .strip_suffix('%')?
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .map(|n| n / 100.0),
+    }
+}
+
+/// A 2D affine transform, in CSS's own `matrix(a, b, c, d, e, f)` order:
+/// `x' = a*x + c*y + e`, `y' = b*x + d*y + f`.
+///
+/// Rotation and skew are why this exists: translate and scale keep a rectangle
+/// axis-aligned and so fold into a scale-and-offset, but nothing else does.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Mat {
+    pub a: f32,
+    pub b: f32,
+    pub c: f32,
+    pub d: f32,
+    pub e: f32,
+    pub f: f32,
+}
+
+impl Mat {
+    pub const IDENTITY: Mat = Mat {
+        a: 1.0,
+        b: 0.0,
+        c: 0.0,
+        d: 1.0,
+        e: 0.0,
+        f: 0.0,
+    };
+
+    pub fn translate(dx: f32, dy: f32) -> Mat {
+        Mat {
+            e: dx,
+            f: dy,
+            ..Mat::IDENTITY
+        }
+    }
+
+    pub fn scale(sx: f32, sy: f32) -> Mat {
+        Mat {
+            a: sx,
+            d: sy,
+            ..Mat::IDENTITY
+        }
+    }
+
+    pub fn rotate(radians: f32) -> Mat {
+        let (sin, cos) = radians.sin_cos();
+        Mat {
+            a: cos,
+            b: sin,
+            c: -sin,
+            d: cos,
+            ..Mat::IDENTITY
+        }
+    }
+
+    pub fn skew(x_radians: f32, y_radians: f32) -> Mat {
+        Mat {
+            c: x_radians.tan(),
+            b: y_radians.tan(),
+            ..Mat::IDENTITY
+        }
+    }
+
+    /// `inner` applied first, then `self` — the order a CSS function list
+    /// composes in, read left to right.
+    pub fn then(self, inner: Mat) -> Mat {
+        Mat {
+            a: self.a * inner.a + self.c * inner.b,
+            b: self.b * inner.a + self.d * inner.b,
+            c: self.a * inner.c + self.c * inner.d,
+            d: self.b * inner.c + self.d * inner.d,
+            e: self.a * inner.e + self.c * inner.f + self.e,
+            f: self.b * inner.e + self.d * inner.f + self.f,
+        }
+    }
+
+    pub fn apply(self, x: f32, y: f32) -> (f32, f32) {
+        (
+            self.a * x + self.c * y + self.e,
+            self.b * x + self.d * y + self.f,
+        )
+    }
+
+    pub fn is_identity(self) -> bool {
+        self == Mat::IDENTITY
+    }
+
+    /// Whether this maps rectangles to rectangles *and* scales both axes
+    /// alike — the shape the painter can apply without an offscreen buffer.
+    pub fn is_upright(self) -> bool {
+        const EPSILON: f32 = 1.0e-4;
+        self.b.abs() < EPSILON
+            && self.c.abs() < EPSILON
+            && (self.a - self.d).abs() < EPSILON
+            && self.a > 0.0
+    }
+
+    pub fn invert(self) -> Option<Mat> {
+        let det = self.a * self.d - self.b * self.c;
+        if det.abs() < 1.0e-9 {
+            return None; // a degenerate transform paints nothing
+        }
+        Some(Mat {
+            a: self.d / det,
+            b: -self.b / det,
+            c: -self.c / det,
+            d: self.a / det,
+            e: (self.c * self.f - self.d * self.e) / det,
+            f: (self.b * self.e - self.a * self.f) / det,
+        })
+    }
+}
+
+/// An angle in radians. CSS allows four units and a bare `0`.
+pub fn parse_angle(token: &str) -> Option<f32> {
+    let token = token.trim();
+    for (suffix, per_unit) in [
+        ("deg", std::f32::consts::PI / 180.0),
+        ("grad", std::f32::consts::PI / 200.0),
+        ("turn", std::f32::consts::TAU),
+        ("rad", 1.0),
+    ] {
+        if let Some(number) = token.strip_suffix(suffix) {
+            return number.trim().parse::<f32>().ok().map(|n| n * per_unit);
+        }
+    }
+    // A bare number is only an angle when it is zero, which CSS lets a page
+    // write without a unit.
+    match token.parse::<f32>() {
+        Ok(0.0) => Some(0.0),
+        _ => None,
+    }
+}
+
+/// Parse a `transform` list into one matrix, composed in the order written.
+///
+/// `size` is the box's own border box, which is what a percentage in
+/// `translate()` resolves against — `translate(-50%, -50%)` is how the web
+/// centres things.
+///
+/// ponytail: the 3D functions (`translate3d`, `rotateX`, `perspective`, ...)
+/// are ignored rather than flattened. Applying their 2D shadow would move
+/// things to places the page did not ask for; they need a real 3D compositor,
+/// which is its own piece of work.
+pub fn parse_transform(spec: &str, ctx: LengthContext, size: (f32, f32)) -> Mat {
+    let mut matrix = Mat::IDENTITY;
+    let mut rest = spec.trim();
+    while let Some(open) = rest.find('(') {
+        let name = rest[..open]
+            .trim()
+            .trim_start_matches(',')
+            .trim()
+            .to_ascii_lowercase();
+        let Some(close) = matching_paren(&rest[open + 1..]) else {
+            break;
+        };
+        let args: Vec<&str> = rest[open + 1..open + 1 + close]
+            .split(',')
+            .map(str::trim)
+            .collect();
+        rest = &rest[open + 1 + close + 1..];
+
+        // A percentage is of this box's own size, so each axis has its own base.
+        let length = |token: &str, base: f32| match token.strip_suffix('%') {
+            Some(pct) => pct.trim().parse::<f32>().unwrap_or(0.0) / 100.0 * base,
+            None => parse_length_token(token, ctx),
+        };
+        let number = |token: Option<&&str>| token.and_then(|t| t.parse::<f32>().ok());
+        let angle = |token: Option<&&str>| token.and_then(|t| parse_angle(t)).unwrap_or(0.0);
+        let step = match name.as_str() {
+            "translate" => Mat::translate(
+                length(args[0], size.0),
+                args.get(1).map_or(0.0, |y| length(y, size.1)),
+            ),
+            "translatex" => Mat::translate(length(args[0], size.0), 0.0),
+            "translatey" => Mat::translate(0.0, length(args[0], size.1)),
+            "scale" => {
+                let x = number(args.first()).unwrap_or(1.0);
+                Mat::scale(x, number(args.get(1)).unwrap_or(x))
+            }
+            "scalex" => Mat::scale(number(args.first()).unwrap_or(1.0), 1.0),
+            "scaley" => Mat::scale(1.0, number(args.first()).unwrap_or(1.0)),
+            // `rotateZ` is a rotation about the screen normal, which is the 2D
+            // one; `rotateX`/`rotateY` are not and fall through to be ignored.
+            "rotate" | "rotatez" => Mat::rotate(angle(args.first())),
+            "skew" => Mat::skew(angle(args.first()), angle(args.get(1))),
+            "skewx" => Mat::skew(angle(args.first()), 0.0),
+            "skewy" => Mat::skew(0.0, angle(args.first())),
+            "matrix" if args.len() == 6 => {
+                let n: Vec<f32> = args.iter().map(|a| a.parse().unwrap_or(0.0)).collect();
+                Mat {
+                    a: n[0],
+                    b: n[1],
+                    c: n[2],
+                    d: n[3],
+                    e: n[4],
+                    f: n[5],
+                }
+            }
+            _ => continue,
+        };
+        matrix = matrix.then(step);
+    }
+    matrix
+}
+
+/// `transform-origin`, as an offset inside the box. Defaults to its centre,
+/// which is what every transform is measured about unless a page says otherwise.
+pub fn parse_transform_origin(
+    spec: Option<&str>,
+    ctx: LengthContext,
+    size: (f32, f32),
+) -> (f32, f32) {
+    let mut origin = (size.0 / 2.0, size.1 / 2.0);
+    let Some(spec) = spec else {
+        return origin;
+    };
+    let mut axis = 0;
+    for token in spec.split_whitespace() {
+        // The keywords may come in either order, so each names its own axis.
+        let (value, of) = match token.to_ascii_lowercase().as_str() {
+            "left" => (Some(0.0), 0),
+            "right" => (Some(size.0), 0),
+            "top" => (Some(0.0), 1),
+            "bottom" => (Some(size.1), 1),
+            "center" => (None, axis),
+            _ => {
+                let base = if axis == 0 { size.0 } else { size.1 };
+                let value = match token.strip_suffix('%') {
+                    Some(pct) => pct.trim().parse::<f32>().ok().map(|n| n / 100.0 * base),
+                    None => Some(parse_length_token(token, ctx)),
+                };
+                (value, axis)
+            }
+        };
+        if let Some(value) = value {
+            if of == 0 {
+                origin.0 = value;
+            } else {
+                origin.1 = value;
+            }
+        }
+        // A keyword names its axis explicitly; anything else takes the next one.
+        axis = if of == 0 { 1 } else { 0 };
+    }
+    origin
+}
+
+/// Whether the engine supports what an `@supports` condition asks about.
+///
+/// The answers have to be *honest*. `@supports` exists so a site can hand a
+/// partial engine a working fallback instead of a broken layout, and an engine
+/// that claims a property it only half-implements makes the site take the
+/// modern path and render worse than if the rule had been ignored. So support
+/// is answered from an explicit registry of what the engine *applies*, never
+/// inferred from the value parsing.
+pub fn supports_matches(condition: &str) -> bool {
+    let mut parser = SupportsParser {
+        text: condition,
+        pos: 0,
+    };
+    let value = parser.or_expr().unwrap_or(false);
+    parser.skip_whitespace();
+    // Trailing junk means the condition used something we did not understand,
+    // and per spec an unparsable condition is false rather than half-true.
+    value && parser.pos == parser.text.len()
+}
+
+/// Properties the engine reads and acts on, as opposed to merely parses.
+///
+/// Gathered from what `layout.rs` and `paint.rs` actually look up. Anything
+/// absent answers `false`, which is the safe direction: a site then takes its
+/// fallback path, which is what an engine without the property wants anyway.
+/// As the rest of the backlog lands, its entry is added here with it.
+const SUPPORTED_PROPERTIES: &[&str] = &[
+    "align-items",
+    "align-self",
+    "animation",
+    "animation-delay",
+    "animation-direction",
+    "animation-duration",
+    "animation-fill-mode",
+    "animation-iteration-count",
+    "animation-name",
+    "animation-play-state",
+    "animation-timing-function",
+    "backdrop-filter",
+    "background",
+    "background-color",
+    "background-image",
+    "background-position",
+    "background-repeat",
+    "background-size",
+    "border-bottom-width",
+    "border-left-width",
+    "border-radius",
+    "border-right-width",
+    "border-spacing",
+    "border-style",
+    "border-top-width",
+    "bottom",
+    "box-shadow",
+    "box-sizing",
+    "clear",
+    "color",
+    "content",
+    // `chapter 1 section` — pairs of a name and a number.
+    "counter-increment",
+    "counter-reset",
+    "counter-set",
+    "cursor",
+    // `"\201C" "\201D"` — pairs of quotation marks.
+    "quotes",
+    "display",
+    "flex",
+    "flex-basis",
+    "flex-direction",
+    "flex-grow",
+    "flex-shrink",
+    "flex-wrap",
+    "float",
+    "font-family",
+    "font-size",
+    "font-style",
+    "filter",
+    "font-weight",
+    "gap",
+    "grid-area",
+    "grid-template",
+    "grid-template-areas",
+    "grid-template-columns",
+    "grid-template-rows",
+    "height",
+    "justify-content",
+    "left",
+    "letter-spacing",
+    "line-height",
+    "margin",
+    "margin-bottom",
+    "margin-left",
+    "margin-right",
+    "margin-top",
+    "max-height",
+    "max-width",
+    "min-height",
+    "min-width",
+    "object-fit",
+    "opacity",
+    "outline-color",
+    "outline-style",
+    "outline-width",
+    "overflow",
+    "padding",
+    "padding-bottom",
+    "padding-left",
+    "padding-right",
+    "padding-top",
+    "position",
+    "right",
+    "text-align",
+    "text-decoration",
+    "text-overflow",
+    "text-shadow",
+    "text-transform",
+    "top",
+    "transform",
+    "transform-origin",
+    "transition",
+    "transition-timing-function",
+    "visibility",
+    "white-space",
+    "width",
+    "z-index",
+];
+
+/// Selector syntax the engine matches. `selector()` asks about the selector,
+/// not about any property, so it gets its own list.
+fn supports_selector(selector: &str) -> bool {
+    let selector = selector.trim();
+    if selector.is_empty() {
+        return false;
+    }
+    // Anything the engine does not match is a lie waiting to happen, so only
+    // the constructs `style.rs` implements answer true.
+    const KNOWN_PSEUDO: &[&str] = &[
+        ":hover",
+        ":first-child",
+        ":last-child",
+        ":only-child",
+        ":not",
+        ":nth-child",
+        "::before",
+        "::after",
+    ];
+    if let Some(colon) = selector.find(':') {
+        let pseudo = &selector[colon..];
+        let name = pseudo.split(['(', ' ', ',', '>']).next().unwrap_or(pseudo);
+        if !KNOWN_PSEUDO.contains(&name) {
+            return false;
+        }
+    }
+    // Attribute selectors and the column combinator are not implemented.
+    !selector.contains('[') && !selector.contains("||")
+}
+
+/// A declaration condition: does the engine both parse *and* apply this?
+fn supports_declaration(declaration: &str) -> bool {
+    let Some((property, value)) = declaration.split_once(':') else {
+        return false;
+    };
+    let property = property.trim().to_ascii_lowercase();
+    let value = value.trim();
+    if value.is_empty() {
+        return false;
+    }
+    // A custom property is storage, and the engine stores any of them.
+    if property.starts_with("--") {
+        return true;
+    }
+    if !SUPPORTED_PROPERTIES.contains(&property.as_str()) {
+        return false;
+    }
+    // The property is implemented, so the question becomes whether this
+    // particular value is — `display: grid` and `display: ruby` are not the
+    // same question.
+    match property.as_str() {
+        "display" => matches!(
+            value,
+            "block"
+                | "inline"
+                | "inline-block"
+                | "flex"
+                | "inline-flex"
+                | "grid"
+                | "inline-grid"
+                | "none"
+                | "contents"
+                | "table"
+                | "table-row"
+                | "table-cell"
+                | "list-item"
+        ),
+        "position" => matches!(
+            value,
+            "static" | "relative" | "absolute" | "fixed" | "sticky"
+        ),
+        // Every 2D function is implemented; the 3D ones are deliberately not,
+        // and claiming them would be exactly the lie this function exists to
+        // avoid.
+        "transform" => {
+            !value.contains("3d(")
+                && !value.contains("perspective(")
+                && !value.contains("rotateX")
+                && !value.contains("rotateY")
+        }
+        _ => !declarations_for(&property, value).is_empty(),
+    }
+}
+
+struct SupportsParser<'a> {
+    text: &'a str,
+    pos: usize,
+}
+
+impl SupportsParser<'_> {
+    fn or_expr(&mut self) -> Option<bool> {
+        let mut value = self.and_expr()?;
+        // `and` and `or` may not be mixed without parens, per spec, so a flat
+        // left-to-right fold is the whole of the precedence rules.
+        while self.eat_keyword("or") {
+            value = self.and_expr()? || value;
+        }
+        Some(value)
+    }
+
+    fn and_expr(&mut self) -> Option<bool> {
+        let mut value = self.unary()?;
+        while self.eat_keyword("and") {
+            value = self.unary()? && value;
+        }
+        Some(value)
+    }
+
+    fn unary(&mut self) -> Option<bool> {
+        self.skip_whitespace();
+        if self.eat_keyword("not") {
+            return Some(!self.unary()?);
+        }
+        if let Some(inner) = self.eat_function("selector") {
+            return Some(supports_selector(&inner));
+        }
+        // An unrecognised function — `font-tech()`, `font-format()` — is not
+        // something to guess at.
+        if let Some(rest) = self.text.get(self.pos..) {
+            if !rest.starts_with('(') {
+                return None;
+            }
+        }
+        let inner = self.eat_parens()?;
+        let trimmed = inner.trim();
+        // `( <supports-condition> )` or `( <declaration> )`. A nested condition
+        // starts with a paren or `not`, or joins with `and`/`or`.
+        let nested = trimmed.starts_with('(')
+            || trimmed.len() >= 4 && trimmed[..4].eq_ignore_ascii_case("not ");
+        if nested {
+            return supports_matches(trimmed).then_some(true).or(Some(false));
+        }
+        Some(supports_declaration(trimmed))
+    }
+
+    /// The contents of `name( ... )` if that is what comes next.
+    fn eat_function(&mut self, name: &str) -> Option<String> {
+        self.skip_whitespace();
+        let rest = self.text.get(self.pos..)?;
+        if rest.len() < name.len() + 1 || !rest[..name.len()].eq_ignore_ascii_case(name) {
+            return None;
+        }
+        if !rest[name.len()..].starts_with('(') {
+            return None;
+        }
+        self.pos += name.len();
+        self.eat_parens()
+    }
+
+    /// The contents of the parenthesised group starting here.
+    fn eat_parens(&mut self) -> Option<String> {
+        self.skip_whitespace();
+        let rest = self.text.get(self.pos..)?;
+        if !rest.starts_with('(') {
+            return None;
+        }
+        let end = matching_paren(&rest[1..])?;
+        self.pos += 1 + end + 1;
+        Some(rest[1..1 + end].to_string())
+    }
+
+    fn eat_keyword(&mut self, keyword: &str) -> bool {
+        self.skip_whitespace();
+        let Some(rest) = self.text.get(self.pos..) else {
+            return false;
+        };
+        if rest.len() < keyword.len() || !rest[..keyword.len()].eq_ignore_ascii_case(keyword) {
+            return false;
+        }
+        // `notin` is not `not`, and `ands` is not `and`.
+        let after = rest[keyword.len()..].chars().next();
+        if matches!(after, Some(c) if c.is_ascii_alphanumeric() || c == '-') {
+            return false;
+        }
+        self.pos += keyword.len();
+        true
+    }
+
+    fn skip_whitespace(&mut self) {
+        let Some(rest) = self.text.get(self.pos..) else {
+            return;
+        };
+        self.pos += rest.len() - rest.trim_start().len();
+    }
+}
+
 /// Whether a rule applies at this viewport size. `None` (no media block)
 /// always applies.
 ///
@@ -1163,29 +1964,104 @@ struct Parser {
 }
 
 impl Parser {
-    fn parse_rules(&mut self) -> (Vec<Rule>, Vec<FontFace>) {
+    fn parse_rules(&mut self) -> (Vec<Rule>, Vec<FontFace>, Vec<Keyframes>) {
+        self.parse_rule_list(None, false)
+    }
+
+    /// The body of a stylesheet, or of any conditional group rule.
+    ///
+    /// One function for both is what makes a nested at-rule work: `@media
+    /// print { @page { ... } }` and `@media ... { @supports ... { ... } }` are
+    /// the same shape as the top level, so recursing handles every at-rule at
+    /// once rather than special-casing the pair that happen to be common.
+    ///
+    /// `media` is the condition inherited from enclosing `@media` blocks;
+    /// `nested` says a closing brace ends this list rather than being a stray.
+    fn parse_rule_list(
+        &mut self,
+        media: Option<&str>,
+        nested: bool,
+    ) -> (Vec<Rule>, Vec<FontFace>, Vec<Keyframes>) {
         let mut rules = Vec::new();
         let mut font_faces = Vec::new();
+        let mut keyframes = Vec::new();
         loop {
             self.consume_whitespace();
             if self.eof() {
                 break;
             }
+            if self.starts_with("}") {
+                self.consume_char(); // this list's closing brace, or a stray one
+                if nested {
+                    break;
+                }
+                continue;
+            }
             if self.starts_with("@media") {
-                rules.extend(self.parse_media_block());
+                self.pos += "@media".len();
+                let Some(condition) = self.at_rule_prelude() else {
+                    continue;
+                };
+                // A nested `@media` narrows the outer one; both have to hold.
+                let combined = match media {
+                    Some(outer) => format!("{outer} and {condition}"),
+                    None => condition,
+                };
+                let (inner, faces, frames) = self.parse_rule_list(Some(&combined), true);
+                rules.extend(inner);
+                font_faces.extend(faces);
+                keyframes.extend(frames);
+            } else if self.starts_with("@supports") {
+                self.pos += "@supports".len();
+                let Some(condition) = self.at_rule_prelude() else {
+                    continue;
+                };
+                if supports_matches(&condition) {
+                    let (inner, faces, frames) = self.parse_rule_list(media, true);
+                    rules.extend(inner);
+                    font_faces.extend(faces);
+                    keyframes.extend(frames);
+                } else {
+                    self.skip_balanced_braces();
+                }
             } else if self.starts_with("@font-face") {
                 if let Some(face) = self.parse_font_face() {
                     font_faces.push(face);
                 }
+            } else if self.starts_with("@keyframes") {
+                self.pos += "@keyframes".len();
+                if let Some(rule) = self.parse_keyframes() {
+                    // Redefinition: the last one wins, so an earlier rule of the
+                    // same name goes rather than sitting there to be found first.
+                    keyframes.retain(|k: &Keyframes| k.name != rule.name);
+                    keyframes.push(rule);
+                }
             } else if self.starts_with("@") {
                 self.skip_at_rule();
-            } else if self.starts_with("}") {
-                self.consume_char(); // stray brace
-            } else if let Some(rule) = self.parse_rule() {
+            } else if let Some(mut rule) = self.parse_rule() {
+                rule.media = media.map(str::to_string);
                 rules.push(rule);
             }
         }
-        (rules, font_faces)
+        (rules, font_faces, keyframes)
+    }
+
+    /// An at-rule's prelude, leaving the parser just past its opening brace.
+    ///
+    /// `None` means the rule had no block — `@media screen;` is nonsense a page
+    /// can still contain, and the semicolon has been consumed.
+    fn at_rule_prelude(&mut self) -> Option<String> {
+        let start = self.pos;
+        self.consume_while(|c| c != '{' && c != ';');
+        let prelude = self.input[start..self.pos].trim().to_string();
+        if !self.starts_with("{") {
+            if self.starts_with(";") {
+                self.consume_char();
+            }
+            return None;
+        }
+        self.consume_char(); // the opening brace
+        Some(prelude)
     }
 
     /// `@font-face { font-family: "Outfit"; src: url(a.woff2) format("woff2"),
@@ -1508,18 +2384,13 @@ impl Parser {
                 // A custom property is whatever text it was given, and a value
                 // that mentions one cannot be understood until styling resolves
                 // it against the element's inherited variables.
-                if name.starts_with("--")
-                    || raw.contains("var(")
-                    || RAW_VALUE_PROPERTIES.contains(&name.as_str())
-                {
+                if name.starts_with("--") || raw.contains("var(") {
                     declarations.push(Declaration {
                         name,
                         value: Value::Raw(raw.to_string()),
                     });
-                } else if let Some(value) = classify_value(raw) {
-                    declarations.push(Declaration { name, value });
-                } else if let Some(expanded) = expand_shorthand(&name, raw) {
-                    declarations.extend(expanded);
+                } else {
+                    declarations.extend(declarations_for(&name, raw));
                 }
             }
         }
@@ -1546,39 +2417,42 @@ impl Parser {
         self.skip_balanced_braces();
     }
 
-    /// Parse `@media <condition> { ... }`, tagging the rules inside with the
-    /// condition rather than dropping them: real sites keep most of their CSS
-    /// in media blocks, so skipping them loses nearly all styling.
-    fn parse_media_block(&mut self) -> Vec<Rule> {
-        self.pos += "@media".len();
-        let start = self.pos;
-        self.consume_while(|c| c != '{' && c != ';');
-        let condition = self.input[start..self.pos].trim().to_string();
-        if !self.starts_with("{") {
-            if self.starts_with(";") {
-                self.consume_char();
-            }
-            return Vec::new();
+    /// `@keyframes spin { from { ... } 50% { ... } to { ... } }`.
+    ///
+    /// The selector of each stop is a percentage, or `from`/`to`, and one stop
+    /// may list several (`0%, 100% { opacity: 1 }`).
+    fn parse_keyframes(&mut self) -> Option<Keyframes> {
+        let name = self.at_rule_prelude()?.trim().to_string();
+        if name.is_empty() {
+            self.skip_balanced_braces();
+            return None;
         }
-        self.consume_char(); // the opening brace
-        let mut rules = Vec::new();
+        let mut stops: Vec<(f32, Vec<Declaration>)> = Vec::new();
         loop {
             self.consume_whitespace();
-            if self.eof() || self.starts_with("}") {
-                if !self.eof() {
-                    self.consume_char();
-                }
+            if self.eof() {
                 break;
             }
-            // ponytail: a nested at-rule inside @media is skipped, not merged.
-            if self.starts_with("@") {
-                self.skip_at_rule();
-            } else if let Some(mut rule) = self.parse_rule() {
-                rule.media = Some(condition.clone());
-                rules.push(rule);
+            if self.starts_with("}") {
+                self.consume_char();
+                break;
+            }
+            let start = self.pos;
+            self.consume_while(|c| c != '{' && c != '}');
+            let selector = self.input[start..self.pos].trim().to_string();
+            if !self.starts_with("{") {
+                break; // malformed: stop rather than spin
+            }
+            let declarations = self.parse_declarations();
+            for position in selector.split(',') {
+                let Some(position) = keyframe_position(position.trim()) else {
+                    continue;
+                };
+                stops.push((position, declarations.clone()));
             }
         }
-        rules
+        stops.sort_by(|(a, _), (b, _)| a.total_cmp(b));
+        Some(Keyframes { name, stops })
     }
 
     fn skip_at_rule(&mut self) {
@@ -1782,6 +2656,41 @@ mod tests {
             Some(Value::Raw("url(bg.png)".to_string()))
         );
 
+        // The `font` shorthand: the size is the pivot, the family runs to the
+        // end of the value, and everything unmentioned resets.
+        let s = parse(".a { font: bold 14px/1.5 \"Fira Sans\", Arial; }".to_string());
+        let d = &s.rules[0].declarations;
+        assert_eq!(
+            find(d, "font-weight"),
+            Some(Value::Keyword("bold".to_string()))
+        );
+        assert_eq!(find(d, "font-size"), Some(Value::Length(14.0, Unit::Px)));
+        assert_eq!(find(d, "line-height"), Some(Value::Number(1.5)));
+        assert_eq!(
+            find(d, "font-family"),
+            Some(Value::Raw("\"Fira Sans\", Arial".to_string()))
+        );
+        // No weight given, so the shorthand resets it rather than inheriting.
+        let s = parse(".a { font: italic 1rem Georgia, serif; }".to_string());
+        let d = &s.rules[0].declarations;
+        assert_eq!(
+            find(d, "font-style"),
+            Some(Value::Keyword("italic".to_string()))
+        );
+        assert_eq!(
+            find(d, "font-weight"),
+            Some(Value::Keyword("normal".to_string()))
+        );
+        assert_eq!(find(d, "font-size"), Some(Value::Length(1.0, Unit::Rem)));
+        // A named absolute size is a size, not a family.
+        let s = parse(".a { font: small Verdana; }".to_string());
+        let d = &s.rules[0].declarations;
+        assert_eq!(find(d, "font-size"), Some(Value::Length(13.0, Unit::Px)));
+        assert_eq!(
+            find(d, "font-family"),
+            Some(Value::Raw("Verdana".to_string()))
+        );
+
         let s = parse(".a { outline: 3px dashed #00ff00; }".to_string());
         let d = &s.rules[0].declarations;
         assert_eq!(find(d, "outline-width"), Some(Value::Length(3.0, Unit::Px)));
@@ -1945,6 +2854,193 @@ mod tests {
         // `.b /* x */ .c` is a descendant selector, not three compounds.
         assert_eq!(sheet.rules[1].selectors[0].parts.len(), 2);
         assert_eq!(sheet.rules[2].declarations[0].name, "color");
+    }
+
+    #[test]
+    fn supports_answers_what_the_engine_applies() {
+        // A property the engine acts on, and a value of it that it acts on.
+        assert!(supports_matches("(display: grid)"));
+        assert!(supports_matches("(color: red)"));
+        // Parsing is not applying. `transform` parses any function list, but
+        // only translate and scale reach the screen, so claiming `rotate` would
+        // send a site down a path it renders worse on.
+        assert!(supports_matches("(transform: translateX(4px))"));
+        assert!(supports_matches("(transform: rotate(45deg))"));
+        // The 3D functions are deliberately not implemented, so they answer no.
+        assert!(!supports_matches("(transform: rotateX(45deg))"));
+        assert!(!supports_matches("(transform: translate3d(1px, 2px, 3px))"));
+        // Properties the engine has no implementation of at all.
+        assert!(!supports_matches("(mix-blend-mode: multiply)"));
+        assert!(!supports_matches("(clip-path: circle(40%))"));
+        assert!(!supports_matches("(display: ruby-text)"));
+        // Boolean combinations, negation and grouping.
+        assert!(supports_matches("(display: flex) and (color: red)"));
+        assert!(!supports_matches(
+            "(display: flex) and (mix-blend-mode: multiply)"
+        ));
+        assert!(supports_matches(
+            "(mix-blend-mode: multiply) or (display: flex)"
+        ));
+        assert!(supports_matches("not (mix-blend-mode: multiply)"));
+        assert!(supports_matches("((display: flex) or (display: grid))"));
+        // A condition using syntax we do not understand is false, not true.
+        assert!(!supports_matches("font-tech(color-COLRv1)"));
+        assert!(!supports_matches("(display: flex) garbage"));
+        // `selector()` asks about the selector, and answers honestly too.
+        assert!(supports_matches("selector(a:hover)"));
+        assert!(!supports_matches("selector(a[href])"));
+        // A custom property is storage, and the engine stores any of them.
+        assert!(supports_matches("(--anything: 1px)"));
+    }
+
+    #[test]
+    fn nested_at_rules_are_no_longer_dropped() {
+        let sheet = parse(
+            "@media screen { @supports (display: grid) { .g { color: #ff0000; } } \
+             @supports (mix-blend-mode: multiply) { .f { color: #00ff00; } } \
+             .plain { color: #0000ff; } } \
+             @media print { @page { margin: 1cm; } .paper { color: #010101; } }"
+                .to_string(),
+        );
+        let selectors: Vec<String> = sheet
+            .rules
+            .iter()
+            .flat_map(|r| r.selectors.iter().map(|s| format!("{s:?}")))
+            .collect();
+        let has = |name: &str| selectors.iter().any(|s| s.contains(name));
+        // Inside @media, inside a @supports that holds.
+        assert!(
+            has("\"g\""),
+            "nested @supports content was dropped: {selectors:?}"
+        );
+        // The @supports that does not hold takes its block with it.
+        assert!(!has("\"f\""), "an unsupported @supports block was applied");
+        // A rule after a nested at-rule is still there — the skip did not eat
+        // the rest of the enclosing block.
+        assert!(has("\"plain\""), "the rest of the @media block was lost");
+        // An unknown at-rule inside @media is skipped without corrupting what
+        // follows it.
+        assert!(has("\"paper\""), "@page swallowed the rest of @media print");
+
+        // Both conditions are recorded, so the inner one still has to match.
+        let grid = sheet
+            .rules
+            .iter()
+            .find(|r| {
+                r.selectors
+                    .iter()
+                    .any(|s| format!("{s:?}").contains("\"g\""))
+            })
+            .expect("the nested rule");
+        assert_eq!(grid.media.as_deref(), Some("screen"));
+
+        let nested_media = parse(
+            "@media screen { @media (min-width: 700px) { .w { color: #ff0000; } } }".to_string(),
+        );
+        let rule = &nested_media.rules[0];
+        assert!(media_matches(rule.media.as_deref(), 900.0, 600.0));
+        assert!(!media_matches(rule.media.as_deref(), 500.0, 600.0));
+    }
+
+    fn ctx() -> LengthContext {
+        LengthContext {
+            percent_base: 0.0,
+            font_size: 16.0,
+            root_font_size: 16.0,
+        }
+    }
+
+    /// Where a point lands, rounded, so floating point noise does not fail a
+    /// geometric assertion.
+    fn at(m: Mat, x: f32, y: f32) -> (i32, i32) {
+        let (x, y) = m.apply(x, y);
+        (x.round() as i32, y.round() as i32)
+    }
+
+    #[test]
+    fn every_angle_unit_parses() {
+        let quarter = std::f32::consts::FRAC_PI_2;
+        for token in ["90deg", "100grad", "0.25turn"] {
+            let radians = parse_angle(token).unwrap_or_else(|| panic!("{token} did not parse"));
+            assert!(
+                (radians - quarter).abs() < 1.0e-4,
+                "{token} gave {radians}, wanted {quarter}"
+            );
+        }
+        assert!((parse_angle("1.5708rad").unwrap() - quarter).abs() < 1.0e-3);
+        assert_eq!(parse_angle("0"), Some(0.0));
+        assert_eq!(parse_angle("banana"), None);
+    }
+
+    #[test]
+    fn transform_functions_compose_in_the_order_written() {
+        let size = (100.0, 40.0);
+        // Rotating a quarter turn takes +x to +y.
+        let m = parse_transform("rotate(90deg)", ctx(), size);
+        assert_eq!(at(m, 10.0, 0.0), (0, 10));
+        // Order matters: scale-then-translate moves by the unscaled amount,
+        // because the translation is applied in the scaled space.
+        let scale_first = parse_transform("scale(2) translate(10px, 0)", ctx(), size);
+        let translate_first = parse_transform("translate(10px, 0) scale(2)", ctx(), size);
+        assert_eq!(at(scale_first, 0.0, 0.0), (20, 0));
+        assert_eq!(at(translate_first, 0.0, 0.0), (10, 0));
+        // A percentage in translate() is of the box's own size.
+        let m = parse_transform("translate(-50%, -50%)", ctx(), size);
+        assert_eq!(at(m, 0.0, 0.0), (-50, -20));
+        // skewX slides x by y's tangent; matrix() is taken as written.
+        let m = parse_transform("skewX(45deg)", ctx(), size);
+        assert_eq!(at(m, 0.0, 10.0), (10, 10));
+        let m = parse_transform("matrix(1, 0, 0, 1, 5, 6)", ctx(), size);
+        assert_eq!(at(m, 0.0, 0.0), (5, 6));
+        // A 3D function is ignored rather than partly applied.
+        let m = parse_transform("rotateX(45deg)", ctx(), size);
+        assert!(m.is_identity(), "a 3D function was applied: {m:?}");
+        assert!(parse_transform("perspective(400px)", ctx(), size).is_identity());
+        // Rotation is not a scale-and-offset; a plain translate is.
+        assert!(!parse_transform("rotate(10deg)", ctx(), size).is_upright());
+        assert!(parse_transform("translate(4px, 2px)", ctx(), size).is_upright());
+        // A per-axis scale is not either, so it goes through the layer path
+        // rather than being approximated by one factor.
+        assert!(!parse_transform("scale(2, 3)", ctx(), size).is_upright());
+    }
+
+    #[test]
+    fn transform_origin_places_the_pivot() {
+        let size = (100.0, 40.0);
+        // The default is the centre.
+        assert_eq!(parse_transform_origin(None, ctx(), size), (50.0, 20.0));
+        assert_eq!(
+            parse_transform_origin(Some("left top"), ctx(), size),
+            (0.0, 0.0)
+        );
+        // The keywords may come in either order, each naming its own axis.
+        assert_eq!(
+            parse_transform_origin(Some("top left"), ctx(), size),
+            (0.0, 0.0)
+        );
+        assert_eq!(
+            parse_transform_origin(Some("right bottom"), ctx(), size),
+            (100.0, 40.0)
+        );
+        assert_eq!(
+            parse_transform_origin(Some("25% 50%"), ctx(), size),
+            (25.0, 20.0)
+        );
+        assert_eq!(
+            parse_transform_origin(Some("10px 4px"), ctx(), size),
+            (10.0, 4.0)
+        );
+    }
+
+    #[test]
+    fn a_matrix_and_its_inverse_cancel() {
+        let m = parse_transform("rotate(30deg) scale(1.5) skewY(10deg)", ctx(), (10.0, 10.0));
+        let inverse = m.invert().expect("invertible");
+        let (x, y) = inverse.apply(m.apply(7.0, -3.0).0, m.apply(7.0, -3.0).1);
+        assert!((x - 7.0).abs() < 1.0e-3, "x came back as {x}");
+        assert!((y + 3.0).abs() < 1.0e-3, "y came back as {y}");
+        // A collapsed transform has no inverse and paints nothing.
+        assert!(Mat::scale(0.0, 1.0).invert().is_none());
     }
 
     #[test]

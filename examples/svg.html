@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>SVG features</title>
+<style>
+  body { font: 16px/1.5 system-ui, sans-serif; margin: 2rem; max-width: 60rem; }
+  h1 { font-size: 1.5rem; }
+  section { margin-bottom: 2rem; }
+  h2 { font-size: 1rem; text-transform: uppercase; letter-spacing: 0.08em; }
+  .row { display: flex; gap: 1rem; flex-wrap: wrap; align-items: flex-start; }
+  figure { margin: 0; }
+  figcaption { font-size: 0.8rem; color: #555; }
+</style>
+</head>
+<body>
+<h1>SVG features</h1>
+<p>Each block below should look like its caption. Anything that renders as an
+empty box is a gap in the rasterizer, not in the markup.</p>
+
+<section>
+  <h2>use and symbol</h2>
+  <div class="row">
+    <figure>
+      <svg width="160" height="60" viewBox="0 0 160 60">
+        <defs>
+          <symbol id="star" viewBox="0 0 20 20">
+            <path d="M10 1 L12.5 7.5 L19 7.5 L13.8 11.6 L15.9 18 L10 14 L4.1 18 L6.2 11.6 L1 7.5 L7.5 7.5 Z" fill="#c2410c"/>
+          </symbol>
+        </defs>
+        <use href="#star" x="0" y="20"/>
+        <use href="#star" x="50" y="20"/>
+        <use href="#star" x="100" y="20"/>
+      </svg>
+      <figcaption>Three stars from one definition</figcaption>
+    </figure>
+  </div>
+</section>
+
+<section>
+  <h2>gradients</h2>
+  <div class="row">
+    <figure>
+      <svg width="120" height="80" viewBox="0 0 120 80">
+        <defs>
+          <linearGradient id="sunset" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0" stop-color="#f59e0b"/>
+            <stop offset="0.5" stop-color="#db2777"/>
+            <stop offset="1" stop-color="#4338ca"/>
+          </linearGradient>
+        </defs>
+        <rect x="0" y="0" width="120" height="80" rx="6" fill="url(#sunset)"/>
+      </svg>
+      <figcaption>Linear, three stops, diagonal</figcaption>
+    </figure>
+    <figure>
+      <svg width="80" height="80" viewBox="0 0 80 80">
+        <defs>
+          <radialGradient id="orb" cx="0.35" cy="0.3" r="0.7">
+            <stop offset="0" stop-color="#ffffff"/>
+            <stop offset="1" stop-color="#0f766e"/>
+          </radialGradient>
+        </defs>
+        <circle cx="40" cy="40" r="36" fill="url(#orb)"/>
+      </svg>
+      <figcaption>Radial, off-centre</figcaption>
+    </figure>
+    <figure>
+      <svg width="120" height="80" viewBox="0 0 120 80">
+        <defs>
+          <linearGradient id="palette">
+            <stop offset="0" stop-color="#0ea5e9"/>
+            <stop offset="1" stop-color="#84cc16"/>
+          </linearGradient>
+          <linearGradient id="turned" href="#palette" gradientTransform="rotate(90 0.5 0.5)"/>
+        </defs>
+        <rect x="0" y="0" width="120" height="80" fill="url(#turned)"/>
+      </svg>
+      <figcaption>Stops inherited through href, turned by gradientTransform</figcaption>
+    </figure>
+  </div>
+</section>
+
+<section>
+  <h2>clip path and pattern</h2>
+  <div class="row">
+    <figure>
+      <svg width="100" height="100" viewBox="0 0 100 100">
+        <defs>
+          <clipPath id="ring">
+            <circle cx="50" cy="50" r="40"/>
+          </clipPath>
+        </defs>
+        <rect x="0" y="0" width="100" height="100" fill="#1d4ed8" clip-path="url(#ring)"/>
+      </svg>
+      <figcaption>A square clipped to a circle</figcaption>
+    </figure>
+    <figure>
+      <svg width="100" height="100" viewBox="0 0 100 100">
+        <defs>
+          <pattern id="weave" patternUnits="userSpaceOnUse" width="16" height="16">
+            <rect x="0" y="0" width="8" height="8" fill="#0f172a"/>
+            <rect x="8" y="8" width="8" height="8" fill="#0f172a"/>
+          </pattern>
+        </defs>
+        <circle cx="50" cy="50" r="45" fill="url(#weave)"/>
+      </svg>
+      <figcaption>A circle filled with a tiled pattern</figcaption>
+    </figure>
+  </div>
+</section>
+
+<section>
+  <h2>text</h2>
+  <div class="row">
+    <figure>
+      <svg width="240" height="70" viewBox="0 0 240 70">
+        <defs>
+          <linearGradient id="ink" x1="0" y1="0" x2="1" y2="0">
+            <stop offset="0" stop-color="#be123c"/>
+            <stop offset="1" stop-color="#1d4ed8"/>
+          </linearGradient>
+        </defs>
+        <text x="120" y="30" text-anchor="middle" font-size="22" fill="url(#ink)">Zero</text>
+        <text x="120" y="56" text-anchor="middle" font-size="18" fill="#334155">नमस्ते</text>
+      </svg>
+      <figcaption>Centred text, a gradient fill, and Indic shaping</figcaption>
+    </figure>
+  </div>
+</section>
+
+<section>
+  <h2>filters and transforms</h2>
+  <div class="row">
+    <figure>
+      <svg width="120" height="120" viewBox="0 0 120 120">
+        <defs>
+          <filter id="soft">
+            <feGaussianBlur stdDeviation="3"/>
+            <feOffset dx="5" dy="5"/>
+            <feFlood flood-color="#00000066"/>
+          </filter>
+        </defs>
+        <rect x="25" y="25" width="60" height="60" rx="8" fill="#16a34a" filter="url(#soft)"/>
+      </svg>
+      <figcaption>A drop shadow from feGaussianBlur + feOffset + feFlood</figcaption>
+    </figure>
+    <figure>
+      <svg width="120" height="120" viewBox="0 0 120 120">
+        <g transform="translate(60 60) rotate(30)">
+          <rect x="-40" y="-10" width="80" height="20" fill="#7c3aed"/>
+          <rect x="-10" y="-40" width="20" height="80" fill="#7c3aed" opacity="0.6"/>
+        </g>
+      </svg>
+      <figcaption>A group translated and rotated</figcaption>
+    </figure>
+  </div>
+</section>
+</body>
+</html>

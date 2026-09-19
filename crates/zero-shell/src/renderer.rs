@@ -133,6 +133,28 @@ struct Session {
 
 /// Which band a request is asking for. A negative row means "the page whole",
 /// which is how a headless render asks for every pixel of a long document.
+/// Whether page animations are allowed, following `zero://settings`.
+///
+/// A global because the preference is one: it belongs to the browser, not to a
+/// tab, and threading it through every `spawn`/`replace_page` call would say
+/// otherwise. Every `render` request carries it to the worker, which has no
+/// other way to know.
+static REDUCED_MOTION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Called by the shell whenever the preference is read or changed.
+pub fn set_motion(on: bool) {
+    REDUCED_MOTION.store(!on, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn reduced_motion() -> f64 {
+    match REDUCED_MOTION.load(std::sync::atomic::Ordering::Relaxed) {
+        // Sent as "reduced", not "enabled", so a message from an older peer
+        // that carries no flag at all defaults to animations on.
+        true => 1.0,
+        false => 0.0,
+    }
+}
+
 fn band_of(request: &Msg) -> Option<f32> {
     let top = request.num_at(2) as f32;
     (top >= 0.0).then_some(top)
@@ -160,6 +182,7 @@ impl Session {
         if !find.is_empty() {
             doc.set_find(Some(find.to_string()));
         }
+        doc.set_animations_enabled(request.num_at(3) == 0.0);
         Session {
             doc,
             width: request.num_at(0) as f32,
@@ -254,7 +277,7 @@ impl Session {
 /// `nums` lays out as `[w, h, uses_hover, animating, is_focused, rect_count,
 /// link_count, match_count, doc_height, band_top, run_count, uses_sticky]`
 /// followed by
-/// `rect_count` groups of `[node_id, x, y, w, h]`, then `link_count` groups of
+/// `rect_count` groups of `[node_id, x, y, w, h, cursor]`, then `link_count` groups of
 /// `[x, y, w, h]`, then `match_count` groups of `[x, y, w, h]`, then
 /// `run_count` groups of `[x, y, w, h]`, then two trailing flags,
 /// `has_submission` and `click_handled`; `text` is `[title, ...rect ids,
@@ -301,6 +324,11 @@ fn write_frame(engine: &Engine, session: &mut Session, output: &mut std::io::Std
     for r in &page.element_rects {
         answer = answer.num(r.node_id as f64).num(r.x as f64).num(r.y as f64);
         answer = answer.num(r.width as f64).num(r.height as f64);
+        // Which pointer shape belongs over this box, already resolved. Sent
+        // with the box rather than asked for per mouse move: the shell already
+        // hit-tests these to find the hovered element, so the cursor costs it
+        // one more field and no round trip at all.
+        answer = answer.num(r.cursor.code() as f64);
     }
     for l in &page.links {
         answer = answer
@@ -506,8 +534,9 @@ fn decode_frame(msg: Msg) -> Frame {
             y: get(at + 2) as f32,
             width: get(at + 3) as f32,
             height: get(at + 4) as f32,
+            cursor: zero_engine::Cursor::from_code(get(at + 5) as u8),
         };
-        at += 5;
+        at += 6;
         element_rects.push(rect);
     }
     let mut links = Vec::with_capacity(link_count);
@@ -865,7 +894,8 @@ pub fn render_in_child(
         .num(width as f64)
         .num(height as f64)
         // A screenshot is the one caller that wants every row of a long page.
-        .num(-1.0);
+        .num(-1.0)
+        .num(reduced_motion());
     // Neither store: a one-shot headless render has no site to persist to,
     // and no tab for a session to belong to either.
     let frame = round_trip(&mut to_child, &mut from_child, &request, loader, None);
@@ -957,7 +987,9 @@ impl TabRenderer {
             .text(css)
             .text("")
             .num(width as f64)
-            .num(height as f64);
+            .num(height as f64)
+            .num(0.0)
+            .num(reduced_motion());
         let frame = renderer.exchange(request)?;
         // Start the next one now, so the tab after this one is free too.
         warm();
@@ -1017,7 +1049,8 @@ impl TabRenderer {
             .text("")
             .num(width as f64)
             .num(height as f64)
-            .num(0.0);
+            .num(0.0)
+            .num(reduced_motion());
         self.exchange(request)
     }
 

@@ -18,8 +18,11 @@
 //! styled tree -> layout boxes -> pixels.
 
 pub mod anim;
+pub mod counters;
 pub mod css;
 pub mod dom;
+/// The HTML named character reference table, generated from the spec.
+mod entities;
 pub mod html;
 pub mod js;
 pub mod layout;
@@ -31,7 +34,7 @@ pub mod text;
 pub mod woff2;
 
 pub use css::Color;
-pub use layout::{ElementRect, LinkArea, TextRun};
+pub use layout::{Cursor, ElementRect, LinkArea, TextRun};
 pub use paint::Canvas;
 pub use resource::{DecodedImage, KeyValueStore, ResourceLoader};
 
@@ -311,6 +314,13 @@ impl Document {
     /// state — which is what a screenshot should show.
     pub fn set_time(&mut self, now: f32) {
         self.anim.set_time(now);
+    }
+
+    /// Turn page animation on or off, following the embedder's reduced-motion
+    /// preference. Off holds each animation at its fill state rather than
+    /// freezing the clock mid-cycle, so nothing is left half-drawn.
+    pub fn set_animations_enabled(&mut self, enabled: bool) {
+        self.anim.set_enabled(enabled);
     }
 
     pub fn set_hover(&mut self, node_id: Option<usize>) -> bool {
@@ -879,7 +889,6 @@ impl Engine {
         // Fetch + decode every <img> up front so layout knows their sizes.
         let mut images = ImageMap::new();
         collect_and_load_images(root, loader, &mut images);
-        rasterize_inline_svg(root, &mut images);
         // `background-image: url(...)` is a style, not a DOM attribute, so it
         // can only be found by walking the *styled* tree, once the cascade has
         // matched rules to elements — batched the same way `<img src>` is.
@@ -921,6 +930,10 @@ impl Engine {
         } else {
             Some(FontSet { entries })
         };
+
+        // Inline SVG is rasterized once the fonts exist, because an `<svg>` may
+        // contain `<text>` and that has to shape with the page's own faces.
+        rasterize_inline_svg(root, &mut images, fonts.as_ref());
 
         let layout_root = layout::layout_tree_scrolled(
             &style_root,
@@ -1233,19 +1246,19 @@ fn collect_image_srcs(node: &Node, out: &mut Vec<String>) {
 /// An inline SVG is a picture written in the page rather than fetched, so it
 /// needs no loader — but from layout and paint's point of view it is an image
 /// like any other, and giving it a key in the same map is what lets it be one.
-fn rasterize_inline_svg(node: &Node, out: &mut ImageMap) {
+fn rasterize_inline_svg(node: &Node, out: &mut ImageMap, fonts: Option<&text::FontSet>) {
     if let NodeType::Element(ref e) = node.node_type {
         if e.tag_name == "svg" {
             let source = svg_source(node);
             let (w, h) = svg::intrinsic_size(&source);
-            if let Some(image) = svg::rasterize(&source, w, h) {
+            if let Some(image) = svg::rasterize_with(&source, w, h, fonts) {
                 out.insert(inline_svg_key(node), image);
             }
             return; // its children are its own markup, not more images
         }
     }
     for child in &node.children {
-        rasterize_inline_svg(child, out);
+        rasterize_inline_svg(child, out, fonts);
     }
 }
 

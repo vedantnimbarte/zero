@@ -5,11 +5,15 @@
 
 > **Where it stands.** Phases 0 and 1 are done except for the multi-process
 > shell, and most of Phase 2 landed with them: flexbox, grid, floats, `overflow`
-> clipping, `opacity`/`z-index`, `transform` (translate/scale), sibling and
-> structural selectors, CSS comments, WebP, an SVG rasterizer, and
+> clipping, `opacity`/`z-index`, the 2D `transform` functions with
+> `transform-origin`, `filter`/`backdrop-filter`, `text-shadow`, `@keyframes`,
+> `@supports`, CSS counters and generated content, the full HTML character
+> reference table, sibling and structural selectors, CSS comments, WebP, an SVG
+> rasterizer (gradients, patterns, clip paths, `<use>`, `<text>`), and
 > promises/`await`/`JSON` in the script engine. On the product side: split view,
-> spaces (separate profiles), sync as a sealed file, an English/Hindi interface
-> with IME input, and encryption at rest on all three platforms.
+> spaces (separate profiles), sync as a sealed file, an HTTP cache that survives
+> a restart, an English/Hindi interface with IME input, and encryption at rest on
+> all three platforms.
 >
 > **What is genuinely not built, and why it is not a matter of polish:**
 >
@@ -36,10 +40,13 @@
 >   without a second engine to ship, sandbox and keep current. If that proves
 >   insufficient in use, the bridge is the answer; until then it is 200 MB of
 >   speculation.
-> * **CSS transitions.** Now animated: `anim.rs` keeps the previous value per
->   element and the document carries a clock. The chrome does not use them — it
->   is rebuilt from scratch each frame, so there is no previous value to
->   interpolate from — but a page's own transitions run.
+> * **CSS transitions and animations.** Both animated: `anim.rs` keeps the
+>   previous value per element, the document carries a clock, and `@keyframes`
+>   runs off the same clock with the standard easing functions. The chrome does
+>   not use transitions — it is rebuilt from scratch each frame, so there is no
+>   previous value to interpolate from — but a page's own do, and a spinner
+>   spins. **Animation: Off** holds each animation at its fill state rather than
+>   freezing it mid-cycle.
 >
 > **What is next is tracked as milestones**, not phases: the phases below are the
 > strategy, and the milestones are the ordered work. They were set by opening

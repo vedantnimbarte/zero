@@ -25,6 +25,9 @@ pub enum Display {
     Table,
     /// Sits in a line like text, but sizes itself like a block.
     InlineBlock,
+    /// No box at all: the element's children take its place in its parent's
+    /// layout. A wrapper around grid items is what it is for.
+    Contents,
     None,
 }
 
@@ -105,6 +108,7 @@ impl<'a> StyledNode<'a> {
                 "grid" | "inline-grid" => Display::Grid,
                 "table" | "inline-table" => Display::Table,
                 "none" => Display::None,
+                "contents" => Display::Contents,
                 _ => Display::Inline,
             },
             _ => Display::Inline,
@@ -528,23 +532,57 @@ fn is_custom_property(name: &str) -> bool {
 /// Replace every `var(--name)` in `text` with the variable's value, or the
 /// fallback after the comma when it has none.
 ///
-/// ponytail: no cycle detection and one level of substitution, so a variable
-/// defined in terms of another resolves only if the sheet already did the work.
-fn substitute_vars(text: &str, vars: &PropertyMap) -> Option<String> {
+/// Substitution is recursive: a custom property defined in terms of another
+/// resolves all the way down, which is how every token-based design system on
+/// the web is built. `stack` carries the names currently being resolved, so a
+/// reference cycle is caught rather than recursed into — in a renderer
+/// process a stack overflow aborts instead of unwinding, so a cyclic sheet
+/// would otherwise be an availability bug.
+fn substitute_vars(text: &str, vars: &PropertyMap, stack: &mut Vec<String>) -> Option<String> {
+    // Per spec a substitution that nests this deep is invalid at computed-value
+    // time. The stack catches cycles; this catches a chain long enough to be a
+    // mistake either way.
+    const MAX_DEPTH: usize = 32;
+    if stack.len() > MAX_DEPTH {
+        return None;
+    }
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(start) = rest.find("var(") {
         out.push_str(&rest[..start]);
         let body_start = start + "var(".len();
-        let end = rest[body_start..].find(')')? + body_start;
-        let (name, fallback) = match rest[body_start..end].split_once(',') {
+        // The body runs to the *matching* paren, not the first one: a fallback
+        // is an arbitrary token stream and may nest — `var(--x, rgb(0,0,0))`.
+        let end = body_start + crate::css::matching_paren(&rest[body_start..])?;
+        let body = &rest[body_start..end];
+        // The fallback is everything after the first top-level comma, commas
+        // inside it included: `var(--pair, 1px 2px)`, `var(--c, rgb(1,2,3))`.
+        let (name, fallback) = match crate::css::split_top_level_comma(body) {
             Some((name, fallback)) => (name.trim(), Some(fallback.trim())),
-            None => (rest[body_start..end].trim(), None),
+            None => (body.trim(), None),
         };
-        let value = match vars.get(name) {
-            Some(Value::Raw(raw)) => Some(raw.clone()),
-            Some(other) => Some(format!("{other:?}")), // never happens: customs stay raw
-            None => fallback.map(str::to_string),
+        let substituted = match vars.get(name) {
+            _ if stack.iter().any(|seen| seen == name) => None,
+            Some(Value::Raw(raw)) => {
+                let raw = raw.clone();
+                stack.push(name.to_string());
+                let resolved = substitute_vars(&raw, vars, stack);
+                stack.pop();
+                resolved
+            }
+            // Custom properties are always kept as raw text by the parser, so
+            // any other shape means this name is not a custom property at all.
+            Some(_) => None,
+            None => None,
+        };
+        let value = match substituted {
+            Some(value) => Some(value),
+            // A missing or cyclic reference falls back, and the fallback may
+            // itself mention variables.
+            None => match fallback {
+                Some(fallback) => substitute_vars(fallback, vars, stack),
+                None => None,
+            },
         };
         // An unresolvable var makes the whole declaration invalid, per CSS.
         out.push_str(&value?);
@@ -572,16 +610,113 @@ fn resolve_vars(values: &mut PropertyMap, vars: &PropertyMap) {
         return;
     }
     for (name, text) in pending {
-        match substitute_vars(&text, vars).and_then(|text| crate::css::parse_value(&text)) {
-            Some(value) => {
-                values.insert(name, value);
-            }
-            // Leave nothing behind rather than a value we could not read.
-            None => {
-                values.remove(&name);
-            }
+        // Leave nothing behind rather than a value we could not read.
+        values.remove(&name);
+        let Some(text) = substitute_vars(&text, vars, &mut Vec::new()) else {
+            continue;
+        };
+        // ponytail: the cascade has already been flattened into a map by this
+        // point, so a shorthand that arrives through a variable overwrites a
+        // longhand set next to it whichever was written last. Only var-valued
+        // shorthands can reach this; the rest expand before the cascade runs.
+        for declaration in crate::css::declarations_for(&name, &text) {
+            values.insert(declaration.name, declaration.value);
         }
     }
+}
+
+/// Replace `counter()` and `counters()` inside every `content` value with the
+/// numbers they stand for.
+///
+/// Done here rather than at layout time because a counter's value depends on
+/// where the element sits in document order, and this walk is the only pass that
+/// knows that. What layout receives is an ordinary string component.
+fn resolve_counter_functions(values: &mut PropertyMap, counters: &crate::counters::Counters) {
+    const PROPERTIES: [&str; 3] = ["content", "::before:content", "::after:content"];
+    for property in PROPERTIES {
+        let Some(Value::Raw(raw)) = values.get(property) else {
+            continue;
+        };
+        if !raw.contains("counter") {
+            continue;
+        }
+        let resolved = substitute_counters(raw, counters);
+        values.insert(property.to_string(), Value::Raw(resolved));
+    }
+}
+
+/// `counter(name, style)` and `counters(name, sep, style)`, turned into quoted
+/// strings so the rest of the `content` grammar is unchanged by their presence.
+fn substitute_counters(raw: &str, counters: &crate::counters::Counters) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(at) = find_counter_call(rest) {
+        out.push_str(&rest[..at]);
+        let tail = &rest[at..];
+        let nested = tail.starts_with("counters(");
+        let open = tail.find('(').expect("a call has parens");
+        let Some(close) = crate::css::matching_paren(&tail[open + 1..]) else {
+            break;
+        };
+        let args: Vec<&str> = tail[open + 1..open + 1 + close]
+            .split(',')
+            .map(str::trim)
+            .collect();
+        let name = args.first().copied().unwrap_or("");
+        let text = match nested {
+            // `counters(name, separator, style?)` — the separator is a string.
+            true => {
+                let separator = args.get(1).map(|s| strip_quotes(s)).unwrap_or_default();
+                let style = args.get(2).copied().unwrap_or("decimal");
+                counters.nested(name, &separator, style)
+            }
+            false => counters.value(name, args.get(1).copied().unwrap_or("decimal")),
+        };
+        // Quoted, so a counter that formats to nothing does not swallow the
+        // component that follows it.
+        out.push('"');
+        out.push_str(&text.replace('"', "\\22 "));
+        out.push('"');
+        rest = &tail[open + 1 + close + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The next `counter(`/`counters(` that is not inside a quoted string — a
+/// `content: "counter("` is text, not a call.
+fn find_counter_call(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut quote: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        match quote {
+            Some(_) if c == b'\\' => i += 1,
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == b'"' || c == b'\'' => quote = Some(c),
+            None if text[i..].starts_with("counter(") || text[i..].starts_with("counters(") => {
+                return Some(i)
+            }
+            None => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+fn strip_quotes(text: &str) -> String {
+    let trimmed = text.trim();
+    ['"', '\'']
+        .iter()
+        .find_map(|q| {
+            trimmed
+                .strip_prefix(*q)
+                .and_then(|r| r.strip_suffix(*q))
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| trimmed.to_string())
 }
 
 /// Properties that flow from parent to child when the child doesn't set them.
@@ -592,7 +727,7 @@ fn resolve_vars(values: &mut PropertyMap, vars: &PropertyMap) {
 /// never declared it — but a text node here reads its own value with no such
 /// propagation mechanism, so treating it as inherited is what makes
 /// `p { text-decoration: underline }` reach the text at all.
-const INHERITED_PROPERTIES: [&str; 11] = [
+const INHERITED_PROPERTIES: [&str; 13] = [
     "color",
     "font-size",
     "font-family",
@@ -604,6 +739,8 @@ const INHERITED_PROPERTIES: [&str; 11] = [
     "letter-spacing",
     "font-weight",
     "font-style",
+    "text-transform",
+    "text-shadow",
 ];
 
 pub fn style_tree<'a>(root: &'a Node, stylesheet: &'a Stylesheet) -> StyledNode<'a> {
@@ -640,6 +777,26 @@ pub fn style_tree_animated<'a>(
     hovered: &HoverChain,
     anim: &mut crate::anim::Animator,
 ) -> StyledNode<'a> {
+    style_tree_counted(
+        root,
+        stylesheet,
+        index,
+        hovered,
+        anim,
+        &mut Default::default(),
+    )
+}
+
+/// The same, with the counter scopes the walk maintains. Counters are a
+/// document-order thing, so this walk is the only place they can be resolved.
+pub fn style_tree_counted<'a>(
+    root: &'a Node,
+    stylesheet: &'a Stylesheet,
+    index: &RuleIndex,
+    hovered: &HoverChain,
+    anim: &mut crate::anim::Animator,
+    counters: &mut crate::counters::Counters,
+) -> StyledNode<'a> {
     let cursor = match root.node_type {
         NodeType::Element(ref elem) => Some(Cursor::only(elem)),
         NodeType::Text(_) => None,
@@ -654,6 +811,7 @@ pub fn style_tree_animated<'a>(
         &mut Vec::new(),
         hovered,
         anim,
+        counters,
     )
 }
 
@@ -670,6 +828,7 @@ fn style_tree_inner<'a>(
     ancestors: &mut Vec<Cursor<'a, ElementData>>,
     hovered: &HoverChain,
     anim: &mut crate::anim::Animator,
+    counters: &mut crate::counters::Counters,
 ) -> StyledNode<'a> {
     let mut specified = match cursor {
         Some(ref cursor) => specified_values(cursor, ancestors, stylesheet, index, hovered),
@@ -679,7 +838,7 @@ fn style_tree_inner<'a>(
     // back at where it has actually got to, so layout and paint see one
     // consistent frame rather than the destination.
     if let Some(ref cursor) = cursor {
-        anim.apply(cursor.elem().node_id, &mut specified);
+        anim.apply(cursor.elem().node_id, &mut specified, &stylesheet.keyframes);
     }
     for prop in INHERITED_PROPERTIES {
         if !specified.contains_key(prop) {
@@ -725,6 +884,15 @@ fn style_tree_inner<'a>(
         _ => parent_font,
     };
     specified.insert("font-size".to_string(), Value::Length(font_px, Unit::Px));
+    // Counters, then the `content` values that read them: an element's own
+    // `counter-increment` is visible to its own `::before`, which is exactly how
+    // a numbered heading is written.
+    counters.apply(&specified, ancestors.len());
+    resolve_counter_functions(&mut specified, counters);
+    // A counter a child resets stays in scope for its *following siblings*, so
+    // the scope is unwound once this element runs out of children, not once each
+    // child's subtree does.
+    let counter_mark = counters.mark();
     // Children see this element as their nearest ancestor.
     if let Some(ref cursor) = cursor {
         ancestors.push(cursor.clone());
@@ -757,9 +925,11 @@ fn style_tree_inner<'a>(
             };
             style_tree_inner(
                 child, cursor, stylesheet, index, &specified, &vars, ancestors, hovered, anim,
+                counters,
             )
         })
         .collect();
+    counters.rewind(counter_mark);
     if cursor.is_some() {
         ancestors.pop();
     }
@@ -1012,6 +1182,39 @@ mod tests {
         assert_eq!(cards[1].value("color"), Some(green));
         // With no fallback the declaration is dropped, not left as raw text.
         assert_eq!(cards[2].value("color"), None);
+    }
+
+    #[test]
+    fn custom_properties_chain_and_survive_cycles() {
+        // A token-based design system: every token is defined in terms of the
+        // one above it, so one level of substitution resolves none of them.
+        let css = ":root { --hue: #ff0000; --brand: var(--hue); --button-bg: var(--brand);                    --a: var(--b); --b: var(--a); --pair: 1px 2px; }                    .deep { color: var(--button-bg); }                    .cyclic { color: var(--a, #00ff00); }                    .nested-fallback { color: var(--gone, var(--brand)); }                    .commas { color: var(--gone, rgb(0, 0, 255)); }                    .stream { margin: var(--pair); }";
+        let html = "<html><body><div class=\"deep\">a</div><div class=\"cyclic\">b</div>                    <div class=\"nested-fallback\">c</div><div class=\"commas\">d</div>                    <div class=\"stream\">e</div></body></html>";
+        let dom = crate::html::parse(html.to_string());
+        let sheet = crate::css::parse(css.to_string());
+        let styled = style_tree(&dom, &sheet);
+        let kids = elements(elements(&styled)[0]);
+        let color = |r, g, b| Some(Value::ColorValue(crate::css::Color { r, g, b, a: 255 }));
+
+        // Three levels deep.
+        assert_eq!(kids[0].value("color"), color(255, 0, 0));
+        // A cycle is invalid at computed-value time, so the fallback stands —
+        // and getting here at all means it did not overflow the stack.
+        assert_eq!(kids[1].value("color"), color(0, 255, 0));
+        // The fallback may itself be a var().
+        assert_eq!(kids[2].value("color"), color(255, 0, 0));
+        // Commas inside a nested function are not the fallback separator.
+        assert_eq!(kids[3].value("color"), color(0, 0, 255));
+        // A custom property holds a token stream, not a single value, and a
+        // shorthand that arrives through one still expands to its longhands.
+        assert_eq!(
+            kids[4].value("margin-top"),
+            Some(Value::Length(1.0, Unit::Px))
+        );
+        assert_eq!(
+            kids[4].value("margin-left"),
+            Some(Value::Length(2.0, Unit::Px))
+        );
     }
 
     #[test]

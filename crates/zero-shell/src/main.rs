@@ -20,6 +20,7 @@ mod clipboard;
 mod cookies;
 mod crypto;
 mod fonts;
+mod httpcache;
 mod i18n;
 mod internal;
 mod localstore;
