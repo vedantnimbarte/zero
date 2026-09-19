@@ -37,4 +37,7 @@ jobs:
           cache-dependency-path: web/package-lock.json
       - run: npm ci
       - run: npm run lint
+      # Next generates PageProps/LayoutProps into .next/types; without this
+      # tsc only passes on a machine that has already run the dev server.
+      - run: npx next typegen
       - run: npx tsc --noEmit
