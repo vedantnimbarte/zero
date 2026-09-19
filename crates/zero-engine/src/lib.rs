@@ -1864,7 +1864,7 @@ mod tests {
         ids_of(&doc.root, "div", &mut ids);
         let box_id = ids[0];
 
-        let mut draw = |doc: &mut super::Document| {
+        let draw = |doc: &mut super::Document| {
             let page = engine.render_document(doc, 40.0, 40.0, &crate::resource::NullLoader);
             let px = page.canvas.pixels[5 * page.canvas.width + 5];
             ((px.r, px.g, px.b), page.animating)
@@ -2023,7 +2023,7 @@ p { color: #0000ff }",
 
     #[test]
     fn fields_outside_a_form_do_not_submit() {
-        let mut doc = super::Document::load("<input name=\"q\">", "");
+        let doc = super::Document::load("<input name=\"q\">", "");
         let field = first_input(&doc);
         assert_eq!(doc.submit(field), None);
     }

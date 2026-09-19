@@ -155,7 +155,9 @@ fn an_icon_inside_a_link_or_a_span_is_still_drawn() {
         let frame = read_frame(&mut stdout, &mut stdin, &mut store).expect("a frame");
         let green = frame
             .pixels
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|p| p[1] > 200 && p[0] < 80 && p[2] < 80)
             .count();
         // A 20×20 icon, give or take the edges the rasterizer softens.

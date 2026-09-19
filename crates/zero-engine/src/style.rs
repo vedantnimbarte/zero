@@ -657,6 +657,9 @@ pub fn style_tree_animated<'a>(
     )
 }
 
+// Every argument is threaded down the whole recursion; bundling them into a
+// context struct buys nothing but a second name for the same nine fields.
+#[allow(clippy::too_many_arguments)]
 fn style_tree_inner<'a>(
     root: &'a Node,
     cursor: Option<Cursor<'a, ElementData>>,

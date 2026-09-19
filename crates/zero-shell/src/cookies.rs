@@ -261,10 +261,8 @@ fn parse_set_cookie(header: &str, url: &str) -> Option<Cookie> {
                 }
             }
             // Max-Age wins over Expires when both are present, so only fill a gap.
-            "expires" => {
-                if cookie.expires.is_none() {
-                    cookie.expires = parse_http_date(&val);
-                }
+            "expires" if cookie.expires.is_none() => {
+                cookie.expires = parse_http_date(&val);
             }
             _ => {} // SameSite, HttpOnly, Priority, ...
         }

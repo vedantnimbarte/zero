@@ -1064,7 +1064,7 @@ fn next_tab_id() -> usize {
 /// Undo `renderer::write_frame`'s RGBA packing.
 fn canvas_from_frame(frame: &renderer::Frame) -> Canvas {
     let mut pixels = Vec::with_capacity(frame.width * frame.height);
-    for p in frame.pixels.chunks_exact(4) {
+    for p in frame.pixels.as_chunks::<4>().0 {
         pixels.push(zero_engine::Color {
             r: p[0],
             g: p[1],
@@ -3832,6 +3832,9 @@ fn is_web_url(url: &str) -> bool {
         && !lowered.contains(char::is_whitespace)
 }
 
+// The pane rect already travels as one tuple; the rest are scalars that would
+// only be reassembled at every call site.
+#[allow(clippy::too_many_arguments)]
 fn blit_page(
     buffer: &mut [u32],
     w: u32,
@@ -4386,8 +4389,10 @@ mod tests {
         // theme's colour, which is only ever noticed by eye. Mixing proves each
         // value parses as a colour rather than merely being present.
         for theme_choice in [crate::settings::Theme::Light, crate::settings::Theme::Dark] {
-            let mut settings = Settings::default();
-            settings.theme = theme_choice;
+            let settings = Settings {
+                theme: theme_choice,
+                ..Default::default()
+            };
             crate::settings::preview(settings);
             let p = theme::palette();
             for colour in [

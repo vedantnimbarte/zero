@@ -330,10 +330,10 @@ fn read_session(dir: &Path) -> Option<(Vec<(String, bool)>, usize)> {
     let mut lines = text.lines();
     let active: usize = lines.next()?.trim().parse().unwrap_or(0);
     let tabs: Vec<(String, bool)> = lines
-        .filter_map(|line| match line.split_once('\t') {
-            Some((kind, url)) => Some((url.to_string(), kind == "pin")),
+        .map(|line| match line.split_once('\t') {
+            Some((kind, url)) => (url.to_string(), kind == "pin"),
             // A session written before pinning existed is one URL per line.
-            None => Some((line.to_string(), false)),
+            None => (line.to_string(), false),
         })
         .filter(|(url, _)| !url.is_empty())
         .collect();
