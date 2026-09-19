@@ -593,7 +593,7 @@ fn read_msg(r: &mut impl Read) -> Option<RawMsg> {
 /// Decode a `frame` message's body, per the schema `write_frame` in
 /// `renderer.rs` documents: `nums` is `[w, h, uses_hover, animating,
 /// is_focused, rect_count, link_count, match_count]` then `rect_count`
-/// groups of `[node_id, x, y, w, h]`, then link and find-match rects; `text`
+/// groups of `[node_id, x, y, w, h, cursor]`, then link and find-match rects; `text`
 /// is `[title, ...rect ids, ...link hrefs]` in the same order.
 fn decode_frame(msg: RawMsg) -> TestFrame {
     let get = |i: usize| *msg.nums.get(i).unwrap_or(&0.0);
@@ -612,7 +612,7 @@ fn decode_frame(msg: RawMsg) -> TestFrame {
             get(at + 3) as f32,
             get(at + 4) as f32,
         );
-        at += 5;
+        at += 6; // the sixth is the pointer shape, which no test here reads
         let id = msg.text.get(1 + i).cloned().unwrap_or_default();
         element_rects.push((node_id, id, x, y, w, h));
     }

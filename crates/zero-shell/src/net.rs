@@ -134,6 +134,10 @@ pub struct ShellLoader {
     ///
     /// ponytail: lives as long as the tab's document and has no size limit;
     /// a shared LRU across tabs is the upgrade if memory becomes a problem.
+    ///
+    /// Behind it sits [`crate::httpcache`], which survives the document, the
+    /// tab and the process — this map only stops one keystroke refetching a
+    /// page's assets.
     cache: RefCell<HashMap<String, Option<Vec<u8>>>>,
 }
 
@@ -275,6 +279,12 @@ fn fetch_detached(url: &str, cookies: &Option<String>) -> Option<(Vec<u8>, Vec<S
         // Local files and unsupported schemes are cheap; no thread needed.
         return std::fs::read(url).ok().map(|bytes| (bytes, Vec::new()));
     }
+    // A fresh stored copy needs no request at all. This is the case that makes
+    // revisiting a site you use every day feel like it was already open.
+    let stored = crate::httpcache::get(url);
+    if let Some(entry) = stored.as_ref().filter(|entry| entry.fresh) {
+        return Some((entry.body.clone(), Vec::new()));
+    }
     // HTTPS-first, like every other request the shell makes.
     let attempts = match url.strip_prefix("http://") {
         Some(rest) => vec![format!("https://{rest}"), url.to_string()],
@@ -286,10 +296,26 @@ fn fetch_detached(url: &str, cookies: &Option<String>) -> Option<(Vec<u8>, Vec<S
             if let Some(header) = cookies {
                 request = request.set("Cookie", header);
             }
+            // A stale copy is still worth having: these turn the request into a
+            // conditional one, and most static assets answer `304 Not Modified`
+            // with no body at all.
+            for (name, value) in stored.iter().flat_map(|entry| entry.validators()) {
+                request = request.set(name, &value);
+            }
             request.call()
         };
         let response = match send() {
             Ok(response) => response,
+            // `304 Not Modified`: what is stored still stands, and the server
+            // told us so in a few hundred bytes instead of the whole file.
+            Err(ureq::Error::Status(304, response)) => {
+                if let Some(entry) = stored.as_ref() {
+                    let policy = cache_policy(304, &response);
+                    crate::httpcache::refresh(url, entry, &policy);
+                    return Some((entry.body.clone(), header_list(&response, "set-cookie")));
+                }
+                continue;
+            }
             // Fetching a page's images at once can trip a host's rate limit.
             // Backing off once and retrying is what the status asks for, and it
             // is the difference between a page with images and one without.
@@ -302,17 +328,24 @@ fn fetch_detached(url: &str, cookies: &Option<String>) -> Option<(Vec<u8>, Vec<S
             }
             Err(_) => continue,
         };
-        let set_cookie: Vec<String> = response
-            .all("set-cookie")
-            .iter()
-            .map(|h| h.to_string())
-            .collect();
+        let set_cookie = header_list(&response, "set-cookie");
+        let policy = cache_policy(response.status(), &response);
         let mut buf = Vec::new();
         if response.into_reader().read_to_end(&mut buf).is_ok() {
+            crate::httpcache::put(url, &buf, &policy);
             return Some((buf, set_cookie));
         }
     }
     None
+}
+
+/// What this response's headers say about storing it.
+fn cache_policy(status: u16, response: &ureq::Response) -> crate::httpcache::Policy {
+    crate::httpcache::policy(status, |name| response.header(name).map(str::to_string))
+}
+
+fn header_list(response: &ureq::Response, name: &str) -> Vec<String> {
+    response.all(name).iter().map(|h| h.to_string()).collect()
 }
 
 /// How long to wait before retrying, honouring `Retry-After` but never stalling
@@ -326,34 +359,24 @@ fn retry_after(response: &ureq::Response) -> std::time::Duration {
 }
 
 impl ShellLoader {
-    /// The uncached fetch, by scheme.
+    /// The fetch behind the in-memory map, by scheme. Goes through the disk
+    /// cache for anything over the network, so a reload costs a validator
+    /// round trip rather than a whole download.
     fn fetch(&self, resolved: &str) -> Option<Vec<u8>> {
         let resolved = resolved.to_string();
         if is_url(&resolved) {
-            // HTTPS-first for subresources too, falling back to cleartext only on failure.
-            let mut buf = Vec::new();
-            if let Some(rest) = resolved.strip_prefix("http://") {
-                if let Some(mut r) = fetch_bytes(&format!("https://{rest}")) {
-                    if r.read_to_end(&mut buf).is_ok() {
-                        return Some(buf);
-                    }
-                    buf.clear();
-                }
-            }
-            fetch_bytes(&resolved)?.read_to_end(&mut buf).ok()?;
-            Some(buf)
+            // One code path for the network, shared with the parallel loader, so
+            // the two cannot drift on what is cacheable.
+            let cookies = cookie_header(&resolved);
+            let (bytes, set_cookie) = fetch_detached(&resolved, &cookies)?;
+            store_cookies(&resolved, set_cookie);
+            Some(bytes)
         } else if resolved.starts_with("data:") {
             None // ponytail: data: URIs unsupported; add base64 decode when needed
         } else {
             fs::read(&resolved).ok()
         }
     }
-}
-
-fn fetch_bytes(url: &str) -> Option<impl Read> {
-    let response = with_cookies(url, agent().get(url)).call().ok()?;
-    absorb_cookies(url, &response);
-    Some(response.into_reader())
 }
 
 /// Resolve a possibly-relative resource URL against a base page URL or file path.

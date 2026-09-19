@@ -41,8 +41,8 @@ use winit::dpi::LogicalSize;
 use winit::event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
-use winit::window::{Window, WindowId};
-use zero_engine::{Canvas, ElementRect, Engine, TextRun};
+use winit::window::{CursorIcon, Window, WindowId};
+use zero_engine::{Canvas, Cursor, ElementRect, Engine, TextRun};
 
 const RAIL_W: u32 = 236;
 /// Wide enough for one initial plus breathing room, per docs/02-UI-UX-SPEC.md §3.4.
@@ -1061,6 +1061,37 @@ fn next_tab_id() -> usize {
     })
 }
 
+/// The engine's abstract cursor as this platform's own.
+///
+/// The one place the two vocabularies meet: the engine stays platform-agnostic
+/// and never names a `winit` type, which is what lets another embedder map these
+/// onto something else entirely.
+fn os_cursor(cursor: Cursor) -> CursorIcon {
+    match cursor {
+        // `auto` is resolved in the engine, where the content is; reaching here
+        // means nothing under the pointer had an opinion.
+        Cursor::Auto | Cursor::Default | Cursor::None => CursorIcon::Default,
+        Cursor::Pointer => CursorIcon::Pointer,
+        Cursor::Text => CursorIcon::Text,
+        Cursor::Wait => CursorIcon::Wait,
+        Cursor::Progress => CursorIcon::Progress,
+        Cursor::Help => CursorIcon::Help,
+        Cursor::Crosshair => CursorIcon::Crosshair,
+        Cursor::Move => CursorIcon::Move,
+        Cursor::NotAllowed => CursorIcon::NotAllowed,
+        Cursor::Grab => CursorIcon::Grab,
+        Cursor::Grabbing => CursorIcon::Grabbing,
+        Cursor::ColResize => CursorIcon::ColResize,
+        Cursor::RowResize => CursorIcon::RowResize,
+        Cursor::EwResize => CursorIcon::EwResize,
+        Cursor::NsResize => CursorIcon::NsResize,
+        Cursor::NeswResize => CursorIcon::NeswResize,
+        Cursor::NwseResize => CursorIcon::NwseResize,
+        Cursor::ZoomIn => CursorIcon::ZoomIn,
+        Cursor::ZoomOut => CursorIcon::ZoomOut,
+    }
+}
+
 /// Undo `renderer::write_frame`'s RGBA packing.
 fn canvas_from_frame(frame: &renderer::Frame) -> Canvas {
     let mut pixels = Vec::with_capacity(frame.width * frame.height);
@@ -1395,6 +1426,10 @@ struct App {
     /// Where the divider sits, as a fraction of the content area.
     split_ratio: f32,
     dragging_divider: bool,
+    /// The pointer shape the window is currently showing. Setting a cursor is a
+    /// syscall, and a mouse move fires a great many times a second, so it is
+    /// only sent when it actually changes.
+    cursor_icon: CursorIcon,
     window: Option<Rc<Window>>,
     surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
 }
@@ -1402,6 +1437,9 @@ struct App {
 impl App {
     fn new(engine: Engine, tabs: Vec<Tab>, active: usize) -> App {
         let settings = settings::current();
+        // Before the first page is drawn, so a reduced-motion profile never
+        // sees one animated frame.
+        renderer::set_motion(settings.motion);
         App {
             engine,
             tabs,
@@ -1427,6 +1465,7 @@ impl App {
             split: None,
             split_ratio: 0.5,
             dragging_divider: false,
+            cursor_icon: CursorIcon::Default,
             window: None,
             surface: None,
         }
@@ -1516,6 +1555,7 @@ impl ApplicationHandler for App {
                 } else {
                     self.update_hover();
                 }
+                self.update_cursor();
             }
             WindowEvent::MouseInput {
                 state: ElementState::Released,
@@ -1740,6 +1780,7 @@ impl App {
         };
         settings::reload();
         self.settings = settings::current();
+        renderer::set_motion(self.settings.motion);
         // Nothing from the old space may stay on screen: its tabs are its own.
         self.tabs = vec![Tab::blank()];
         self.active = 0;
@@ -1890,6 +1931,8 @@ impl App {
     fn store_settings(&mut self, settings: Settings) {
         self.settings = settings;
         settings::store(settings);
+        // Page animation follows the same preference the chrome's own does.
+        renderer::set_motion(settings.motion);
         for tab in &mut self.tabs {
             tab.page_canvas = None;
         }
@@ -3377,6 +3420,45 @@ impl App {
         match (in_other, self.split) {
             (true, Some(other)) => other,
             _ => self.active,
+        }
+    }
+
+    /// Show the pointer shape that belongs where the cursor is.
+    ///
+    /// The engine says what a page's boxes want (`cursor`, with `auto` already
+    /// resolved); the chrome's own surfaces are decided here, because they are
+    /// the shell's own furniture and the engine knows nothing about them.
+    fn update_cursor(&mut self) {
+        let (cx, cy) = self.cursor;
+        let regions = self.regions();
+        let wanted = if self.dragging_divider || self.on_divider(cx, &regions) {
+            // The split-view divider: §5 of the UI spec calls for a resize
+            // cursor here, and it is the clearest signal that it can be dragged.
+            CursorIcon::ColResize
+        } else if self.hit_at(cx, cy).is_some() {
+            // A toolbar button or a tab: clickable chrome.
+            CursorIcon::Pointer
+        } else {
+            match self.page_coords((cx, cy), &regions) {
+                Some((px, py)) => os_cursor(
+                    self.tab()
+                        .element_rects
+                        .iter()
+                        .rfind(|r| {
+                            px >= r.x && px <= r.x + r.width && py >= r.y && py <= r.y + r.height
+                        })
+                        .map(|r| r.cursor)
+                        .unwrap_or(Cursor::Default),
+                ),
+                None => CursorIcon::Default,
+            }
+        };
+        if wanted == self.cursor_icon {
+            return;
+        }
+        self.cursor_icon = wanted;
+        if let Some(window) = &self.window {
+            window.set_cursor(wanted);
         }
     }
 

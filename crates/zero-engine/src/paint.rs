@@ -21,6 +21,7 @@ pub struct Canvas {
     pub height: usize,
 }
 
+#[derive(Clone)]
 enum DisplayCommand {
     SolidColor(Color, Rect),
     /// A rounded rectangle: same as SolidColor but with a corner radius.
@@ -47,6 +48,35 @@ enum DisplayCommand {
     Text(TextFragment, Rect),
     /// image src, destination content box, and how it fits that box.
     Image(String, Rect, ObjectFit),
+    /// A subtree drawn into its own buffer and mapped through a transform that
+    /// is not a scale-and-offset — a rotation, a skew, a flip, or a scale that
+    /// differs per axis.
+    ///
+    /// Everything else folds into [`Xf`] and paints straight onto the canvas.
+    /// This is the one path that needs an offscreen buffer, because a rotated
+    /// rectangle is not a rectangle and every primitive the painter has is.
+    Layer {
+        list: DisplayList,
+        /// The area of the page the buffer stands for, in the subtree's own
+        /// (untransformed) coordinates.
+        source: Rect,
+        /// Maps those coordinates to where they are drawn.
+        matrix: crate::css::Mat,
+        /// What the ancestors allow this layer to cover, in drawn coordinates.
+        clip: Rect,
+        /// `filter`, applied to the finished buffer before it is composited.
+        /// Which is why a filter needs a layer at all: it is defined over the
+        /// element's rendered result, not over each thing it paints.
+        filters: Vec<FilterOp>,
+    },
+    /// `backdrop-filter`: filter what is already painted beneath a box, in
+    /// place, before the box paints over it.
+    Backdrop {
+        rect: Rect,
+        radius: f32,
+        filters: Vec<FilterOp>,
+        clip: Rect,
+    },
     /// `background-image: url(...)`, resolved and tiled at paint time once the
     /// image's own intrinsic size is known — see `Canvas::paint_background_image`.
     BackgroundImage {
@@ -56,6 +86,443 @@ enum DisplayCommand {
         position: (BgAxis, BgAxis),
         repeat: BgRepeat,
     },
+}
+
+/// Walk a run's rasterized coverage, pixel by pixel, in canvas coordinates.
+///
+/// The one place glyph ink is produced, so the shadow mask and the painted
+/// glyphs are guaranteed to be the same shape — including the synthesized bold
+/// and italic below, which are part of that shape.
+fn run_ink(
+    frag: &TextFragment,
+    font: &fontdue::Font,
+    baseline: f32,
+    mut plot: impl FnMut(i32, i32, u8),
+) {
+    // No bold/italic font file is loaded (Track D4), so a heavier weight and a
+    // slant are synthesized here instead of picked from a face: bold redraws
+    // each row a pixel wider, italic shears columns toward the top by `row`'s
+    // distance from the baseline.
+    let stroke = if frag.bold {
+        (frag.size / 24.0).max(1.0).round() as i32
+    } else {
+        0
+    };
+    let shear = if frag.italic { 0.22 } else { 0.0 };
+
+    for glyph in &frag.glyphs {
+        let (m, coverage) = font.rasterize_indexed(glyph.id, frag.size);
+        // fontdue gives per-pixel coverage (0..=255); place relative to the baseline.
+        let gx = (frag.x + glyph.x + m.xmin as f32).round() as i32;
+        let gy = (baseline - glyph.y - m.ymin as f32 - m.height as f32).round() as i32;
+
+        for row in 0..m.height {
+            let row_shear = (shear * (m.height - row) as f32).round() as i32;
+            let py = gy + row as i32;
+            for col in 0..m.width {
+                let a = coverage[row * m.width + col];
+                if a == 0 {
+                    continue;
+                }
+                for dx in 0..=stroke {
+                    plot(gx + col as i32 + row_shear + dx, py, a);
+                }
+            }
+        }
+    }
+}
+
+/// One entry of a `filter` or `backdrop-filter` chain.
+///
+/// Each carries its amount already resolved from the percentage or number the
+/// page wrote, so applying a chain is arithmetic and no longer parsing.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum FilterOp {
+    /// The CSS blur *radius*; sigma is half of it.
+    Blur(f32),
+    Brightness(f32),
+    Contrast(f32),
+    Grayscale(f32),
+    /// In radians.
+    HueRotate(f32),
+    Invert(f32),
+    Opacity(f32),
+    Saturate(f32),
+    Sepia(f32),
+    DropShadow(ShadowSpec),
+}
+
+impl FilterOp {
+    /// How far this op spreads past the pixels it is given, so a buffer can be
+    /// made big enough to hold the result.
+    fn margin(self) -> f32 {
+        match self {
+            FilterOp::Blur(radius) => mask_margin(sigma_for(radius)) as f32,
+            FilterOp::DropShadow(shadow) => {
+                shadow.dx.abs() + shadow.dy.abs() + mask_margin(sigma_for(shadow.blur)) as f32
+            }
+            _ => 0.0,
+        }
+    }
+}
+
+/// `grayscale(amount)`: each channel moves `amount` of the way to the pixel's
+/// own luminance.
+fn mix_towards_luminance(l: [f32; 3], amount: f32) -> [[f32; 3]; 3] {
+    let keep = 1.0 - amount;
+    [
+        [l[0] * amount + keep, l[1] * amount, l[2] * amount],
+        [l[0] * amount, l[1] * amount + keep, l[2] * amount],
+        [l[0] * amount, l[1] * amount, l[2] * amount + keep],
+    ]
+}
+
+/// `saturate(amount)` — the same shape, with `amount` above 1 pushing away
+/// from luminance rather than towards it.
+fn saturate_matrix(l: [f32; 3], amount: f32) -> [[f32; 3]; 3] {
+    mix_towards_luminance(l, 1.0 - amount)
+}
+
+/// The sepia matrix from the filter spec, faded in by `amount`.
+fn sepia_matrix(amount: f32) -> [[f32; 3]; 3] {
+    let full = [
+        [0.393, 0.769, 0.189],
+        [0.349, 0.686, 0.168],
+        [0.272, 0.534, 0.131],
+    ];
+    let identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+    std::array::from_fn(|r| {
+        std::array::from_fn(|c| identity[r][c] * (1.0 - amount) + full[r][c] * amount)
+    })
+}
+
+/// The hue-rotation matrix from the filter spec.
+fn hue_rotate_matrix(radians: f32) -> [[f32; 3]; 3] {
+    let (sin, cos) = radians.sin_cos();
+    [
+        [
+            0.213 + cos * 0.787 - sin * 0.213,
+            0.715 - cos * 0.715 - sin * 0.715,
+            0.072 - cos * 0.072 + sin * 0.928,
+        ],
+        [
+            0.213 - cos * 0.213 + sin * 0.143,
+            0.715 + cos * 0.285 + sin * 0.140,
+            0.072 - cos * 0.072 - sin * 0.283,
+        ],
+        [
+            0.213 - cos * 0.213 - sin * 0.787,
+            0.715 - cos * 0.715 + sin * 0.715,
+            0.072 + cos * 0.928 + sin * 0.072,
+        ],
+    ]
+}
+
+/// Whether a point falls outside a rounded rectangle — the corner test, shared
+/// by the frosted-glass clip.
+fn outside_rounded(rect: Rect, radius: f32, px: f32, py: f32) -> bool {
+    let (left, right) = (rect.x + radius, rect.x + rect.width - radius);
+    let (top, bottom) = (rect.y + radius, rect.y + rect.height - radius);
+    let dx = (left - px).max(px - right).max(0.0);
+    let dy = (top - py).max(py - bottom).max(0.0);
+    (dx * dx + dy * dy).sqrt() > radius
+}
+
+/// Parse a `filter` / `backdrop-filter` function list.
+///
+/// An unrecognised function is skipped rather than failing the whole chain: a
+/// page that asks for `url(#svg-filter)` alongside a blur should still get the
+/// blur.
+fn parse_filter_list(spec: &str, ctx: crate::css::LengthContext, color: Color) -> Vec<FilterOp> {
+    let mut out = Vec::new();
+    let mut rest = spec.trim();
+    while let Some(open) = rest.find('(') {
+        let name = rest[..open].trim().to_ascii_lowercase();
+        let Some(close) = crate::css::matching_paren(&rest[open + 1..]) else {
+            break;
+        };
+        let args = rest[open + 1..open + 1 + close].trim();
+        rest = &rest[open + 1 + close + 1..];
+        // `50%` and `0.5` mean the same thing to every one of these but blur,
+        // hue-rotate and drop-shadow.
+        let amount = |default: f32| match args.strip_suffix('%') {
+            Some(pct) => pct
+                .trim()
+                .parse::<f32>()
+                .map(|n| n / 100.0)
+                .unwrap_or(default),
+            None => args.parse::<f32>().unwrap_or(default),
+        };
+        let op = match name.as_str() {
+            "blur" => FilterOp::Blur(crate::css::parse_length_token(args, ctx)),
+            "brightness" => FilterOp::Brightness(amount(1.0)),
+            "contrast" => FilterOp::Contrast(amount(1.0)),
+            "grayscale" => FilterOp::Grayscale(amount(1.0).clamp(0.0, 1.0)),
+            "hue-rotate" => FilterOp::HueRotate(crate::css::parse_angle(args).unwrap_or(0.0)),
+            "invert" => FilterOp::Invert(amount(1.0).clamp(0.0, 1.0)),
+            "opacity" => FilterOp::Opacity(amount(1.0).clamp(0.0, 1.0)),
+            "saturate" => FilterOp::Saturate(amount(1.0)),
+            "sepia" => FilterOp::Sepia(amount(1.0).clamp(0.0, 1.0)),
+            "drop-shadow" => match parse_shadow_list(args, ctx, color).first() {
+                Some(shadow) => FilterOp::DropShadow(*shadow),
+                None => continue,
+            },
+            _ => continue,
+        };
+        out.push(op);
+    }
+    out
+}
+
+/// Blur a buffer of pixels in place, `sigma` being the Gaussian standard
+/// deviation.
+///
+/// The one blur in the engine, shared with the SVG rasterizer's
+/// `feGaussianBlur`: a shadow, a CSS filter and an SVG filter all want the same
+/// three box passes, and a second implementation would only be a second thing
+/// to get wrong.
+pub(crate) fn blur_pixels(pixels: &mut [Color], width: usize, height: usize, sigma: f32) {
+    if sigma <= 0.0 || pixels.len() != width * height {
+        return;
+    }
+    let mut canvas = Canvas {
+        pixels: pixels.to_vec(),
+        width,
+        height,
+    };
+    canvas.blur(sigma);
+    pixels.copy_from_slice(&canvas.pixels);
+}
+
+/// Apply a filter chain to a buffer, in order.
+fn apply_filters(canvas: &mut Canvas, ops: &[FilterOp]) {
+    for op in ops {
+        match *op {
+            FilterOp::Blur(radius) => canvas.blur(sigma_for(radius)),
+            FilterOp::DropShadow(shadow) => canvas.drop_shadow(shadow),
+            // Everything else is one pass over the pixels: either a 3x3 colour
+            // matrix or a per-channel curve, which are the same loop with
+            // different coefficients.
+            other => canvas.recolor(other),
+        }
+    }
+}
+
+/// One shadow from a `box-shadow` or `text-shadow` list.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct ShadowSpec {
+    pub dx: f32,
+    pub dy: f32,
+    /// The CSS blur *radius*, which is not the Gaussian sigma — see
+    /// [`sigma_for`].
+    pub blur: f32,
+    pub color: Color,
+}
+
+/// Per spec the blur radius is twice the standard deviation.
+fn sigma_for(blur_radius: f32) -> f32 {
+    (blur_radius / 2.0).max(0.0)
+}
+
+/// How far a blur bleeds past the shape it came from, so the mask is big
+/// enough to hold it. Three sigma covers over 99% of a Gaussian.
+fn mask_margin(sigma: f32) -> i32 {
+    (sigma * 3.0).ceil() as i32 + 1
+}
+
+/// An 8-bit coverage buffer in canvas coordinates.
+///
+/// Every soft effect in the engine comes down to the same four steps —
+/// rasterize coverage, blur it, tint it, composite it — so they share one
+/// mask and one blur rather than each growing an approximation of its own.
+struct Mask {
+    x: i32,
+    y: i32,
+    width: usize,
+    height: usize,
+    alpha: Vec<u8>,
+}
+
+impl Mask {
+    /// A mask covering `rect` plus `margin` on every side, clipped to the
+    /// canvas so a shadow off the edge of a long page costs nothing.
+    fn covering(rect: Rect, margin: i32, canvas_w: usize, canvas_h: usize) -> Self {
+        let x0 = (rect.x.floor() as i32 - margin).max(-margin);
+        let y0 = (rect.y.floor() as i32 - margin).max(-margin);
+        let x1 = ((rect.x + rect.width).ceil() as i32 + margin).min(canvas_w as i32 + margin);
+        let y1 = ((rect.y + rect.height).ceil() as i32 + margin).min(canvas_h as i32 + margin);
+        Self::bounded(x0, y0, x1, y1)
+    }
+
+    fn bounded(x0: i32, y0: i32, x1: i32, y1: i32) -> Self {
+        let width = (x1 - x0).max(0) as usize;
+        let height = (y1 - y0).max(0) as usize;
+        Mask {
+            x: x0,
+            y: y0,
+            width,
+            height,
+            alpha: vec![0; width * height],
+        }
+    }
+
+    /// Record coverage at a canvas pixel, keeping the strongest — overlapping
+    /// glyphs must not add up to a darker patch where they cross.
+    fn cover(&mut self, px: i32, py: i32, a: u8) {
+        let (x, y) = (px - self.x, py - self.y);
+        if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
+            return;
+        }
+        let idx = y as usize * self.width + x as usize;
+        self.alpha[idx] = self.alpha[idx].max(a);
+    }
+
+    /// Blur in place.
+    ///
+    /// Three box passes per axis, which is the approximation the SVG filter
+    /// spec itself prescribes: visually indistinguishable from a Gaussian and
+    /// O(1) per pixel, where a two-dimensional convolution is O(radius^2).
+    fn blur(&mut self, sigma: f32) {
+        if sigma <= 0.0 || self.alpha.is_empty() {
+            return;
+        }
+        // The box width that makes three passes match a Gaussian of this
+        // standard deviation.
+        let radius = ((sigma * 3.0 * (2.0 * std::f32::consts::PI).sqrt() / 4.0 + 0.5) / 2.0)
+            .round()
+            .max(1.0) as usize;
+        let mut scratch = vec![0u8; self.alpha.len()];
+        for _ in 0..3 {
+            box_pass(
+                &self.alpha,
+                &mut scratch,
+                self.width,
+                self.height,
+                radius,
+                true,
+            );
+            box_pass(
+                &scratch,
+                &mut self.alpha,
+                self.width,
+                self.height,
+                radius,
+                false,
+            );
+        }
+    }
+}
+
+/// One separable box-blur pass. `horizontal` picks the axis; the running sum
+/// makes each output pixel two adds regardless of the radius.
+fn box_pass(
+    src: &[u8],
+    dst: &mut [u8],
+    width: usize,
+    height: usize,
+    radius: usize,
+    horizontal: bool,
+) {
+    let (outer, inner) = if horizontal {
+        (height, width)
+    } else {
+        (width, height)
+    };
+    let index = |o: usize, i: usize| {
+        if horizontal {
+            o * width + i
+        } else {
+            i * width + o
+        }
+    };
+    let window = (radius * 2 + 1) as u32;
+    for o in 0..outer {
+        // Clamp at the edges, which is what keeps a shadow from fading out
+        // where it runs off the mask.
+        let at = |i: isize| src[index(o, i.clamp(0, inner as isize - 1) as usize)] as u32;
+        let mut sum: u32 = (-(radius as isize)..=(radius as isize)).map(at).sum();
+        for i in 0..inner {
+            // Round rather than truncate: six passes of flooring throw away
+            // most of a faint shadow before it ever reaches the canvas.
+            dst[index(o, i)] = ((sum + window / 2) / window) as u8;
+            sum = sum + at(i as isize + radius as isize + 1) - at(i as isize - radius as isize);
+        }
+    }
+}
+
+/// Parse a `box-shadow` / `text-shadow` value: a comma-separated list of
+/// `<x> <y> <blur>? <color>?`, where the colour may come first or last and
+/// defaults to the element's own `color`.
+///
+/// ponytail: `inset` and the spread radius are read past rather than applied —
+/// neither is expressible in the single blurred mask this paints.
+fn parse_shadow_list(
+    spec: &str,
+    ctx: crate::css::LengthContext,
+    default: Color,
+) -> Vec<ShadowSpec> {
+    let mut out = Vec::new();
+    let mut rest = spec.trim();
+    while !rest.is_empty() {
+        let (head, tail) = match crate::css::split_top_level_comma(rest) {
+            Some((head, tail)) => (head, tail),
+            None => (rest, ""),
+        };
+        rest = tail.trim_start();
+        let mut lengths = [0.0_f32; 3];
+        let mut seen = 0;
+        let mut color = default;
+        for token in split_shadow_tokens(head) {
+            if token.eq_ignore_ascii_case("inset") {
+                continue;
+            }
+            if let Some(Value::ColorValue(c)) = crate::css::parse_value(&token) {
+                color = c;
+            } else if seen < lengths.len() {
+                lengths[seen] = crate::css::parse_length_token(&token, ctx);
+                seen += 1;
+            }
+        }
+        // Two offsets are the minimum a shadow can be written with.
+        if seen >= 2 {
+            out.push(ShadowSpec {
+                dx: lengths[0],
+                dy: lengths[1],
+                blur: lengths[2],
+                color,
+            });
+        }
+    }
+    out
+}
+
+/// Split one shadow on whitespace, keeping `rgba(0, 0, 0, .5)` in one piece.
+fn split_shadow_tokens(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0usize;
+    for c in text.chars() {
+        match c {
+            '(' => {
+                depth += 1;
+                current.push(c);
+            }
+            ')' => {
+                depth = depth.saturating_sub(1);
+                current.push(c);
+            }
+            c if c.is_whitespace() && depth == 0 => {
+                if !current.is_empty() {
+                    out.push(std::mem::take(&mut current));
+                }
+            }
+            c => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
 }
 
 /// A gradient's geometry — everything but its colour stops.
@@ -117,6 +584,271 @@ enum BgRepeat {
 type DisplayList = Vec<DisplayCommand>;
 
 impl Canvas {
+    /// A buffer that starts with nothing in it, for an off-axis subtree that
+    /// will be composited rather than shown directly.
+    fn transparent(width: usize, height: usize) -> Canvas {
+        Canvas {
+            pixels: vec![
+                Color {
+                    r: 0,
+                    g: 0,
+                    b: 0,
+                    a: 0,
+                };
+                width * height
+            ],
+            width,
+            height,
+        }
+    }
+
+    /// Sample this canvas at a fractional position, bilinearly.
+    ///
+    /// This is what antialiases a rotated edge: the destination pixel lands
+    /// between four source pixels and takes a weighted share of each, where
+    /// nearest-neighbour would step.
+    fn sample(&self, x: f32, y: f32) -> Color {
+        let (x0, y0) = (x.floor() as i32, y.floor() as i32);
+        let (fx, fy) = (x - x0 as f32, y - y0 as f32);
+        // Premultiplied, or a transparent neighbour drags its colour in.
+        let mut acc = [0.0f32; 4];
+        for (dx, dy, weight) in [
+            (0, 0, (1.0 - fx) * (1.0 - fy)),
+            (1, 0, fx * (1.0 - fy)),
+            (0, 1, (1.0 - fx) * fy),
+            (1, 1, fx * fy),
+        ] {
+            if weight <= 0.0 {
+                continue;
+            }
+            let (px, py) = (x0 + dx, y0 + dy);
+            if px < 0 || py < 0 || px >= self.width as i32 || py >= self.height as i32 {
+                continue;
+            }
+            let c = self.pixels[py as usize * self.width + px as usize];
+            let a = c.a as f32 / 255.0;
+            acc[0] += c.r as f32 * a * weight;
+            acc[1] += c.g as f32 * a * weight;
+            acc[2] += c.b as f32 * a * weight;
+            acc[3] += a * weight;
+        }
+        if acc[3] <= 0.0 {
+            return Color {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 0,
+            };
+        }
+        Color {
+            r: (acc[0] / acc[3]).round().clamp(0.0, 255.0) as u8,
+            g: (acc[1] / acc[3]).round().clamp(0.0, 255.0) as u8,
+            b: (acc[2] / acc[3]).round().clamp(0.0, 255.0) as u8,
+            a: (acc[3] * 255.0).round().clamp(0.0, 255.0) as u8,
+        }
+    }
+
+    /// Blur every channel of this buffer.
+    ///
+    /// Premultiplied and per plane, so the same box passes a shadow mask uses
+    /// serve here too rather than a second blur being written.
+    fn blur(&mut self, sigma: f32) {
+        if sigma <= 0.0 || self.pixels.is_empty() {
+            return;
+        }
+        let (width, height) = (self.width, self.height);
+        let mut planes: [Vec<u8>; 4] = std::array::from_fn(|_| vec![0u8; self.pixels.len()]);
+        for (i, p) in self.pixels.iter().enumerate() {
+            let a = p.a as u32;
+            planes[0][i] = (p.r as u32 * a / 255) as u8;
+            planes[1][i] = (p.g as u32 * a / 255) as u8;
+            planes[2][i] = (p.b as u32 * a / 255) as u8;
+            planes[3][i] = p.a;
+        }
+        for plane in planes.iter_mut() {
+            let mut mask = Mask {
+                x: 0,
+                y: 0,
+                width,
+                height,
+                alpha: std::mem::take(plane),
+            };
+            mask.blur(sigma);
+            *plane = mask.alpha;
+        }
+        for (i, p) in self.pixels.iter_mut().enumerate() {
+            let a = planes[3][i];
+            let unpremultiply = |v: u8| match a {
+                0 => 0,
+                a => ((v as u32 * 255 / a as u32).min(255)) as u8,
+            };
+            *p = Color {
+                r: unpremultiply(planes[0][i]),
+                g: unpremultiply(planes[1][i]),
+                b: unpremultiply(planes[2][i]),
+                a,
+            };
+        }
+    }
+
+    /// The colour-matrix and per-channel filters, which are one pass each.
+    fn recolor(&mut self, op: FilterOp) {
+        // Each is written as `out = M * in`, with the luminance weights the
+        // filter spec gives, so one loop serves all of them.
+        let luminance = [0.2126f32, 0.7152, 0.0722];
+        let matrix: [[f32; 3]; 3] = match op {
+            FilterOp::Grayscale(amount) => mix_towards_luminance(luminance, amount),
+            FilterOp::Saturate(amount) => saturate_matrix(luminance, amount),
+            FilterOp::Sepia(amount) => sepia_matrix(amount),
+            FilterOp::HueRotate(radians) => hue_rotate_matrix(radians),
+            _ => [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        };
+        for p in self.pixels.iter_mut() {
+            let channels = [p.r as f32 / 255.0, p.g as f32 / 255.0, p.b as f32 / 255.0];
+            let mut out = [0.0f32; 3];
+            for (row, weights) in matrix.iter().enumerate() {
+                out[row] = weights
+                    .iter()
+                    .zip(channels.iter())
+                    .map(|(w, c)| w * c)
+                    .sum();
+            }
+            // Then the per-channel curves, which do not mix channels at all.
+            for value in out.iter_mut() {
+                *value = match op {
+                    FilterOp::Brightness(amount) => *value * amount,
+                    FilterOp::Contrast(amount) => (*value - 0.5) * amount + 0.5,
+                    FilterOp::Invert(amount) => *value * (1.0 - amount) + (1.0 - *value) * amount,
+                    _ => *value,
+                };
+            }
+            let byte = |v: f32| (v * 255.0).round().clamp(0.0, 255.0) as u8;
+            p.r = byte(out[0]);
+            p.g = byte(out[1]);
+            p.b = byte(out[2]);
+            if let FilterOp::Opacity(amount) = op {
+                p.a = byte(p.a as f32 / 255.0 * amount);
+            }
+        }
+    }
+
+    /// `drop-shadow`: the buffer's own alpha, offset, blurred, tinted, and put
+    /// underneath what is already there.
+    ///
+    /// Against a transparent background, which is what a layer buffer is — so
+    /// the shadow shows around the shape rather than filling its box.
+    fn drop_shadow(&mut self, shadow: ShadowSpec) {
+        let mut mask = Mask {
+            x: 0,
+            y: 0,
+            width: self.width,
+            height: self.height,
+            alpha: self.pixels.iter().map(|p| p.a).collect(),
+        };
+        mask.blur(sigma_for(shadow.blur));
+        let mut beneath = Canvas::transparent(self.width, self.height);
+        beneath.composite_mask(
+            &mask,
+            shadow.color,
+            shadow.dx.round() as i32,
+            shadow.dy.round() as i32,
+            UNCLIPPED,
+        );
+        for (under, over) in beneath.pixels.iter_mut().zip(self.pixels.iter()) {
+            *under = blend(*under, *over, 255);
+        }
+        self.pixels = beneath.pixels;
+    }
+
+    /// Filter what is already painted beneath `rect`, for `backdrop-filter`.
+    ///
+    /// Reads this canvas's own output back, which is exactly why it comes after
+    /// `filter`: the compositor has to be able to sample itself.
+    fn filter_backdrop(&mut self, rect: Rect, radius: f32, ops: &[FilterOp], clip: Rect) {
+        let Some(area) = intersect(rect, clip) else {
+            return;
+        };
+        let x0 = area.x.floor().max(0.0) as usize;
+        let y0 = area.y.floor().max(0.0) as usize;
+        let x1 = (area.x + area.width).ceil().clamp(0.0, self.width as f32) as usize;
+        let y1 = (area.y + area.height).ceil().clamp(0.0, self.height as f32) as usize;
+        if x1 <= x0 || y1 <= y0 {
+            return;
+        }
+        // A margin, so a blur samples the page outside the element rather than
+        // fading into nothing at its edge.
+        let margin = ops.iter().map(|op| op.margin()).fold(0.0, f32::max).ceil() as usize;
+        let sx0 = x0.saturating_sub(margin);
+        let sy0 = y0.saturating_sub(margin);
+        let sx1 = (x1 + margin).min(self.width);
+        let sy1 = (y1 + margin).min(self.height);
+        let mut snapshot = Canvas::transparent(sx1 - sx0, sy1 - sy0);
+        for y in sy0..sy1 {
+            for x in sx0..sx1 {
+                snapshot.pixels[(y - sy0) * snapshot.width + (x - sx0)] =
+                    self.pixels[y * self.width + x];
+            }
+        }
+        apply_filters(&mut snapshot, ops);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                // The element's own rounded corners clip the frosted area, or a
+                // sheet's blur would show as a square behind a rounded card.
+                if radius > 0.0 && outside_rounded(rect, radius, x as f32 + 0.5, y as f32 + 0.5) {
+                    continue;
+                }
+                let sampled = snapshot.pixels[(y - sy0) * snapshot.width + (x - sx0)];
+                self.pixels[y * self.width + x] =
+                    blend(self.pixels[y * self.width + x], sampled, 255);
+            }
+        }
+    }
+
+    /// Map an already-rendered layer onto this canvas through `matrix`.
+    ///
+    /// Destination-driven: every pixel the transformed shape covers is walked
+    /// once and pulled back through the inverse, which is what keeps a rotation
+    /// free of the gaps a forward mapping leaves.
+    fn composite_layer(
+        &mut self,
+        layer: &Canvas,
+        source: Rect,
+        matrix: crate::css::Mat,
+        clip: Rect,
+    ) {
+        let Some(inverse) = matrix.invert() else {
+            return;
+        };
+        let dest = match intersect(transformed_bounds(matrix, source), clip) {
+            Some(dest) => dest,
+            None => return,
+        };
+        let x0 = dest.x.floor().max(0.0) as usize;
+        let y0 = dest.y.floor().max(0.0) as usize;
+        let x1 = (dest.x + dest.width).ceil().clamp(0.0, self.width as f32) as usize;
+        let y1 = (dest.y + dest.height).ceil().clamp(0.0, self.height as f32) as usize;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let (sx, sy) = inverse.apply(x as f32 + 0.5, y as f32 + 0.5);
+                // Half a pixel out on each side, so the layer's own edge is
+                // antialiased against whatever is behind it rather than cut.
+                if sx < source.x - 1.0
+                    || sy < source.y - 1.0
+                    || sx > source.x + source.width + 1.0
+                    || sy > source.y + source.height + 1.0
+                {
+                    continue;
+                }
+                let sampled = layer.sample(sx - source.x - 0.5, sy - source.y - 0.5);
+                if sampled.a == 0 {
+                    continue;
+                }
+                let idx = y * self.width + x;
+                self.pixels[idx] = blend(self.pixels[idx], sampled, 255);
+            }
+        }
+    }
+
     fn new(width: usize, height: usize) -> Canvas {
         let white = Color {
             r: 255,
@@ -278,47 +1010,55 @@ impl Canvas {
         }
     }
 
-    /// Draw a blurred rectangle behind a box. Alpha falls off linearly across
-    /// `blur`, which reads close enough to a Gaussian at these sizes.
+    /// Draw a blurred rounded rectangle behind a box.
+    ///
+    /// The shape is rasterized into an alpha mask and the mask is blurred —
+    /// the same path `text-shadow` takes, so there is one blur in the engine
+    /// rather than one per effect that wants one.
     fn paint_shadow(&mut self, rect: Rect, radius: f32, blur: f32, color: Color) {
-        let blur = blur.max(0.0);
-        let x0 = (rect.x - blur).clamp(0.0, self.width as f32) as usize;
-        let y0 = (rect.y - blur).clamp(0.0, self.height as f32) as usize;
-        let x1 = (rect.x + rect.width + blur).clamp(0.0, self.width as f32) as usize;
-        let y1 = (rect.y + rect.height + blur).clamp(0.0, self.height as f32) as usize;
+        let sigma = sigma_for(blur);
+        let spread = mask_margin(sigma);
+        let mut mask = Mask::covering(rect, spread, self.width, self.height);
         let (left, right) = (rect.x + radius, rect.x + rect.width - radius);
         let (top, bottom) = (rect.y + radius, rect.y + rect.height - radius);
-
-        for y in y0..y1 {
-            for x in x0..x1 {
-                let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
-                let dx = if px < left {
-                    left - px
-                } else if px > right {
-                    px - right
-                } else {
-                    0.0
-                };
-                let dy = if py < top {
-                    top - py
-                } else if py > bottom {
-                    py - bottom
-                } else {
-                    0.0
-                };
+        for y in 0..mask.height {
+            for x in 0..mask.width {
+                let px = (mask.x + x as i32) as f32 + 0.5;
+                let py = (mask.y + y as i32) as f32 + 0.5;
+                let dx = (left - px).max(px - right).max(0.0);
+                let dy = (top - py).max(py - bottom).max(0.0);
+                // Coverage of the rounded rectangle itself, antialiased across
+                // the one pixel its edge crosses; the blur does the rest.
                 let dist = (dx * dx + dy * dy).sqrt() - radius;
-                let coverage = if dist <= 0.0 {
-                    1.0
-                } else if blur > 0.0 {
-                    1.0 - dist / blur
-                } else {
-                    0.0
-                };
-                if coverage <= 0.0 {
+                let coverage = (0.5 - dist).clamp(0.0, 1.0);
+                mask.alpha[y * mask.width + x] = (coverage * 255.0) as u8;
+            }
+        }
+        mask.blur(sigma);
+        self.composite_mask(&mask, color, 0, 0, UNCLIPPED);
+    }
+
+    /// Blend a blurred alpha mask onto the canvas, tinted and offset.
+    fn composite_mask(&mut self, mask: &Mask, color: Color, dx: i32, dy: i32, clip: Rect) {
+        let (cx0, cy0) = (clip.x.max(0.0) as i32, clip.y.max(0.0) as i32);
+        let cx1 = (clip.x + clip.width).min(self.width as f32).max(0.0) as i32;
+        let cy1 = (clip.y + clip.height).min(self.height as f32).max(0.0) as i32;
+        for y in 0..mask.height {
+            let py = mask.y + y as i32 + dy;
+            if py < cy0 || py >= cy1 || py < 0 || py >= self.height as i32 {
+                continue;
+            }
+            for x in 0..mask.width {
+                let a = mask.alpha[y * mask.width + x];
+                if a == 0 {
                     continue;
                 }
-                let idx = y * self.width + x;
-                let alpha = (coverage * color.a as f32) as u8;
+                let px = mask.x + x as i32 + dx;
+                if px < cx0 || px >= cx1 || px < 0 || px >= self.width as i32 {
+                    continue;
+                }
+                let idx = py as usize * self.width + px as usize;
+                let alpha = (a as u32 * color.a as u32 / 255) as u8;
                 self.pixels[idx] = blend(self.pixels[idx], color, alpha);
             }
         }
@@ -348,45 +1088,37 @@ impl Canvas {
             .map_or(frag.size, |m| m.ascent);
         let baseline = frag.y + ascent;
 
-        // No bold/italic font file is loaded (Track D4), so a heavier weight
-        // and a slant are synthesized here instead of picked from a face:
-        // bold redraws each row a pixel wider, italic shears columns toward
-        // the top by `row`'s distance from the baseline.
-        let stroke = if frag.bold {
-            (frag.size / 24.0).max(1.0).round() as i32
-        } else {
-            0
-        };
-        let shear = if frag.italic { 0.22 } else { 0.0 };
-
-        for glyph in &frag.glyphs {
-            let (m, coverage) = font.rasterize_indexed(glyph.id, frag.size);
-            // fontdue gives per-pixel coverage (0..=255); place relative to the baseline.
-            let gx = (frag.x + glyph.x + m.xmin as f32).round() as i32;
-            let gy = (baseline - glyph.y - m.ymin as f32 - m.height as f32).round() as i32;
-
-            for row in 0..m.height {
-                let row_shear = (shear * (m.height - row) as f32).round() as i32;
-                let py = gy + row as i32;
-                if py < y0 || py >= y1 {
-                    continue;
-                }
-                for col in 0..m.width {
-                    let a = coverage[row * m.width + col];
-                    if a == 0 {
-                        continue;
-                    }
-                    for dx in 0..=stroke {
-                        let px = gx + col as i32 + row_shear + dx;
-                        if px < x0 || px >= x1 {
-                            continue;
-                        }
-                        let idx = py as usize * self.width + px as usize;
-                        self.pixels[idx] = blend(self.pixels[idx], frag.color, a);
-                    }
-                }
+        // Shadows are the glyph *coverage*, offset, blurred and tinted — not
+        // the run drawn again in another colour, which gives visibly wrong
+        // results wherever glyphs overlap or the blur is soft.
+        if !frag.shadows.is_empty() {
+            let mut ink = Mask::bounded(x0, y0, x1, y1);
+            run_ink(frag, font, baseline, |px, py, a| ink.cover(px, py, a));
+            // Back to front: the last shadow in the list paints first, so the
+            // first one ends up nearest the text.
+            for shadow in frag.shadows.iter().rev() {
+                let mut mask = Mask {
+                    alpha: ink.alpha.clone(),
+                    ..ink
+                };
+                mask.blur(sigma_for(shadow.blur));
+                self.composite_mask(
+                    &mask,
+                    shadow.color,
+                    shadow.dx.round() as i32,
+                    shadow.dy.round() as i32,
+                    clip,
+                );
             }
         }
+
+        run_ink(frag, font, baseline, |px, py, a| {
+            if px < x0 || px >= x1 || py < y0 || py >= y1 {
+                return;
+            }
+            let idx = py as usize * self.width + px as usize;
+            self.pixels[idx] = blend(self.pixels[idx], frag.color, a);
+        });
 
         // A stroke's own thickness, not part of any glyph's rasterized coverage.
         // A rule under clipped-away words must not outlive them, so both are
@@ -599,13 +1331,30 @@ fn resolve_bg_axis(axis: BgAxis, box_dim: f32, image_dim: f32) -> f32 {
 
 /// Alpha-blend `src` (scaled by `coverage`) over `dst`.
 fn blend(dst: Color, src: Color, coverage: u8) -> Color {
-    let a = (coverage as f32 / 255.0) * (src.a as f32 / 255.0);
-    let mix = |d: u8, s: u8| (s as f32 * a + d as f32 * (1.0 - a)).round() as u8;
+    let sa = (coverage as f32 / 255.0) * (src.a as f32 / 255.0);
+    let da = dst.a as f32 / 255.0;
+    // Source-over. On the page canvas, which starts opaque, this reduces to the
+    // straight mix it always was; an offscreen layer starts transparent and
+    // needs the alpha carried through so it can be composited afterwards.
+    let out = sa + da * (1.0 - sa);
+    if out <= 0.0 {
+        return Color {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 0,
+        };
+    }
+    let mix = |d: u8, s: u8| {
+        ((s as f32 * sa + d as f32 * da * (1.0 - sa)) / out)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
     Color {
         r: mix(dst.r, src.r),
         g: mix(dst.g, src.g),
         b: mix(dst.b, src.b),
-        a: 255,
+        a: (out * 255.0).round() as u8,
     }
 }
 
@@ -665,11 +1414,39 @@ pub fn paint(
             },
         );
     }
+    rasterize(
+        &mut canvas,
+        &display_list,
+        &matches_on_canvas,
+        fonts,
+        images,
+        MAX_LAYER_DEPTH,
+    );
+    (canvas, matches)
+}
+
+/// How deeply off-axis transforms may nest before the painter stops following
+/// them. Each level is an offscreen buffer, and a page can nest as it likes.
+const MAX_LAYER_DEPTH: usize = 8;
+
+/// Draw a display list onto a canvas.
+///
+/// Its own function because a [`DisplayCommand::Layer`] renders its subtree the
+/// same way, into a buffer of its own, before being mapped through a transform
+/// the primitives here cannot express.
+fn rasterize(
+    canvas: &mut Canvas,
+    display_list: &DisplayList,
+    highlights: &[Rect],
+    fonts: Option<&FontSet>,
+    images: &ImageMap,
+    depth: usize,
+) {
     // Two passes: everything under the text, then the find highlights, then the
     // text itself — a highlight must cover page backgrounds but sit under words.
     for pass in [Pass::Boxes, Pass::Text] {
         if pass == Pass::Text {
-            for rect in &matches_on_canvas {
+            for rect in highlights {
                 canvas.paint_solid(HIGHLIGHT, *rect);
             }
         }
@@ -712,10 +1489,54 @@ pub fn paint(
                         canvas.paint_background_image(img, *rect, *size, *position, *repeat);
                     }
                 }
+                DisplayCommand::Backdrop {
+                    rect,
+                    radius,
+                    filters,
+                    clip,
+                } => canvas.filter_backdrop(*rect, *radius, filters, *clip),
+                DisplayCommand::Layer {
+                    list,
+                    source,
+                    matrix,
+                    clip,
+                    filters,
+                } => {
+                    if depth == 0 {
+                        continue;
+                    }
+                    let width = source.width.ceil().max(0.0) as usize;
+                    let height = source.height.ceil().max(0.0) as usize;
+                    // A transform on an empty or absurd box is not worth a
+                    // buffer; the page still renders, just without the effect.
+                    if width == 0 || height == 0 || width * height > 16_000_000 {
+                        continue;
+                    }
+                    let mut layer = Canvas::transparent(width, height);
+                    // The subtree was built in page coordinates, so drawing it
+                    // into a buffer that starts at the source's corner is one
+                    // translation.
+                    let shifted: DisplayList = list
+                        .iter()
+                        .cloned()
+                        .map(|item| {
+                            transform(
+                                item,
+                                Xf {
+                                    scale: 1.0,
+                                    dx: -source.x,
+                                    dy: -source.y,
+                                },
+                            )
+                        })
+                        .collect();
+                    rasterize(&mut layer, &shifted, &[], fonts, images, depth - 1);
+                    apply_filters(&mut layer, filters);
+                    canvas.composite_layer(&layer, *source, *matrix, *clip);
+                }
             }
         }
     }
-    (canvas, matches)
 }
 
 /// Text paints above every box, so highlights can slot between the two.
@@ -728,6 +1549,13 @@ enum Pass {
 fn pass_of(item: &DisplayCommand) -> Pass {
     match item {
         DisplayCommand::Text(..) => Pass::Text,
+        // A layer holds its own boxes and text and orders them internally, so
+        // it has to paint in one pass. The text pass is the right one: a
+        // transformed element is a badge or a label over the page, not under it.
+        DisplayCommand::Layer { .. } => Pass::Text,
+        // A backdrop filter reads the canvas back, so it has to run after
+        // everything beneath it has been drawn but before the box on top.
+        DisplayCommand::Backdrop { .. } => Pass::Boxes,
         _ => Pass::Boxes,
     }
 }
@@ -751,7 +1579,10 @@ fn highlight_rects(list: &DisplayList, query: &str) -> Vec<Rect> {
     }
     list.iter()
         .filter_map(|item| match item {
-            DisplayCommand::Text(frag, _) if frag.text.to_lowercase().contains(&needle) => {
+            // Generated content is not in the document, so it is not findable.
+            DisplayCommand::Text(frag, ..)
+                if !frag.generated && frag.text.to_lowercase().contains(&needle) =>
+            {
                 Some(Rect {
                     x: frag.x,
                     y: frag.y,
@@ -995,82 +1826,103 @@ impl Xf {
     }
 }
 
-/// What `transform` does to this box and everything inside it.
+/// What `transform` does to this box and everything inside it, as one matrix.
 ///
-/// ponytail: `translate` and `scale` only. Percentages resolve against the box's
-/// own border box, which is what `translate(-50%, -50%)` — the way the web
-/// centres things — needs. `rotate`, `skew` and matrices are ignored rather than
-/// approximated: moving and scaling a box is exact, and rotating text would need
-/// the rasterizer to turn glyphs, not just place them.
-fn transform_of(layout_box: &LayoutBox) -> Xf {
+/// The function list composes in the order written, and the whole of it is
+/// measured about `transform-origin` — the translate/rotate/untranslate
+/// sandwich, which is also what makes an existing `scale()` grow about the
+/// box's centre rather than its corner.
+pub(crate) fn transform_matrix_of(layout_box: &LayoutBox) -> crate::css::Mat {
     let style = match layout_box.box_type {
         BoxType::BlockNode(s) | BoxType::InlineNode(s) => s,
-        BoxType::AnonymousBlock => return Xf::NONE,
+        BoxType::AnonymousBlock => return crate::css::Mat::IDENTITY,
     };
     let spec = match style.value("transform") {
         Some(Value::Raw(text)) => text,
-        _ => return Xf::NONE,
+        _ => return crate::css::Mat::IDENTITY,
     };
     let box_rect = layout_box.dimensions.border_box();
-    let mut shift = (0.0f32, 0.0f32);
-    let mut scale = 1.0f32;
-    let mut rest = spec.as_str();
-    // Translations commute and a uniform scale commutes with them up to the
-    // origin, which is handled once at the end — so the list can be summed.
-    while let Some(open) = rest.find('(') {
-        let name = rest[..open]
-            .trim()
-            .trim_start_matches(',')
-            .trim()
-            .to_ascii_lowercase();
-        let Some(close) = rest[open..].find(')') else {
-            break;
+    let size = (box_rect.width, box_rect.height);
+    let ctx = style.length_context(0.0);
+    let matrix = crate::css::parse_transform(&spec, ctx, size);
+    if matrix.is_identity() {
+        return matrix;
+    }
+    // `transform-origin` is kept as raw text, so one arm covers every spelling.
+    let spec = match style.value("transform-origin") {
+        Some(Value::Raw(spec)) => Some(spec),
+        _ => None,
+    };
+    let origin = crate::css::parse_transform_origin(spec.as_deref(), ctx, size);
+    // The origin is a point on the page, not an offset in the box.
+    let pivot = (box_rect.x + origin.0, box_rect.y + origin.1);
+    crate::css::Mat::translate(pivot.0, pivot.1)
+        .then(matrix)
+        .then(crate::css::Mat::translate(-pivot.0, -pivot.1))
+}
+
+/// The axis-aligned scale-and-offset a matrix is equivalent to, when it is one.
+fn upright_xf(matrix: crate::css::Mat) -> Option<Xf> {
+    matrix.is_upright().then_some(Xf {
+        scale: matrix.a,
+        dx: matrix.e,
+        dy: matrix.f,
+    })
+}
+
+/// The bounding box of `rect` after `matrix` — all four corners, because a
+/// rotated rectangle's extent is not given by two of them.
+pub(crate) fn transformed_bounds(matrix: crate::css::Mat, rect: Rect) -> Rect {
+    let corners = [
+        matrix.apply(rect.x, rect.y),
+        matrix.apply(rect.x + rect.width, rect.y),
+        matrix.apply(rect.x, rect.y + rect.height),
+        matrix.apply(rect.x + rect.width, rect.y + rect.height),
+    ];
+    let xs = corners.map(|(x, _)| x);
+    let ys = corners.map(|(_, y)| y);
+    let x0 = xs.iter().copied().fold(f32::INFINITY, f32::min);
+    let x1 = xs.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let y0 = ys.iter().copied().fold(f32::INFINITY, f32::min);
+    let y1 = ys.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    Rect {
+        x: x0,
+        y: y0,
+        width: x1 - x0,
+        height: y1 - y0,
+    }
+}
+
+/// Everything a subtree paints within, so a layer's buffer is big enough.
+///
+/// Its own box is not enough: a descendant may stick out of it, and an absolute
+/// child may sit well outside.
+fn subtree_bounds(layout_box: &LayoutBox) -> Rect {
+    let mut bounds = layout_box.dimensions.border_box();
+    let mut grow = |r: Rect| {
+        let x0 = bounds.x.min(r.x);
+        let y0 = bounds.y.min(r.y);
+        let x1 = (bounds.x + bounds.width).max(r.x + r.width);
+        let y1 = (bounds.y + bounds.height).max(r.y + r.height);
+        bounds = Rect {
+            x: x0,
+            y: y0,
+            width: x1 - x0,
+            height: y1 - y0,
         };
-        let args: Vec<&str> = rest[open + 1..open + close]
-            .split(',')
-            .map(str::trim)
-            .collect();
-        let ctx = style.length_context(0.0);
-        // A percentage is of this box's own size, so each axis has its own base.
-        let px = |token: &str, base: f32| match token.strip_suffix('%') {
-            Some(pct) => pct.trim().parse::<f32>().unwrap_or(0.0) / 100.0 * base,
-            None => crate::css::parse_length_token(token, ctx),
-        };
-        let number = |token: &str| token.parse::<f32>().ok();
-        match name.as_str() {
-            "translate" => {
-                shift.0 += px(args[0], box_rect.width);
-                if let Some(y) = args.get(1) {
-                    shift.1 += px(y, box_rect.height);
-                }
-            }
-            "translatex" => shift.0 += px(args[0], box_rect.width),
-            "translatey" => shift.1 += px(args[0], box_rect.height),
-            // A non-uniform scale would need two factors everywhere below; the
-            // larger of the two is closer than ignoring the transform outright.
-            "scale" => {
-                let x = number(args[0]).unwrap_or(1.0);
-                let y = args.get(1).and_then(|a| number(a)).unwrap_or(x);
-                scale *= x.abs().max(y.abs());
-            }
-            "scalex" | "scaley" => scale *= number(args[0]).unwrap_or(1.0).abs(),
-            _ => {} // rotate/skew/matrix: not modelled
-        }
-        rest = &rest[open + close + 1..];
+    };
+    for frag in &layout_box.text_fragments {
+        grow(Rect {
+            x: frag.x,
+            y: frag.y,
+            width: frag.width,
+            height: frag.line_height,
+        });
     }
-    if shift == (0.0, 0.0) && scale == 1.0 {
-        return Xf::NONE;
+    for child in &layout_box.children {
+        grow(subtree_bounds(child));
     }
-    // Scaling happens about the box's centre, as `transform-origin` defaults to.
-    let centre = (
-        box_rect.x + box_rect.width / 2.0,
-        box_rect.y + box_rect.height / 2.0,
-    );
-    Xf {
-        scale,
-        dx: centre.0 * (1.0 - scale) + shift.0,
-        dy: centre.1 * (1.0 - scale) + shift.1,
-    }
+    bounds
 }
 
 /// Move and scale one command.
@@ -1079,6 +1931,40 @@ fn transform(item: DisplayCommand, xf: Xf) -> DisplayCommand {
         return item;
     }
     match item {
+        DisplayCommand::Backdrop {
+            rect,
+            radius,
+            filters,
+            clip,
+        } => DisplayCommand::Backdrop {
+            rect: xf.rect(rect),
+            radius: radius * xf.scale,
+            filters,
+            clip: xf.rect(clip),
+        },
+        // A layer's contents are in their own coordinates and stay there; what
+        // an enclosing transform changes is where the result lands.
+        DisplayCommand::Layer {
+            list,
+            source,
+            matrix,
+            clip,
+            filters,
+        } => DisplayCommand::Layer {
+            list,
+            source,
+            filters,
+            matrix: crate::css::Mat {
+                a: xf.scale,
+                b: 0.0,
+                c: 0.0,
+                d: xf.scale,
+                e: xf.dx,
+                f: xf.dy,
+            }
+            .then(matrix),
+            clip: xf.rect(clip),
+        },
         DisplayCommand::SolidColor(c, rect) => DisplayCommand::SolidColor(c, xf.rect(rect)),
         DisplayCommand::RoundedColor(c, rect, radius) => {
             DisplayCommand::RoundedColor(c, xf.rect(rect), radius * xf.scale)
@@ -1147,6 +2033,17 @@ fn transform(item: DisplayCommand, xf: Xf) -> DisplayCommand {
                 width: frag.width * xf.scale,
                 size: frag.size * xf.scale,
                 line_height: frag.line_height * xf.scale,
+                shadows: std::rc::Rc::new(
+                    frag.shadows
+                        .iter()
+                        .map(|s| ShadowSpec {
+                            dx: s.dx * xf.scale,
+                            dy: s.dy * xf.scale,
+                            blur: s.blur * xf.scale,
+                            ..*s
+                        })
+                        .collect(),
+                ),
                 glyphs: frag
                     .glyphs
                     .into_iter()
@@ -1199,10 +2096,69 @@ fn render_layout_box(
     alpha: f32,
     outer: Xf,
 ) {
-    let alpha = alpha * opacity_of(layout_box);
     // A transform applies to the box and everything inside it, so it composes
     // with whatever its ancestors already did.
-    let xf = outer.then(transform_of(layout_box));
+    let matrix = transform_matrix_of(layout_box);
+    let filters = filters_of(layout_box, "filter");
+    match upright_xf(matrix).filter(|_| filters.is_empty()) {
+        // A scale-and-offset and no filter needs no buffer: it folds into the
+        // ancestors' and paints straight onto the canvas, which keeps text sharp.
+        Some(local) => render_subtree(list, layout_box, clip, alpha, outer.then(local)),
+        // Anything else — a rotation, a skew, a flip, a per-axis scale, or a
+        // filter, which is defined over the rendered result — is drawn upright
+        // into its own buffer, filtered, and mapped.
+        None => {
+            let mut source = subtree_bounds(layout_box);
+            // A blur or a drop shadow reaches past the content it came from.
+            let margin = filters.iter().map(|op| op.margin()).fold(0.0, f32::max);
+            if margin > 0.0 {
+                source = Rect {
+                    x: source.x - margin,
+                    y: source.y - margin,
+                    width: source.width + margin * 2.0,
+                    height: source.height + margin * 2.0,
+                };
+            }
+            let mut sub = Vec::new();
+            render_subtree(&mut sub, layout_box, UNCLIPPED, alpha, Xf::NONE);
+            list.push(transform(
+                DisplayCommand::Layer {
+                    list: sub,
+                    source,
+                    matrix,
+                    clip,
+                    filters,
+                },
+                outer,
+            ));
+        }
+    }
+}
+
+/// A `filter` or `backdrop-filter` chain, already resolved to amounts.
+fn filters_of(layout_box: &LayoutBox, property: &str) -> Vec<FilterOp> {
+    let style = match layout_box.box_type {
+        BoxType::BlockNode(s) | BoxType::InlineNode(s) => s,
+        BoxType::AnonymousBlock => return Vec::new(),
+    };
+    let Some(Value::Raw(spec)) = style.value(property) else {
+        return Vec::new();
+    };
+    // `drop-shadow()` with no colour of its own uses the element's `color`.
+    let color = match style.value("color") {
+        Some(Value::ColorValue(c)) => c,
+        _ => Color {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 255,
+        },
+    };
+    parse_filter_list(&spec, style.length_context(style.font_size()), color)
+}
+
+fn render_subtree(list: &mut DisplayList, layout_box: &LayoutBox, clip: Rect, alpha: f32, xf: Xf) {
+    let alpha = alpha * opacity_of(layout_box);
     if !is_invisible(layout_box) && alpha > 0.0 {
         let mut own = Vec::new();
         render_own(&mut own, layout_box);
@@ -1235,6 +2191,7 @@ fn render_layout_box(
 
 fn render_own(list: &mut DisplayList, layout_box: &LayoutBox) {
     render_shadow(list, layout_box);
+    render_backdrop(list, layout_box);
     render_background(list, layout_box);
     render_borders(list, layout_box);
     render_outline(list, layout_box);
@@ -1284,8 +2241,14 @@ fn render_own(list: &mut DisplayList, layout_box: &LayoutBox) {
         }
     }
     // Text sits above this box's background/borders.
+    let shadows = match layout_box.box_type {
+        BoxType::BlockNode(s) | BoxType::InlineNode(s) => text_shadows(s),
+        BoxType::AnonymousBlock => std::rc::Rc::new(Vec::new()),
+    };
     for frag in &layout_box.text_fragments {
-        list.push(DisplayCommand::Text(frag.clone(), UNCLIPPED));
+        let mut frag = frag.clone();
+        frag.shadows = std::rc::Rc::clone(&shadows);
+        list.push(DisplayCommand::Text(frag, UNCLIPPED));
     }
 }
 
@@ -1320,7 +2283,7 @@ fn image_src(layout_box: &LayoutBox) -> Option<String> {
     }
 }
 
-/// `box-shadow: <x> <y> <blur> <color>` — drawn before the background so it sits behind.
+/// `box-shadow` — drawn before the background so it sits behind.
 fn render_shadow(list: &mut DisplayList, layout_box: &LayoutBox) {
     let style = match layout_box.box_type {
         BoxType::BlockNode(s) | BoxType::InlineNode(s) => s,
@@ -1330,38 +2293,73 @@ fn render_shadow(list: &mut DisplayList, layout_box: &LayoutBox) {
         Some(Value::Raw(spec)) => spec,
         _ => return,
     };
-    let ctx = style.length_context(0.0);
-    let mut offset = [0.0_f32; 3]; // x, y, blur
-    let mut color = Color {
+    let b = layout_box.dimensions.border_box();
+    let radius = border_radius(layout_box, b);
+    let faint = Color {
         r: 0,
         g: 0,
         b: 0,
         a: 80,
     };
-    let mut lengths = 0;
-    for token in spec.split_whitespace() {
-        if let Some(hex) = token.strip_prefix('#') {
-            if let Some(Value::ColorValue(c)) = crate::css::parse_color_token(hex) {
-                color = c;
-            }
-        } else if lengths < 3 {
-            offset[lengths] = crate::css::parse_length_token(token, ctx);
-            lengths += 1;
-        }
+    // Back to front, so the first shadow in the list ends up on top.
+    for shadow in parse_shadow_list(&spec, style.length_context(0.0), faint)
+        .into_iter()
+        .rev()
+    {
+        list.push(DisplayCommand::Shadow {
+            rect: Rect {
+                x: b.x + shadow.dx,
+                y: b.y + shadow.dy,
+                width: b.width,
+                height: b.height,
+            },
+            radius,
+            blur: shadow.blur,
+            color: shadow.color,
+        });
     }
-    let b = layout_box.dimensions.border_box();
-    let rect = Rect {
-        x: b.x + offset[0],
-        y: b.y + offset[1],
-        width: b.width,
-        height: b.height,
-    };
-    list.push(DisplayCommand::Shadow {
+}
+
+/// `backdrop-filter` — the frosted glass behind a translucent surface.
+///
+/// Pushed after the box shadow and before the background, which is the order
+/// that makes it read as glass: the page beneath is filtered, then the box's own
+/// translucent background tints the result.
+fn render_backdrop(list: &mut DisplayList, layout_box: &LayoutBox) {
+    let filters = filters_of(layout_box, "backdrop-filter");
+    if filters.is_empty() {
+        return;
+    }
+    let rect = layout_box.dimensions.border_box();
+    list.push(DisplayCommand::Backdrop {
         rect,
-        radius: border_radius(layout_box, b),
-        blur: offset[2],
-        color,
+        radius: border_radius(layout_box, rect),
+        filters,
+        clip: UNCLIPPED,
     });
+}
+
+/// `text-shadow`, which paints from the glyph coverage of each run in this box
+/// and contributes nothing to layout.
+fn text_shadows(style: &crate::style::StyledNode) -> std::rc::Rc<Vec<ShadowSpec>> {
+    let Some(Value::Raw(spec)) = style.value("text-shadow") else {
+        return std::rc::Rc::new(Vec::new());
+    };
+    // An omitted colour is the element's own `color`.
+    let color = match style.value("color") {
+        Some(Value::ColorValue(c)) => c,
+        _ => Color {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 255,
+        },
+    };
+    std::rc::Rc::new(parse_shadow_list(
+        &spec,
+        style.length_context(style.font_size()),
+        color,
+    ))
 }
 
 fn render_background(list: &mut DisplayList, layout_box: &LayoutBox) {
@@ -1939,6 +2937,270 @@ fn get_color(layout_box: &LayoutBox, name: &str) -> Option<Color> {
 mod tests {
     use super::*;
 
+    fn shadow_ctx() -> crate::css::LengthContext {
+        crate::css::LengthContext {
+            percent_base: 0.0,
+            font_size: 16.0,
+            root_font_size: 16.0,
+        }
+    }
+
+    fn solid(width: usize, height: usize, color: Color) -> Canvas {
+        let mut canvas = Canvas::transparent(width, height);
+        canvas.pixels.fill(color);
+        canvas
+    }
+
+    #[test]
+    fn filter_functions_parse_with_percentages_numbers_and_angles() {
+        let black = Color {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 255,
+        };
+        let ops = parse_filter_list(
+            "blur(4px) grayscale(50%) hue-rotate(90deg) drop-shadow(2px 3px 4px blue)",
+            shadow_ctx(),
+            black,
+        );
+        assert_eq!(ops.len(), 4, "the chain lost a function: {ops:?}");
+        assert_eq!(ops[0], FilterOp::Blur(4.0));
+        assert_eq!(ops[1], FilterOp::Grayscale(0.5));
+        assert!(
+            matches!(ops[2], FilterOp::HueRotate(a) if (a - std::f32::consts::FRAC_PI_2).abs() < 1.0e-4)
+        );
+        assert!(matches!(ops[3], FilterOp::DropShadow(s) if s.dx == 2.0 && s.color.b == 255));
+        // A percentage and a bare number mean the same thing.
+        assert_eq!(
+            parse_filter_list("brightness(150%)", shadow_ctx(), black),
+            parse_filter_list("brightness(1.5)", shadow_ctx(), black)
+        );
+        // An SVG-referencing filter is skipped without taking the chain with it.
+        let ops = parse_filter_list("url(#sharpen) invert(1)", shadow_ctx(), black);
+        assert_eq!(ops, vec![FilterOp::Invert(1.0)]);
+    }
+
+    #[test]
+    fn filters_apply_in_the_order_written() {
+        let red = Color {
+            r: 255,
+            g: 0,
+            b: 0,
+            a: 255,
+        };
+        // Darkening then inverting is not inverting then darkening.
+        let gray = Color {
+            r: 128,
+            g: 128,
+            b: 128,
+            a: 255,
+        };
+        let mut a = solid(2, 2, gray);
+        apply_filters(&mut a, &[FilterOp::Brightness(0.5), FilterOp::Invert(1.0)]);
+        let mut b = solid(2, 2, gray);
+        apply_filters(&mut b, &[FilterOp::Invert(1.0), FilterOp::Brightness(0.5)]);
+        assert_ne!(a.pixels[0], b.pixels[0], "the chain order did not matter");
+        assert!(a.pixels[0].r > b.pixels[0].r);
+
+        // Grayscale flattens the channels to one luminance.
+        let mut gray = solid(1, 1, red);
+        apply_filters(&mut gray, &[FilterOp::Grayscale(1.0)]);
+        let p = gray.pixels[0];
+        assert_eq!((p.r, p.g, p.b), (p.r, p.r, p.r));
+        assert!(p.r > 0 && p.r < 255, "luminance came out as {}", p.r);
+
+        // Invert is its own opposite.
+        let mut twice = solid(1, 1, red);
+        apply_filters(&mut twice, &[FilterOp::Invert(1.0), FilterOp::Invert(1.0)]);
+        assert_eq!(twice.pixels[0], red);
+
+        // Opacity works on the alpha channel, which is what lets a filtered
+        // layer be composited rather than pasted.
+        let mut faded = solid(1, 1, red);
+        apply_filters(&mut faded, &[FilterOp::Opacity(0.5)]);
+        assert_eq!(faded.pixels[0].a, 128);
+
+        // Brightness scales, and clamps rather than wrapping.
+        let mut bright = solid(1, 1, red);
+        apply_filters(&mut bright, &[FilterOp::Brightness(2.0)]);
+        assert_eq!(bright.pixels[0].r, 255);
+    }
+
+    #[test]
+    fn blur_and_drop_shadow_work_against_transparency() {
+        let opaque = Color {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 255,
+        };
+        // A small opaque square in a transparent buffer.
+        let mut canvas = Canvas::transparent(21, 21);
+        for y in 8..13 {
+            for x in 8..13 {
+                canvas.pixels[y * 21 + x] = opaque;
+            }
+        }
+        let mut blurred = Canvas {
+            pixels: canvas.pixels.clone(),
+            width: 21,
+            height: 21,
+        };
+        apply_filters(&mut blurred, &[FilterOp::Blur(4.0)]);
+        assert!(
+            blurred.pixels[10 * 21 + 10].a < 255,
+            "the centre stayed hard"
+        );
+        assert!(
+            blurred.pixels[10 * 21 + 14].a > 0,
+            "the blur did not spread past the shape"
+        );
+
+        // drop-shadow puts tinted alpha *under* the shape, so the shape itself
+        // is untouched and the shadow appears where nothing was.
+        let mut shadowed = Canvas {
+            pixels: canvas.pixels.clone(),
+            width: 21,
+            height: 21,
+        };
+        apply_filters(
+            &mut shadowed,
+            &[FilterOp::DropShadow(ShadowSpec {
+                dx: 4.0,
+                dy: 4.0,
+                blur: 0.0,
+                color: Color {
+                    r: 255,
+                    g: 0,
+                    b: 0,
+                    a: 255,
+                },
+            })],
+        );
+        assert_eq!(
+            shadowed.pixels[10 * 21 + 10],
+            opaque,
+            "the shape was overdrawn"
+        );
+        let under = shadowed.pixels[14 * 21 + 14];
+        assert_eq!(
+            (under.r, under.a),
+            (255, 255),
+            "no shadow beneath the shape"
+        );
+    }
+
+    #[test]
+    fn a_backdrop_filter_reads_back_what_is_already_painted() {
+        let red = Color {
+            r: 255,
+            g: 0,
+            b: 0,
+            a: 255,
+        };
+        let mut canvas = solid(10, 10, red);
+        let area = Rect {
+            x: 2.0,
+            y: 2.0,
+            width: 4.0,
+            height: 4.0,
+        };
+        canvas.filter_backdrop(area, 0.0, &[FilterOp::Grayscale(1.0)], UNCLIPPED);
+        // Inside the box the page beneath has been desaturated in place...
+        let inside = canvas.pixels[4 * 10 + 4];
+        assert_eq!(
+            (inside.r, inside.g, inside.b),
+            (inside.r, inside.r, inside.r)
+        );
+        // ...and outside it, nothing changed.
+        assert_eq!(canvas.pixels[9 * 10 + 9], red);
+    }
+
+    #[test]
+    fn shadow_lists_parse_with_colours_offsets_and_blur() {
+        let black = Color {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 255,
+        };
+        let list = parse_shadow_list(
+            "1px 1px 2px rgba(0, 0, 0, 0.5), 0 0 8px blue",
+            shadow_ctx(),
+            black,
+        );
+        assert_eq!(list.len(), 2, "the comma inside rgba() split the list");
+        assert_eq!(list[0].dx, 1.0);
+        assert_eq!(list[0].dy, 1.0);
+        assert_eq!(list[0].blur, 2.0);
+        assert_eq!(list[0].color.a, 128);
+        assert_eq!(list[1].blur, 8.0);
+        assert_eq!(list[1].color.b, 255);
+
+        // An omitted colour is whatever the caller passed as the element's own.
+        let red = Color {
+            r: 255,
+            g: 0,
+            b: 0,
+            a: 255,
+        };
+        let list = parse_shadow_list("2px 3px", shadow_ctx(), red);
+        assert_eq!(list[0].color, red);
+        assert_eq!(list[0].blur, 0.0);
+        // The colour may lead as well as trail.
+        let list = parse_shadow_list("blue 2px 3px 4px", shadow_ctx(), red);
+        assert_eq!(list[0].color.b, 255);
+        assert_eq!(list[0].dx, 2.0);
+        // One offset is not a shadow.
+        assert!(parse_shadow_list("4px", shadow_ctx(), red).is_empty());
+    }
+
+    #[test]
+    fn a_blurred_mask_spreads_coverage_without_inventing_any() {
+        // A small solid blob in the middle of a mask.
+        let mut mask = Mask::bounded(0, 0, 21, 21);
+        for y in 8..13 {
+            for x in 8..13 {
+                mask.cover(x, y, 255);
+            }
+        }
+        let before: u32 = mask.alpha.iter().map(|&a| a as u32).sum();
+        mask.blur(sigma_for(4.0));
+
+        let at = |x: usize, y: usize| mask.alpha[y * mask.width + x];
+        assert!(at(10, 10) < 255, "the blur did not soften the centre");
+        assert!(at(13, 10) > 0, "the blur did not spread sideways");
+        assert!(at(10, 13) > 0, "the blur did not spread vertically");
+        // Softening moves coverage around; it must not manufacture ink.
+        let after: u32 = mask.alpha.iter().map(|&a| a as u32).sum();
+        assert!(
+            after <= before,
+            "blurring brightened the mask: {before} -> {after}"
+        );
+
+        // Zero blur leaves the mask exactly as it was.
+        let mut sharp = Mask::bounded(0, 0, 5, 5);
+        sharp.cover(2, 2, 200);
+        sharp.blur(sigma_for(0.0));
+        assert_eq!(sharp.alpha[2 * 5 + 2], 200);
+    }
+
+    #[test]
+    fn text_shadows_paint_back_to_front_beneath_the_glyphs() {
+        // The list order is reading order; the paint order is its reverse, so
+        // the first shadow written ends up nearest the text.
+        let red = Color {
+            r: 255,
+            g: 0,
+            b: 0,
+            a: 255,
+        };
+        let list = parse_shadow_list("1px 0 red, 2px 0 blue", shadow_ctx(), red);
+        let painted: Vec<f32> = list.iter().rev().map(|s| s.dx).collect();
+        assert_eq!(painted, vec![2.0, 1.0]);
+    }
+
     fn run(x: f32, y: f32, width: f32) -> TextFragment {
         TextFragment {
             glyphs: Vec::new(),
@@ -1959,6 +3221,9 @@ mod tests {
             bold: false,
             italic: false,
             font_index: 0,
+            transform: crate::layout::TextTransform::None,
+            shadows: std::rc::Rc::new(Vec::new()),
+            generated: false,
         }
     }
 
