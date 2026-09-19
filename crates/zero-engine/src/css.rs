@@ -218,7 +218,10 @@ struct CalcParser {
 
 impl CalcParser {
     fn new(s: &str) -> CalcParser {
-        CalcParser { chars: s.chars().collect(), pos: 0 }
+        CalcParser {
+            chars: s.chars().collect(),
+            pos: 0,
+        }
     }
 
     fn skip_ws(&mut self) {
@@ -366,17 +369,19 @@ pub type Specificity = (usize, usize, usize);
 impl Selector {
     /// Specificity sums over the whole chain, so `nav a` beats a bare `a`.
     pub fn specificity(&self) -> Specificity {
-        self.parts.iter().fold((0, 0, 0), |(ids, classes, tags), part| {
-            (
-                ids + part.simple.id.iter().count(),
-                // A pseudo-class counts alongside classes, per the spec.
-                classes
-                    + part.simple.class.len()
-                    + part.simple.attrs.len()
-                    + part.simple.pseudos.len(),
-                tags + part.simple.tag_name.iter().count(),
-            )
-        })
+        self.parts
+            .iter()
+            .fold((0, 0, 0), |(ids, classes, tags), part| {
+                (
+                    ids + part.simple.id.iter().count(),
+                    // A pseudo-class counts alongside classes, per the spec.
+                    classes
+                        + part.simple.class.len()
+                        + part.simple.attrs.len()
+                        + part.simple.pseudos.len(),
+                    tags + part.simple.tag_name.iter().count(),
+                )
+            })
     }
 
     /// The element this selector styles, ignoring its ancestor conditions.
@@ -476,7 +481,10 @@ pub fn parse_style_attribute(text: &str) -> Vec<Declaration> {
     if text.trim().is_empty() {
         return Vec::new();
     }
-    let mut parser = Parser { pos: 0, input: format!("{{{text}}}") };
+    let mut parser = Parser {
+        pos: 0,
+        input: format!("{{{text}}}"),
+    };
     parser.parse_declarations()
 }
 
@@ -658,14 +666,17 @@ pub(crate) fn parse_color_str(token: &str) -> Option<Color> {
 
 fn named_color(name: &str) -> Option<Value> {
     let name = name.to_ascii_lowercase();
-    NAMED_COLORS.iter().find(|(n, _)| *n == name).map(|(_, rgba)| {
-        Value::ColorValue(Color {
-            r: (rgba >> 24) as u8,
-            g: (rgba >> 16) as u8,
-            b: (rgba >> 8) as u8,
-            a: *rgba as u8,
+    NAMED_COLORS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, rgba)| {
+            Value::ColorValue(Color {
+                r: (rgba >> 24) as u8,
+                g: (rgba >> 16) as u8,
+                b: (rgba >> 8) as u8,
+                a: *rgba as u8,
+            })
         })
-    })
 }
 
 /// `rgb()`, `rgba()`, `hsl()` and `hsla()`, in both the comma and the modern
@@ -675,8 +686,11 @@ fn parse_color_function(s: &str) -> Option<Value> {
     let body = rest.strip_suffix(')')?;
     let name = name.trim().to_ascii_lowercase();
     // Both separators mean the same thing, and `/` only ever precedes alpha.
-    let parts: Vec<&str> =
-        body.split([',', '/', ' ']).map(str::trim).filter(|p| !p.is_empty()).collect();
+    let parts: Vec<&str> = body
+        .split([',', '/', ' '])
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .collect();
     if parts.len() < 3 {
         return None;
     }
@@ -702,7 +716,12 @@ fn parse_color_function(s: &str) -> Option<Value> {
         }
         "hsl" | "hsla" => {
             let hue = parts[0].trim_end_matches("deg").parse::<f32>().ok()?;
-            let pct = |p: &str| p.trim_end_matches('%').parse::<f32>().ok().map(|v| v / 100.0);
+            let pct = |p: &str| {
+                p.trim_end_matches('%')
+                    .parse::<f32>()
+                    .ok()
+                    .map(|v| v / 100.0)
+            };
             let (r, g, b) = hsl_to_rgb(hue, pct(parts[1])?, pct(parts[2])?);
             Color { r, g, b, a: alpha }
         }
@@ -752,7 +771,10 @@ fn classify_value(s: &str) -> Option<Value> {
     if let Some(hex) = s.strip_prefix('#') {
         return parse_hex_color(hex);
     }
-    if let Some(inner) = s.strip_prefix("calc(").and_then(|rest| rest.strip_suffix(')')) {
+    if let Some(inner) = s
+        .strip_prefix("calc(")
+        .and_then(|rest| rest.strip_suffix(')'))
+    {
         return parse_calc(inner).map(|expr| Value::Calc(Box::new(expr)));
     }
     if s.contains('(') && !s.starts_with("linear-gradient(") {
@@ -808,7 +830,9 @@ fn border_like_longhands(
     let mut style = None;
     for token in tokens {
         match classify_value(token) {
-            Some(v @ (Value::Length(..) | Value::Number(_) | Value::Calc(..))) if width.is_none() => {
+            Some(v @ (Value::Length(..) | Value::Number(_) | Value::Calc(..)))
+                if width.is_none() =>
+            {
                 width = Some(v)
             }
             Some(v @ Value::ColorValue(_)) if color.is_none() => color = Some(v),
@@ -818,13 +842,22 @@ fn border_like_longhands(
     }
     let mut out = Vec::new();
     if let Some(v) = width {
-        out.push(Declaration { name: width_name.to_string(), value: v });
+        out.push(Declaration {
+            name: width_name.to_string(),
+            value: v,
+        });
     }
     if let Some(v) = color {
-        out.push(Declaration { name: color_name.to_string(), value: v });
+        out.push(Declaration {
+            name: color_name.to_string(),
+            value: v,
+        });
     }
     if let Some(v) = style {
-        out.push(Declaration { name: style_name.to_string(), value: v });
+        out.push(Declaration {
+            name: style_name.to_string(),
+            value: v,
+        });
     }
     (!out.is_empty()).then_some(out)
 }
@@ -853,8 +886,10 @@ fn expand_shorthand(name: &str, raw: &str) -> Option<Vec<Declaration>> {
     }
     match name {
         "padding" | "margin" => {
-            let values: Vec<Value> =
-                tokens.iter().map(|t| classify_value(t)).collect::<Option<_>>()?;
+            let values: Vec<Value> = tokens
+                .iter()
+                .map(|t| classify_value(t))
+                .collect::<Option<_>>()?;
             let (top, right, bottom, left) = match values.as_slice() {
                 [all] => (all.clone(), all.clone(), all.clone(), all.clone()),
                 [v, h] => (v.clone(), h.clone(), v.clone(), h.clone()),
@@ -863,10 +898,22 @@ fn expand_shorthand(name: &str, raw: &str) -> Option<Vec<Declaration>> {
                 _ => return None,
             };
             Some(vec![
-                Declaration { name: format!("{name}-top"), value: top },
-                Declaration { name: format!("{name}-right"), value: right },
-                Declaration { name: format!("{name}-bottom"), value: bottom },
-                Declaration { name: format!("{name}-left"), value: left },
+                Declaration {
+                    name: format!("{name}-top"),
+                    value: top,
+                },
+                Declaration {
+                    name: format!("{name}-right"),
+                    value: right,
+                },
+                Declaration {
+                    name: format!("{name}-bottom"),
+                    value: bottom,
+                },
+                Declaration {
+                    name: format!("{name}-left"),
+                    value: left,
+                },
             ])
         }
         // Uniform on every side, which is the overwhelming common case
@@ -879,14 +926,19 @@ fn expand_shorthand(name: &str, raw: &str) -> Option<Vec<Declaration>> {
             border_like_longhands(&tokens, "outline-width", "outline-color", "outline-style")
         }
         "flex" => {
-            let values: Vec<Value> =
-                tokens.iter().map(|t| classify_value(t)).collect::<Option<_>>()?;
+            let values: Vec<Value> = tokens
+                .iter()
+                .map(|t| classify_value(t))
+                .collect::<Option<_>>()?;
             let names = ["flex-grow", "flex-shrink", "flex-basis"];
             Some(
                 values
                     .into_iter()
                     .zip(names)
-                    .map(|(value, name)| Declaration { name: name.to_string(), value })
+                    .map(|(value, name)| Declaration {
+                        name: name.to_string(),
+                        value,
+                    })
                     .collect(),
             )
         }
@@ -899,8 +951,14 @@ fn expand_shorthand(name: &str, raw: &str) -> Option<Vec<Declaration>> {
 /// declaration instead. Every other token order this grammar allows is
 /// understood.
 fn expand_background_shorthand(raw: &str) -> Option<Vec<Declaration>> {
-    const REPEAT_KEYWORDS: [&str; 6] =
-        ["repeat", "no-repeat", "repeat-x", "repeat-y", "space", "round"];
+    const REPEAT_KEYWORDS: [&str; 6] = [
+        "repeat",
+        "no-repeat",
+        "repeat-x",
+        "repeat-y",
+        "space",
+        "round",
+    ];
     let tokens = split_top_level_whitespace(raw);
     let mut out = Vec::new();
     let mut position_tokens: Vec<&str> = Vec::new();
@@ -919,7 +977,10 @@ fn expand_background_shorthand(raw: &str) -> Option<Vec<Declaration>> {
                 value: Value::Keyword(token.to_string()),
             });
         } else if let Some(v @ Value::ColorValue(_)) = classify_value(token) {
-            out.push(Declaration { name: "background-color".to_string(), value: v });
+            out.push(Declaration {
+                name: "background-color".to_string(),
+                value: v,
+            });
         } else if matches!(
             token.to_ascii_lowercase().as_str(),
             "left" | "right" | "top" | "bottom" | "center"
@@ -1026,7 +1087,9 @@ fn parse_hex_color(hex: &str) -> Option<Value> {
 /// the block *not* match, so an unsupported condition leaves the page at its
 /// base styling rather than applying rules meant for some other context.
 pub fn media_matches(condition: Option<&str>, viewport_width: f32, viewport_height: f32) -> bool {
-    let Some(condition) = condition else { return true };
+    let Some(condition) = condition else {
+        return true;
+    };
     // Commas are "or": any branch matching is enough.
     condition.split(',').any(|branch| {
         let branch = branch.trim().to_lowercase();
@@ -1055,7 +1118,9 @@ fn term_matches(term: &str, width: f32, height: f32) -> bool {
     let value = value.trim();
     match feature.trim() {
         "min-width" | "max-width" | "min-height" | "max-height" => {
-            let Some(px) = parse_px(value) else { return false };
+            let Some(px) = parse_px(value) else {
+                return false;
+            };
             match feature.trim() {
                 "min-width" => width >= px,
                 "max-width" => width <= px,
@@ -1195,7 +1260,10 @@ impl Parser {
                         return None;
                     }
                 };
-                parts.push(SelectorPart { simple: self.parse_simple_selector(), combinator });
+                parts.push(SelectorPart {
+                    simple: self.parse_simple_selector(),
+                    combinator,
+                });
             }
             if parts.iter().any(|part| part.simple.is_empty()) {
                 self.skip_block(); // an empty compound means we mis-read something
@@ -1264,11 +1332,11 @@ impl Parser {
     fn parse_pseudo(&mut self, selector: &mut SimpleSelector) -> bool {
         let start = self.pos;
         self.consume_char(); // ':'
-        // A pseudo-*element* is a box the page is asking the engine to make,
-        // not a condition on this one. `::before`/`::after` carry real content
-        // on real sites — bullets, quote marks, disclosure arrows — so they are
-        // recorded and generated. Anything else is still a selector we would
-        // only half understand, and the rule goes.
+                             // A pseudo-*element* is a box the page is asking the engine to make,
+                             // not a condition on this one. `::before`/`::after` carry real content
+                             // on real sites — bullets, quote marks, disclosure arrows — so they are
+                             // recorded and generated. Anything else is still a selector we would
+                             // only half understand, and the rule goes.
         if self.next_char_or('\0') == ':' {
             self.consume_char();
             let name = self.parse_identifier().to_ascii_lowercase();
@@ -1327,7 +1395,10 @@ impl Parser {
                 None => Pseudo::Never,
             },
             ("not", Some(inner)) => {
-                let mut sub = Parser { pos: 0, input: inner.to_string() };
+                let mut sub = Parser {
+                    pos: 0,
+                    input: inner.to_string(),
+                };
                 let inner = sub.parse_simple_selector();
                 // `:not(a, b)` and `:not(div p)` need more than one compound.
                 if inner.is_empty() || sub.pos < sub.input.len() {
@@ -1344,9 +1415,10 @@ impl Parser {
             // States nothing here tracks. Matching nothing keeps the base rule
             // in force, which is what an unstyled-but-visited link should look
             // like; dropping the rule would lose the base declaration too.
-            ("visited" | "active" | "focus" | "focus-within" | "focus-visible" | "target", None) => {
-                Pseudo::Never
-            }
+            (
+                "visited" | "active" | "focus" | "focus-within" | "focus-visible" | "target",
+                None,
+            ) => Pseudo::Never,
             _ => {
                 self.pos = start;
                 return false;
@@ -1367,7 +1439,11 @@ impl Parser {
         }
         if self.starts_with("]") {
             self.consume_char();
-            return Some(AttrTest { name, op: AttrOp::Exists, value: String::new() });
+            return Some(AttrTest {
+                name,
+                op: AttrOp::Exists,
+                value: String::new(),
+            });
         }
         let op = match self.next_char_or('\0') {
             '=' => AttrOp::Equals,
@@ -1436,7 +1512,10 @@ impl Parser {
                     || raw.contains("var(")
                     || RAW_VALUE_PROPERTIES.contains(&name.as_str())
                 {
-                    declarations.push(Declaration { name, value: Value::Raw(raw.to_string()) });
+                    declarations.push(Declaration {
+                        name,
+                        value: Value::Raw(raw.to_string()),
+                    });
                 } else if let Some(value) = classify_value(raw) {
                     declarations.push(Declaration { name, value });
                 } else if let Some(expanded) = expand_shorthand(&name, raw) {
@@ -1627,21 +1706,35 @@ mod tests {
     #[test]
     fn multi_value_shorthands_expand_into_the_longhands_layout_reads() {
         let find = |d: &[Declaration], name: &str| {
-            d.iter().find(|decl| decl.name == name).map(|decl| decl.value.clone())
+            d.iter()
+                .find(|decl| decl.name == name)
+                .map(|decl| decl.value.clone())
         };
 
         let s = parse(".a { padding: 10px 20px; }".to_string());
         let d = &s.rules[0].declarations;
         assert_eq!(find(d, "padding-top"), Some(Value::Length(10.0, Unit::Px)));
-        assert_eq!(find(d, "padding-right"), Some(Value::Length(20.0, Unit::Px)));
-        assert_eq!(find(d, "padding-bottom"), Some(Value::Length(10.0, Unit::Px)));
+        assert_eq!(
+            find(d, "padding-right"),
+            Some(Value::Length(20.0, Unit::Px))
+        );
+        assert_eq!(
+            find(d, "padding-bottom"),
+            Some(Value::Length(10.0, Unit::Px))
+        );
         assert_eq!(find(d, "padding-left"), Some(Value::Length(20.0, Unit::Px)));
 
         let s = parse(".a { margin: 0 auto; }".to_string());
         let d = &s.rules[0].declarations;
         assert_eq!(find(d, "margin-top"), Some(Value::Number(0.0)));
-        assert_eq!(find(d, "margin-right"), Some(Value::Keyword("auto".to_string())));
-        assert_eq!(find(d, "margin-left"), Some(Value::Keyword("auto".to_string())));
+        assert_eq!(
+            find(d, "margin-right"),
+            Some(Value::Keyword("auto".to_string()))
+        );
+        assert_eq!(
+            find(d, "margin-left"),
+            Some(Value::Keyword("auto".to_string()))
+        );
 
         let s = parse(".a { margin: 1px 2px 3px 4px; }".to_string());
         let d = &s.rules[0].declarations;
@@ -1653,10 +1746,18 @@ mod tests {
         let s = parse(".a { border: 1px solid #cccccc; }".to_string());
         let d = &s.rules[0].declarations;
         assert_eq!(find(d, "border-width"), Some(Value::Length(1.0, Unit::Px)));
-        assert_eq!(find(d, "border-style"), Some(Value::Keyword("solid".to_string())));
+        assert_eq!(
+            find(d, "border-style"),
+            Some(Value::Keyword("solid".to_string()))
+        );
         assert_eq!(
             find(d, "border-color"),
-            Some(Value::ColorValue(Color { r: 0xcc, g: 0xcc, b: 0xcc, a: 255 }))
+            Some(Value::ColorValue(Color {
+                r: 0xcc,
+                g: 0xcc,
+                b: 0xcc,
+                a: 255
+            }))
         );
 
         let s = parse(".a { flex: 1 1 0; }".to_string());
@@ -1669,22 +1770,41 @@ mod tests {
         let d = &s.rules[0].declarations;
         assert_eq!(
             find(d, "background-color"),
-            Some(Value::ColorValue(Color { r: 0xff, g: 0xff, b: 0xff, a: 255 }))
+            Some(Value::ColorValue(Color {
+                r: 0xff,
+                g: 0xff,
+                b: 0xff,
+                a: 255
+            }))
         );
-        assert_eq!(find(d, "background-image"), Some(Value::Raw("url(bg.png)".to_string())));
+        assert_eq!(
+            find(d, "background-image"),
+            Some(Value::Raw("url(bg.png)".to_string()))
+        );
 
         let s = parse(".a { outline: 3px dashed #00ff00; }".to_string());
         let d = &s.rules[0].declarations;
         assert_eq!(find(d, "outline-width"), Some(Value::Length(3.0, Unit::Px)));
-        assert_eq!(find(d, "outline-style"), Some(Value::Keyword("dashed".to_string())));
+        assert_eq!(
+            find(d, "outline-style"),
+            Some(Value::Keyword("dashed".to_string()))
+        );
         assert_eq!(
             find(d, "outline-color"),
-            Some(Value::ColorValue(Color { r: 0x00, g: 0xff, b: 0x00, a: 255 }))
+            Some(Value::ColorValue(Color {
+                r: 0x00,
+                g: 0xff,
+                b: 0x00,
+                a: 255
+            }))
         );
 
         // A single-token shorthand is untouched by expansion.
         let s = parse(".a { padding: 10px; }".to_string());
-        assert_eq!(s.rules[0].declarations[0].value, Value::Length(10.0, Unit::Px));
+        assert_eq!(
+            s.rules[0].declarations[0].value,
+            Value::Length(10.0, Unit::Px)
+        );
 
         // An unknown multi-token property still drops, as before.
         let s = parse(".a { unknown-thing: 1px 2px; }".to_string());
@@ -1718,13 +1838,27 @@ mod tests {
             800.0 - 250.0
         );
         // Precedence: * binds tighter than -.
-        assert_eq!(classify_value("calc(10px + 2 * 5px)").unwrap().resolve(ctx), 20.0);
+        assert_eq!(
+            classify_value("calc(10px + 2 * 5px)").unwrap().resolve(ctx),
+            20.0
+        );
         // Parens override precedence, and nesting works.
-        assert_eq!(classify_value("calc((10px + 2px) * 3)").unwrap().resolve(ctx), 36.0);
+        assert_eq!(
+            classify_value("calc((10px + 2px) * 3)")
+                .unwrap()
+                .resolve(ctx),
+            36.0
+        );
         // A unary minus on a term, not just a binary subtraction.
-        assert_eq!(classify_value("calc(100px + -20px)").unwrap().resolve(ctx), 80.0);
+        assert_eq!(
+            classify_value("calc(100px + -20px)").unwrap().resolve(ctx),
+            80.0
+        );
         // Division.
-        assert_eq!(classify_value("calc(100px / 4)").unwrap().resolve(ctx), 25.0);
+        assert_eq!(
+            classify_value("calc(100px / 4)").unwrap().resolve(ctx),
+            25.0
+        );
         // Garbage inside calc() must not silently become some other value.
         assert!(classify_value("calc(100px +)").is_none());
     }
@@ -1801,7 +1935,12 @@ mod tests {
         assert_eq!(sheet.rules.len(), 3);
         assert_eq!(
             sheet.rules[0].declarations[0].value,
-            Value::ColorValue(Color { r: 255, g: 0, b: 0, a: 255 })
+            Value::ColorValue(Color {
+                r: 255,
+                g: 0,
+                b: 0,
+                a: 255
+            })
         );
         // `.b /* x */ .c` is a descendant selector, not three compounds.
         assert_eq!(sheet.rules[1].selectors[0].parts.len(), 2);
@@ -1816,12 +1955,20 @@ mod tests {
         assert!(media_matches(Some("(max-width: 600px)"), 400.0, 800.0));
         assert!(!media_matches(Some("(max-width: 600px)"), 900.0, 800.0));
         // `and` requires both; a comma is `or`.
-        assert!(!media_matches(Some("screen and (min-width: 900px)"), 400.0, 800.0));
+        assert!(!media_matches(
+            Some("screen and (min-width: 900px)"),
+            400.0,
+            800.0
+        ));
         assert!(media_matches(Some("print, screen"), 400.0, 800.0));
         // em/rem conditions resolve against the initial font size.
         assert!(media_matches(Some("(min-width: 20em)"), 400.0, 800.0));
         // A feature we cannot judge must not switch styles on.
-        assert!(!media_matches(Some("(prefers-color-scheme: dark)"), 400.0, 800.0));
+        assert!(!media_matches(
+            Some("(prefers-color-scheme: dark)"),
+            400.0,
+            800.0
+        ));
     }
 
     #[test]
@@ -1833,11 +1980,23 @@ mod tests {
 
     #[test]
     fn orientation_compares_width_against_height() {
-        assert!(media_matches(Some("(orientation: landscape)"), 800.0, 600.0));
-        assert!(!media_matches(Some("(orientation: portrait)"), 800.0, 600.0));
+        assert!(media_matches(
+            Some("(orientation: landscape)"),
+            800.0,
+            600.0
+        ));
+        assert!(!media_matches(
+            Some("(orientation: portrait)"),
+            800.0,
+            600.0
+        ));
         assert!(media_matches(Some("(orientation: portrait)"), 400.0, 800.0));
         // Square counts as landscape (width >= height), matching browser behavior.
-        assert!(media_matches(Some("(orientation: landscape)"), 500.0, 500.0));
+        assert!(media_matches(
+            Some("(orientation: landscape)"),
+            500.0,
+            500.0
+        ));
     }
 
     #[test]
@@ -1854,8 +2013,16 @@ mod tests {
 
     #[test]
     fn prefers_color_scheme_reports_light_until_a_real_theme_signal_exists() {
-        assert!(media_matches(Some("(prefers-color-scheme: light)"), 400.0, 800.0));
-        assert!(!media_matches(Some("(prefers-color-scheme: dark)"), 400.0, 800.0));
+        assert!(media_matches(
+            Some("(prefers-color-scheme: light)"),
+            400.0,
+            800.0
+        ));
+        assert!(!media_matches(
+            Some("(prefers-color-scheme: dark)"),
+            400.0,
+            800.0
+        ));
     }
 
     #[test]
@@ -1905,7 +2072,10 @@ mod tests {
         assert_eq!(color("rgb(1, 2)"), None);
         assert_eq!(color("notacolor"), None);
         // A keyword that is not a colour still parses as a keyword.
-        assert_eq!(classify_value("block"), Some(Value::Keyword("block".into())));
+        assert_eq!(
+            classify_value("block"),
+            Some(Value::Keyword("block".into()))
+        );
     }
 
     #[test]
@@ -1922,7 +2092,6 @@ mod tests {
         assert_eq!(chain.specificity(), (0, 0, 4));
     }
 }
-
 
 #[cfg(test)]
 mod font_face_tests {
@@ -1952,9 +2121,17 @@ mod font_face_tests {
             ["helvetica neue", "arial", "sans-serif"]
         );
         // A face declaring neither a name nor a file is not a face.
-        assert!(parse("@font-face { font-weight: 700; }".to_string()).font_faces.is_empty());
-        assert!(parse("@font-face { font-family: X; }".to_string()).font_faces.is_empty());
+        assert!(parse("@font-face { font-weight: 700; }".to_string())
+            .font_faces
+            .is_empty());
+        assert!(parse("@font-face { font-family: X; }".to_string())
+            .font_faces
+            .is_empty());
         // And an unknown at-rule is still skipped whole, not parsed as one.
-        assert!(parse("@supports (x:y) { p { color: #ff0000; } }".to_string()).rules.is_empty());
+        assert!(
+            parse("@supports (x:y) { p { color: #ff0000; } }".to_string())
+                .rules
+                .is_empty()
+        );
     }
 }

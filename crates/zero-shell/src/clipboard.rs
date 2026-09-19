@@ -23,7 +23,9 @@ mod backend {
     use windows_sys::Win32::System::DataExchange::{
         CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
     };
-    use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+    use windows_sys::Win32::System::Memory::{
+        GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE,
+    };
 
     /// `CF_UNICODETEXT`. Naming it here costs one line and saves pulling in the
     /// whole `Win32_System_Ole` surface for a single `13`.
@@ -95,12 +97,14 @@ mod backend {
         else {
             return false;
         };
-        let Some(mut stdin) = child.stdin.take() else { return false };
+        let Some(mut stdin) = child.stdin.take() else {
+            return false;
+        };
         let written = stdin.write_all(text.as_bytes()).is_ok();
         drop(stdin); // the helper waits on EOF before it owns the selection
-        // `xclip` and `wl-copy` fork and keep serving the selection, so this
-        // returns as soon as the parent half exits — it is not a wait on the
-        // process that holds the clipboard.
+                     // `xclip` and `wl-copy` fork and keep serving the selection, so this
+                     // returns as soon as the parent half exits — it is not a wait on the
+                     // process that holds the clipboard.
         written && child.wait().map(|s| s.success()).unwrap_or(false)
     }
 }

@@ -46,7 +46,9 @@ pub fn has_scheme(s: &str) -> bool {
     match s.split_once("://") {
         Some((scheme, _)) => {
             !scheme.is_empty()
-                && scheme.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+                && scheme
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
         }
         None => false,
     }
@@ -87,7 +89,14 @@ fn cookie_header(url: &str) -> Option<String> {
 
 /// Record `Set-Cookie` headers from a response, then persist the jar.
 fn absorb_cookies(url: &str, response: &ureq::Response) {
-    store_cookies(url, response.all("set-cookie").iter().map(|h| h.to_string()).collect());
+    store_cookies(
+        url,
+        response
+            .all("set-cookie")
+            .iter()
+            .map(|h| h.to_string())
+            .collect(),
+    );
 }
 
 /// The jar half of [`absorb_cookies`], usable with headers collected elsewhere
@@ -126,7 +135,11 @@ pub struct ShellLoader {
 
 impl ShellLoader {
     pub fn new(base: String) -> ShellLoader {
-        ShellLoader { base, blocked: Rc::new(Cell::new(0)), cache: RefCell::new(HashMap::new()) }
+        ShellLoader {
+            base,
+            blocked: Rc::new(Cell::new(0)),
+            cache: RefCell::new(HashMap::new()),
+        }
     }
 }
 
@@ -165,7 +178,9 @@ impl zero_engine::ResourceLoader for ShellLoader {
                 out[i] = hit.clone();
                 continue;
             }
-            let cookies = is_url(&resolved).then(|| cookie_header(&resolved)).flatten();
+            let cookies = is_url(&resolved)
+                .then(|| cookie_header(&resolved))
+                .flatten();
             pending.push((i, resolved, cookies));
         }
 
@@ -182,7 +197,10 @@ impl zero_engine::ResourceLoader for ShellLoader {
                             scope.spawn(move || (*i, url.clone(), fetch_detached(url, cookies)))
                         })
                         .collect();
-                    handles.into_iter().filter_map(|h| h.join().ok()).collect::<Vec<_>>()
+                    handles
+                        .into_iter()
+                        .filter_map(|h| h.join().ok())
+                        .collect::<Vec<_>>()
                 })
             })
             .collect();
@@ -220,7 +238,11 @@ fn batches(
         let host = host_of(&item.1);
         let slot = out.iter().position(|batch| {
             batch.len() < WORKERS
-                && batch.iter().filter(|(_, url, _)| host_of(url) == host).count() < PER_HOST
+                && batch
+                    .iter()
+                    .filter(|(_, url, _)| host_of(url) == host)
+                    .count()
+                    < PER_HOST
         });
         match slot {
             Some(i) => out[i].push(item),
@@ -231,7 +253,12 @@ fn batches(
 }
 
 fn host_of(url: &str) -> &str {
-    url.split("://").nth(1).unwrap_or(url).split('/').next().unwrap_or("")
+    url.split("://")
+        .nth(1)
+        .unwrap_or(url)
+        .split('/')
+        .next()
+        .unwrap_or("")
 }
 
 /// A fetch with no access to shell state, so it can run on a worker thread.
@@ -268,8 +295,11 @@ fn fetch_detached(url: &str, cookies: &Option<String>) -> Option<(Vec<u8>, Vec<S
             }
             Err(_) => continue,
         };
-        let set_cookie: Vec<String> =
-            response.all("set-cookie").iter().map(|h| h.to_string()).collect();
+        let set_cookie: Vec<String> = response
+            .all("set-cookie")
+            .iter()
+            .map(|h| h.to_string())
+            .collect();
         let mut buf = Vec::new();
         if response.into_reader().read_to_end(&mut buf).is_ok() {
             return Some((buf, set_cookie));
@@ -282,7 +312,9 @@ fn fetch_detached(url: &str, cookies: &Option<String>) -> Option<(Vec<u8>, Vec<S
 /// a page load for long — an image is not worth a multi-second freeze, and a
 /// page with many of them would otherwise add up to a hang.
 fn retry_after(response: &ureq::Response) -> std::time::Duration {
-    let secs = response.header("retry-after").and_then(|v| v.trim().parse::<u64>().ok());
+    let secs = response
+        .header("retry-after")
+        .and_then(|v| v.trim().parse::<u64>().ok());
     std::time::Duration::from_millis(secs.map_or(250, |s| (s * 1000).clamp(100, 500)))
 }
 
@@ -333,7 +365,13 @@ pub fn resolve_url(base: &str, src: &str) -> String {
     }
     if base.starts_with("http") {
         let scheme = base.split("://").next().unwrap_or("https");
-        let host = base.split("://").nth(1).unwrap_or("").split('/').next().unwrap_or("");
+        let host = base
+            .split("://")
+            .nth(1)
+            .unwrap_or("")
+            .split('/')
+            .next()
+            .unwrap_or("");
         let origin = format!("{scheme}://{host}");
         if let Some(abs) = src.strip_prefix('/') {
             return format!("{origin}/{abs}");
@@ -402,7 +440,9 @@ fn try_fetch(url: &str) -> Result<String, String> {
         Err(e) => return Err(describe(&e.to_string())),
     };
     absorb_cookies(url, &response);
-    response.into_string().map_err(|e| format!("the reply could not be read ({e})"))
+    response
+        .into_string()
+        .map_err(|e| format!("the reply could not be read ({e})"))
 }
 
 /// A transport failure in words a person can act on.
@@ -437,21 +477,37 @@ pub fn load_target(target: &str) -> Fetched {
     set_partition(target);
     if !is_url(target) {
         // local: no network
-        return Fetched { url: target.to_string(), body: local_page(target), secure: true };
+        return Fetched {
+            url: target.to_string(),
+            body: local_page(target),
+            secure: true,
+        };
     }
 
     if let Some(rest) = target.strip_prefix("http://") {
         let upgraded = format!("https://{rest}");
         if let Ok(body) = try_fetch(&upgraded) {
-            return Fetched { url: upgraded, body, secure: true };
+            return Fetched {
+                url: upgraded,
+                body,
+                secure: true,
+            };
         }
         eprintln!("HTTPS upgrade failed for {target}; falling back to cleartext");
         let body = try_fetch(target).unwrap_or_else(|why| error_page(target, &why));
-        return Fetched { url: target.to_string(), body, secure: false };
+        return Fetched {
+            url: target.to_string(),
+            body,
+            secure: false,
+        };
     }
 
     let body = try_fetch(target).unwrap_or_else(|why| error_page(target, &why));
-    Fetched { url: target.to_string(), body, secure: true }
+    Fetched {
+        url: target.to_string(),
+        body,
+        secure: true,
+    }
 }
 
 /// The text of a local page file, or a page explaining why it could not be read.
@@ -481,7 +537,11 @@ pub fn local_page(path: &str) -> String {
 /// can do, rather than restating the URL they just typed.
 fn error_page(target: &str, why: &str) -> String {
     use crate::app::theme;
-    let escape = |text: &str| text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    let escape = |text: &str| {
+        text.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    };
     format!(
         "<html><head><style>\
          body{{background:{canvas};color:{text};font-size:14.5px;\
@@ -520,16 +580,28 @@ mod tests {
             resolve_url("zero://settings", "zero://settings?rail=icons"),
             "zero://settings?rail=icons"
         );
-        assert_eq!(resolve_url("zero://newtab", "https://a.com/x"), "https://a.com/x");
+        assert_eq!(
+            resolve_url("zero://newtab", "https://a.com/x"),
+            "https://a.com/x"
+        );
         assert_eq!(
             resolve_url("examples/page.html", "zero://downloads"),
             "zero://downloads"
         );
         // Relative links still resolve against their base.
-        assert_eq!(resolve_url("https://a.com/docs/x.html", "y.html"), "https://a.com/docs/y.html");
-        assert_eq!(resolve_url("https://a.com/docs/x.html", "/z"), "https://a.com/z");
+        assert_eq!(
+            resolve_url("https://a.com/docs/x.html", "y.html"),
+            "https://a.com/docs/y.html"
+        );
+        assert_eq!(
+            resolve_url("https://a.com/docs/x.html", "/z"),
+            "https://a.com/z"
+        );
         // A scheme-relative link takes the base's scheme.
-        assert_eq!(resolve_url("https://a.com/", "//b.com/x"), "https://b.com/x");
+        assert_eq!(
+            resolve_url("https://a.com/", "//b.com/x"),
+            "https://b.com/x"
+        );
     }
 
     #[test]
@@ -545,8 +617,14 @@ mod tests {
 
     #[test]
     fn failures_are_described_in_plain_words() {
-        assert_eq!(describe("Dns Failed: resolve host"), "that address could not be found");
-        assert_eq!(describe("io: timed out reading"), "the site took too long to reply");
+        assert_eq!(
+            describe("Dns Failed: resolve host"),
+            "that address could not be found"
+        );
+        assert_eq!(
+            describe("io: timed out reading"),
+            "the site took too long to reply"
+        );
         assert_eq!(
             describe("Invalid TLS certificate"),
             "the secure connection could not be established"
@@ -575,7 +653,10 @@ mod tests {
         assert_eq!(batched[1].len(), 1);
         for batch in &batched {
             assert!(batch.len() <= WORKERS);
-            let cdn = batch.iter().filter(|(_, u, _)| host_of(u) == "cdn.com").count();
+            let cdn = batch
+                .iter()
+                .filter(|(_, u, _)| host_of(u) == "cdn.com")
+                .count();
             assert!(cdn <= PER_HOST, "no host may exceed its share of a batch");
         }
     }
@@ -598,9 +679,15 @@ mod tests {
         fs::write(&file, "p{color:red}").expect("write");
 
         let loader = ShellLoader::new(dir.join("page.html").to_string_lossy().into_owned());
-        assert_eq!(loader.load("style.css").as_deref(), Some(&b"p{color:red}"[..]));
+        assert_eq!(
+            loader.load("style.css").as_deref(),
+            Some(&b"p{color:red}"[..])
+        );
         fs::remove_file(&file).expect("remove");
-        assert_eq!(loader.load("style.css").as_deref(), Some(&b"p{color:red}"[..]));
+        assert_eq!(
+            loader.load("style.css").as_deref(),
+            Some(&b"p{color:red}"[..])
+        );
 
         // A miss is remembered too, so a 404 is not retried on every render.
         assert_eq!(loader.load("missing.css"), None);
@@ -611,9 +698,18 @@ mod tests {
     #[test]
     fn resolves_relative_absolute_and_scheme_relative() {
         let base = "https://example.com/docs/page.html";
-        assert_eq!(resolve_url(base, "img.png"), "https://example.com/docs/img.png");
+        assert_eq!(
+            resolve_url(base, "img.png"),
+            "https://example.com/docs/img.png"
+        );
         assert_eq!(resolve_url(base, "/img.png"), "https://example.com/img.png");
-        assert_eq!(resolve_url(base, "//cdn.net/i.png"), "https://cdn.net/i.png");
-        assert_eq!(resolve_url(base, "https://x.com/i.png"), "https://x.com/i.png");
+        assert_eq!(
+            resolve_url(base, "//cdn.net/i.png"),
+            "https://cdn.net/i.png"
+        );
+        assert_eq!(
+            resolve_url(base, "https://x.com/i.png"),
+            "https://x.com/i.png"
+        );
     }
 }

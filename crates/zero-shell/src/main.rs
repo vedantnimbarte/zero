@@ -49,7 +49,11 @@ fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     // Started as a renderer: answer one request from the pipe and exit. This is
     // never reached in the browser process.
-    if args.first().map(|a| a == "--render-worker").unwrap_or(false) {
+    if args
+        .first()
+        .map(|a| a == "--render-worker")
+        .unwrap_or(false)
+    {
         renderer::serve();
         return;
     }
@@ -142,7 +146,11 @@ fn main() {
     };
 
     if ai_mode {
-        let doc = zero_engine::Document::load_with(&html, &css, std::rc::Rc::new(ShellLoader::new(address.clone())));
+        let doc = zero_engine::Document::load_with(
+            &html,
+            &css,
+            std::rc::Rc::new(ShellLoader::new(address.clone())),
+        );
         let ctx = ai::PageContext {
             url: address,
             text: doc.page_text(),
@@ -152,8 +160,11 @@ fn main() {
         };
         let assistant = ai::LocalAssistant;
         println!("{}", assistant.respond(&ctx));
-        println!("
-[{}]", assistant.provenance());
+        println!(
+            "
+[{}]",
+            assistant.provenance()
+        );
         return;
     }
 
@@ -209,20 +220,13 @@ fn main() {
 /// protocol is the next increment (see `renderer`'s note).
 fn render_to_png(html: &str, css: &str, out_path: &str, base: &str, find: Option<String>) {
     let loader = ShellLoader::new(base.to_string());
-    let Some(frame) = renderer::render_in_child(
-        html,
-        css,
-        800.0,
-        600.0,
-        find.as_deref(),
-        &loader,
-    ) else {
+    let Some(frame) = renderer::render_in_child(html, css, 800.0, 600.0, find.as_deref(), &loader)
+    else {
         eprintln!("the renderer process did not answer");
         return;
     };
-    let img =
-        image::RgbaImage::from_raw(frame.width as u32, frame.height as u32, frame.pixels)
-            .expect("pixel buffer size mismatch");
+    let img = image::RgbaImage::from_raw(frame.width as u32, frame.height as u32, frame.pixels)
+        .expect("pixel buffer size mismatch");
     img.save(out_path).expect("could not write PNG");
     println!("Rendered -> {out_path} ({}x{})", frame.width, frame.height);
 }

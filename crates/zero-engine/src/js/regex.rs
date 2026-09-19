@@ -311,11 +311,15 @@ fn match_seq(nodes: &[Node], text: &[char], at: usize) -> Option<usize> {
     };
     match first {
         Node::Start => (at == 0).then(|| match_seq(rest, text, at)).flatten(),
-        Node::End => (at == text.len()).then(|| match_seq(rest, text, at)).flatten(),
+        Node::End => (at == text.len())
+            .then(|| match_seq(rest, text, at))
+            .flatten(),
         Node::Boundary => {
             let before = at > 0 && is_word(text[at - 1]);
             let after = at < text.len() && is_word(text[at]);
-            (before != after).then(|| match_seq(rest, text, at)).flatten()
+            (before != after)
+                .then(|| match_seq(rest, text, at))
+                .flatten()
         }
         Node::Char(expected) => match text.get(at) {
             Some(c) if c == expected => match_seq(rest, text, at + 1),

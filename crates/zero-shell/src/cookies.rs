@@ -31,7 +31,10 @@ pub struct CookieJar {
 }
 
 fn now_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// The registrable-ish site of a URL: its host, lowercased.
@@ -47,7 +50,11 @@ pub fn site_of(url: &str) -> String {
 }
 
 fn path_of(url: &str) -> String {
-    match url.split("://").nth(1).and_then(|rest| rest.find('/').map(|i| &rest[i..])) {
+    match url
+        .split("://")
+        .nth(1)
+        .and_then(|rest| rest.find('/').map(|i| &rest[i..]))
+    {
         Some(path) => path.split(['?', '#']).next().unwrap_or("/").to_string(),
         None => "/".to_string(),
     }
@@ -60,7 +67,9 @@ fn is_secure(url: &str) -> bool {
 impl CookieJar {
     /// Record a `Set-Cookie` header seen while visiting `partition`.
     pub fn store(&mut self, partition: &str, url: &str, header: &str) {
-        let Some(cookie) = parse_set_cookie(header, url) else { return };
+        let Some(cookie) = parse_set_cookie(header, url) else {
+            return;
+        };
         let jar = self.partitions.entry(partition.to_string()).or_default();
         // A repeat name/domain/path replaces the old value, as browsers do.
         jar.retain(|c| {
@@ -103,7 +112,10 @@ impl CookieJar {
         let now = now_secs();
         let mut out = String::new();
         for (partition, jar) in &self.partitions {
-            for c in jar.iter().filter(|c| c.expires.map(|e| e > now).unwrap_or(false)) {
+            for c in jar
+                .iter()
+                .filter(|c| c.expires.map(|e| e > now).unwrap_or(false))
+            {
                 out.push_str(&format!(
                     "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                     partition,
@@ -129,18 +141,23 @@ impl CookieJar {
             if f.len() != 7 {
                 continue; // skip corrupt lines rather than dropping the file
             }
-            let Ok(expires) = f[6].parse::<u64>() else { continue };
+            let Ok(expires) = f[6].parse::<u64>() else {
+                continue;
+            };
             if expires <= now {
                 continue; // already stale
             }
-            jar.partitions.entry(f[0].to_string()).or_default().push(Cookie {
-                domain: f[1].to_string(),
-                path: f[2].to_string(),
-                name: f[3].to_string(),
-                value: f[4].to_string(),
-                secure: f[5] == "1",
-                expires: Some(expires),
-            });
+            jar.partitions
+                .entry(f[0].to_string())
+                .or_default()
+                .push(Cookie {
+                    domain: f[1].to_string(),
+                    path: f[2].to_string(),
+                    name: f[3].to_string(),
+                    value: f[4].to_string(),
+                    secure: f[5] == "1",
+                    expires: Some(expires),
+                });
         }
         jar
     }
@@ -178,7 +195,10 @@ fn month_number(name: &str) -> Option<i64> {
         "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
     ];
     let key = name.to_ascii_lowercase();
-    MONTHS.iter().position(|m| key.starts_with(m)).map(|i| i as i64 + 1)
+    MONTHS
+        .iter()
+        .position(|m| key.starts_with(m))
+        .map(|i| i as i64 + 1)
 }
 
 /// Days since 1970-01-01 (Howard Hinnant's civil-date algorithm).
@@ -233,8 +253,11 @@ fn parse_set_cookie(header: &str, url: &str) -> Option<Cookie> {
             "secure" => cookie.secure = true,
             "max-age" => {
                 if let Ok(secs) = val.parse::<i64>() {
-                    cookie.expires =
-                        Some(if secs <= 0 { 0 } else { now_secs().saturating_add(secs as u64) });
+                    cookie.expires = Some(if secs <= 0 {
+                        0
+                    } else {
+                        now_secs().saturating_add(secs as u64)
+                    });
                 }
             }
             // Max-Age wins over Expires when both are present, so only fill a gap.
@@ -258,7 +281,10 @@ mod tests {
     fn stores_and_returns_cookies_for_matching_requests() {
         let mut jar = CookieJar::default();
         jar.store("shop.test", "https://shop.test/login", "sid=abc; Path=/");
-        assert_eq!(jar.header_for("shop.test", "https://shop.test/account"), Some("sid=abc".into()));
+        assert_eq!(
+            jar.header_for("shop.test", "https://shop.test/account"),
+            Some("sid=abc".into())
+        );
         // A different host in the same partition doesn't get it.
         assert_eq!(jar.header_for("shop.test", "https://other.test/"), None);
     }
@@ -270,8 +296,14 @@ mod tests {
         jar.store("a.com", "https://tracker.test/px", "id=from-a");
         jar.store("b.com", "https://tracker.test/px", "id=from-b");
         // Each partition sees only its own value, so the two visits can't be joined.
-        assert_eq!(jar.header_for("a.com", "https://tracker.test/px"), Some("id=from-a".into()));
-        assert_eq!(jar.header_for("b.com", "https://tracker.test/px"), Some("id=from-b".into()));
+        assert_eq!(
+            jar.header_for("a.com", "https://tracker.test/px"),
+            Some("id=from-a".into())
+        );
+        assert_eq!(
+            jar.header_for("b.com", "https://tracker.test/px"),
+            Some("id=from-b".into())
+        );
         assert_eq!(jar.header_for("c.com", "https://tracker.test/px"), None);
     }
 
@@ -283,12 +315,21 @@ mod tests {
         jar.store("x.test", "https://x.test/", "gone=1; Max-Age=0");
 
         // Path-scoped cookies only go to matching paths.
-        assert_eq!(jar.header_for("x.test", "https://x.test/admin/panel"), Some("deep=1; tls=1".into()));
-        assert_eq!(jar.header_for("x.test", "https://x.test/other"), Some("tls=1".into()));
+        assert_eq!(
+            jar.header_for("x.test", "https://x.test/admin/panel"),
+            Some("deep=1; tls=1".into())
+        );
+        assert_eq!(
+            jar.header_for("x.test", "https://x.test/other"),
+            Some("tls=1".into())
+        );
         // Secure cookies never travel over cleartext.
         assert_eq!(jar.header_for("x.test", "http://x.test/other"), None);
         // Max-Age=0 is a deletion.
-        assert!(!jar.header_for("x.test", "https://x.test/").unwrap_or_default().contains("gone"));
+        assert!(!jar
+            .header_for("x.test", "https://x.test/")
+            .unwrap_or_default()
+            .contains("gone"));
     }
 
     #[test]
@@ -297,12 +338,22 @@ mod tests {
         jar.store("evil.test", "https://evil.test/", "a=1; Domain=example.com");
         // The Domain attribute is ignored, so the cookie stays on evil.test.
         assert_eq!(jar.header_for("evil.test", "https://example.com/"), None);
-        assert_eq!(jar.header_for("evil.test", "https://evil.test/"), Some("a=1".into()));
+        assert_eq!(
+            jar.header_for("evil.test", "https://evil.test/"),
+            Some("a=1".into())
+        );
 
         // Widening to a real parent domain is allowed.
         let mut jar = CookieJar::default();
-        jar.store("app.example.com", "https://app.example.com/", "b=2; Domain=example.com");
-        assert_eq!(jar.header_for("app.example.com", "https://api.example.com/"), Some("b=2".into()));
+        jar.store(
+            "app.example.com",
+            "https://app.example.com/",
+            "b=2; Domain=example.com",
+        );
+        assert_eq!(
+            jar.header_for("app.example.com", "https://api.example.com/"),
+            Some("b=2".into())
+        );
     }
 
     #[test]
@@ -310,9 +361,15 @@ mod tests {
         // The epoch itself.
         assert_eq!(parse_http_date("Thu, 01 Jan 1970 00:00:00 GMT"), Some(0));
         // A known instant: 2021-01-01T00:00:00Z.
-        assert_eq!(parse_http_date("Fri, 01 Jan 2021 00:00:00 GMT"), Some(1_609_459_200));
+        assert_eq!(
+            parse_http_date("Fri, 01 Jan 2021 00:00:00 GMT"),
+            Some(1_609_459_200)
+        );
         // Leap day arithmetic.
-        assert_eq!(parse_http_date("Sat, 29 Feb 2020 12:00:00 GMT"), Some(1_582_977_600));
+        assert_eq!(
+            parse_http_date("Sat, 29 Feb 2020 12:00:00 GMT"),
+            Some(1_582_977_600)
+        );
         // Junk is rejected, not guessed at.
         assert!(parse_http_date("not a date").is_none());
         assert!(parse_http_date("Wed, 45 Xxx 2027 11:53:18 GMT").is_none());
@@ -321,10 +378,21 @@ mod tests {
     #[test]
     fn expires_dates_make_cookies_persistent() {
         let mut jar = CookieJar::default();
-        jar.store("g.test", "https://g.test/", "a=1; expires=Wed, 21 Jul 2100 11:53:18 GMT");
-        assert_eq!(jar.header_for("g.test", "https://g.test/"), Some("a=1".into()));
+        jar.store(
+            "g.test",
+            "https://g.test/",
+            "a=1; expires=Wed, 21 Jul 2100 11:53:18 GMT",
+        );
+        assert_eq!(
+            jar.header_for("g.test", "https://g.test/"),
+            Some("a=1".into())
+        );
         // A date in the past deletes instead.
-        jar.store("g.test", "https://g.test/", "a=1; expires=Wed, 21 Jul 2000 11:53:18 GMT");
+        jar.store(
+            "g.test",
+            "https://g.test/",
+            "a=1; expires=Wed, 21 Jul 2000 11:53:18 GMT",
+        );
         assert_eq!(jar.header_for("g.test", "https://g.test/"), None);
     }
 
@@ -340,7 +408,14 @@ mod tests {
         jar.save(&dir);
 
         let loaded = CookieJar::load(&dir);
-        assert_eq!(loaded.len(), 1, "session cookies must not survive a restart");
-        assert_eq!(loaded.header_for("s.test", "https://s.test/"), Some("keep=1".into()));
+        assert_eq!(
+            loaded.len(),
+            1,
+            "session cookies must not survive a restart"
+        );
+        assert_eq!(
+            loaded.header_for("s.test", "https://s.test/"),
+            Some("keep=1".into())
+        );
     }
 }

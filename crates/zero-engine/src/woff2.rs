@@ -66,7 +66,10 @@ fn pack(sfnt_version: u32, tables: &[(u32, Vec<u8>)]) -> Vec<u8> {
     }
     for (_, data) in tables {
         out.extend_from_slice(data);
-        out.resize(out.len() + (padded_len(data.len()) as usize - data.len()), 0);
+        out.resize(
+            out.len() + (padded_len(data.len()) as usize - data.len()),
+            0,
+        );
     }
     out
 }
@@ -104,9 +107,9 @@ mod tests {
     #[test]
     fn the_sfnt_header_describes_the_directory_it_writes() {
         let tables = vec![
-            (u32::from_be_bytes(*b"cmap"), vec![1, 2, 3]),  // 3 bytes, pads to 4
+            (u32::from_be_bytes(*b"cmap"), vec![1, 2, 3]), // 3 bytes, pads to 4
             (u32::from_be_bytes(*b"glyf"), vec![4; 8]),
-            (u32::from_be_bytes(*b"head"), vec![5; 5]),     // 5 bytes, pads to 8
+            (u32::from_be_bytes(*b"head"), vec![5; 5]), // 5 bytes, pads to 8
         ];
         let out = pack(0x0001_0000, &tables);
 

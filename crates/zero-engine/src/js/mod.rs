@@ -4,10 +4,10 @@
 //! A bytecode VM with inline caches (Phase 2) and a baseline JIT (Phase 3) come later.
 
 pub mod dom;
-pub mod regex;
 pub mod interp;
 pub mod lexer;
 pub mod parser;
+pub mod regex;
 
 pub use dom::{DomView, ElementInfo, Mutation};
 pub use interp::Output;
@@ -66,8 +66,7 @@ mod tests {
 
     #[test]
     fn var_hoists_past_blocks_but_let_and_const_stay_inside_them() {
-        let out = run(
-            "function f() {
+        let out = run("function f() {
                  if (true) {
                      var hoisted = 'v';
                      let blocked = 'l';
@@ -75,8 +74,7 @@ mod tests {
                  console.log(hoisted); // var: visible outside the if
                  console.log(typeof blocked); // let: gone with the block
              }
-             f();",
-        );
+             f();");
         assert!(out.errors.is_empty(), "{:?}", out.errors);
         assert_eq!(out.console, vec!["v", "undefined"]);
     }
@@ -93,12 +91,10 @@ mod tests {
 
     #[test]
     fn const_is_still_readable_and_block_scoped_the_same_as_let() {
-        let out = run(
-            "if (true) {
+        let out = run("if (true) {
                  const x = 42;
                  console.log(x);
-             }",
-        );
+             }");
         assert!(out.errors.is_empty(), "{:?}", out.errors);
         assert_eq!(out.console, vec!["42"]);
     }
@@ -109,8 +105,7 @@ mod tests {
         // loop body, or nested several deep — `var` always climbs to the
         // nearest function (or global) scope, not just the block right
         // around it.
-        let out = run(
-            "function f() {
+        let out = run("function f() {
                  for (var i = 0; i < 3; i++) {
                      if (i == 1) {
                          var found = 'yes';
@@ -118,8 +113,7 @@ mod tests {
                  }
                  return found;
              }
-             console.log(f());",
-        );
+             console.log(f());");
         assert!(out.errors.is_empty(), "{:?}", out.errors);
         assert_eq!(out.console, vec!["yes"]);
     }
@@ -128,16 +122,14 @@ mod tests {
     fn break_leaves_the_loop_continue_skips_to_the_next_iteration() {
         // `for (var i ...)` hoists `i` to the function/global scope, so it's
         // still readable after the loop — real `var` semantics.
-        let out = run(
-            "var seen = '';
+        let out = run("var seen = '';
              for (var i = 0; i < 10; i++) {
                  if (i == 5) { break; }
                  if (i % 2 == 0) { continue; }
                  seen += i;
              }
              console.log(seen);
-             console.log(i);",
-        );
+             console.log(i);");
         assert!(out.errors.is_empty(), "{:?}", out.errors);
         // 0,2,4 skipped by `continue`; 5 and up never reached because of `break`.
         assert_eq!(out.console, vec!["13", "5"]);
@@ -147,22 +139,19 @@ mod tests {
     fn continue_in_a_for_loop_still_runs_the_step() {
         // If `continue` skipped the increment too, this would loop forever
         // (i never reaches 3) and hit the interpreter's own runaway-loop guard.
-        let out = run(
-            "var count = 0;
+        let out = run("var count = 0;
              for (var i = 0; i < 3; i++) {
                  if (i == 1) { continue; }
                  count++;
              }
-             console.log(count);",
-        );
+             console.log(count);");
         assert!(out.errors.is_empty(), "{:?}", out.errors);
         assert_eq!(out.console, vec!["2"]); // i=0 and i=2 counted; i=1 skipped
     }
 
     #[test]
     fn break_and_continue_unwind_through_nested_blocks_but_not_nested_loops() {
-        let out = run(
-            "var log = '';
+        let out = run("var log = '';
              while (true) {
                  // A block, then an if, then another block — break has to
                  // unwind through all of it to reach this loop, not the
@@ -185,8 +174,7 @@ mod tests {
                      rows += r + '' + c;
                  }
              }
-             console.log(rows);",
-        );
+             console.log(rows);");
         assert!(out.errors.is_empty(), "{:?}", out.errors);
         assert_eq!(out.console, vec!["x", "00011011"]);
     }
@@ -306,14 +294,12 @@ mod tests {
     fn catch_receives_the_real_thrown_value_not_a_stringified_message() {
         // A thrown object arrives in `catch` as that same object — its own
         // fields intact — not flattened into a string first.
-        let out = run(
-            "try {
+        let out = run("try {
                  throw { code: 42, note: 'custom' };
              } catch (e) {
                  console.log(e.code);
                  console.log(e.note);
-             }",
-        );
+             }");
         assert!(out.errors.is_empty(), "{:?}", out.errors);
         assert_eq!(out.console, vec!["42", "custom"]);
     }
@@ -324,14 +310,12 @@ mod tests {
         // string; it now raises the same shape of object `throw new
         // Error(...)` would (`.name`, `.message`) — a real `ReferenceError`,
         // not a string that happens to describe one.
-        let out = run(
-            "try {
+        let out = run("try {
                  nope();
              } catch (e) {
                  console.log(e.name);
                  console.log(e.message);
-             }",
-        );
+             }");
         assert!(out.errors.is_empty(), "{:?}", out.errors);
         assert_eq!(out.console, vec!["ReferenceError", "nope is not defined"]);
     }
@@ -344,15 +328,16 @@ mod tests {
 
     #[test]
     fn new_error_and_its_named_variants_are_real_constructors() {
-        let out = run(
-            "try { throw new TypeError('bad input'); }
+        let out = run("try { throw new TypeError('bad input'); }
              catch (e) { console.log(e.name); console.log(e.message); }
 
              try { throw new Error('plain'); }
-             catch (e) { console.log(e.name); console.log(e.message); }",
-        );
+             catch (e) { console.log(e.name); console.log(e.message); }");
         assert!(out.errors.is_empty(), "{:?}", out.errors);
-        assert_eq!(out.console, vec!["TypeError", "bad input", "Error", "plain"]);
+        assert_eq!(
+            out.console,
+            vec!["TypeError", "bad input", "Error", "plain"]
+        );
     }
 
     #[test]
@@ -439,7 +424,13 @@ mod tests {
 
         // Syntax the matcher cannot honour is refused, not guessed at.
         let out = run("console.log(/(?<n>a)/.test('a'));");
-        assert!(out.errors.iter().any(|e| e.contains("unsupported regular expression")), "{:?}", out.errors);
+        assert!(
+            out.errors
+                .iter()
+                .any(|e| e.contains("unsupported regular expression")),
+            "{:?}",
+            out.errors
+        );
     }
 
     #[test]
@@ -689,7 +680,10 @@ mod tests {
         // is readable through `getItem` — the thing a plain object could not do.
         assert_eq!(doc.console[0], "3");
         assert_eq!(doc.console[1], "a c null", "key() past the end is null");
-        assert_eq!(doc.console[2], "1 2 3", "values coerce to strings on the way in");
+        assert_eq!(
+            doc.console[2], "1 2 3",
+            "values coerce to strings on the way in"
+        );
         // The web draws this distinction and scripts feature-detect on it.
         assert_eq!(doc.console[3], "undefined null");
         assert_eq!(store.0.borrow().get("c").map(String::as_str), Some("3"));
@@ -716,7 +710,10 @@ mod tests {
         );
         assert_eq!(doc.console[0], "L S");
         assert_eq!(doc.console[1], "1 1");
-        assert_eq!(doc.console[2], "L undefined", "clearing one must not touch the other");
+        assert_eq!(
+            doc.console[2], "L undefined",
+            "clearing one must not touch the other"
+        );
     }
 
     /// A store that accepts nothing, standing in for a full area.
@@ -756,7 +753,10 @@ mod tests {
         // embedder, not quietly drop a property off a local object.
         assert_eq!(doc.console[1], "false null");
         assert_eq!(doc.console[2], "0");
-        assert!(store.0.borrow().is_empty(), "both keys should be gone from the store itself");
+        assert!(
+            store.0.borrow().is_empty(),
+            "both keys should be gone from the store itself"
+        );
     }
 
     #[test]
@@ -777,7 +777,10 @@ mod tests {
         let store = Rc::new(MemStore::default());
         let page = "<html><body><script>            localStorage.setItem('a', '1');            var seen = 0;            for (var k in localStorage) { seen = seen + 1; localStorage.setItem(k + 'x', '1'); }            console.log(seen);            </script></body></html>";
         let doc = crate::Document::load_hosted(page, "", None, Some(store), None);
-        assert_eq!(doc.console[0], "1", "the walk is over the keys present when it started");
+        assert_eq!(
+            doc.console[0], "1",
+            "the walk is over the keys present when it started"
+        );
     }
 
     #[test]
@@ -831,13 +834,8 @@ mod tests {
             try { localStorage.removeItem(); } catch (e) { console.log(e.name); }\
             try { localStorage.key(); } catch (e) { console.log(e.name); }\
             </script></body></html>";
-        let doc = crate::Document::load_hosted(
-            page,
-            "",
-            None,
-            Some(Rc::new(MemStore::default())),
-            None,
-        );
+        let doc =
+            crate::Document::load_hosted(page, "", None, Some(Rc::new(MemStore::default())), None);
         assert_eq!(doc.console, vec!["TypeError"; 4]);
     }
 
@@ -852,11 +850,19 @@ mod tests {
         let mut doc = crate::Document::load_hosted(page, "", None, None, None);
 
         assert!(
-            doc.storage_event(Some("token"), Some("old"), Some("new"), "https://example.com/"),
+            doc.storage_event(
+                Some("token"),
+                Some("old"),
+                Some("new"),
+                "https://example.com/"
+            ),
             "a registered listener should report that it ran"
         );
         assert_eq!(doc.console[0], "token old new https://example.com/");
-        assert_eq!(doc.console[1], "object", "storageArea should be the store itself");
+        assert_eq!(
+            doc.console[1], "object",
+            "storageArea should be the store itself"
+        );
 
         // `clear()` is announced with a null key and no values.
         doc.storage_event(None, None, None, "https://example.com/");
@@ -918,8 +924,7 @@ mod tests {
 
     #[test]
     fn promises_settle_and_await_unwraps_them() {
-        let out = run(
-            "async function load() { return 41; }
+        let out = run("async function load() { return 41; }
              async function main() {
                var n = await load();
                console.log(n + 1);
@@ -930,20 +935,17 @@ mod tests {
              main();
              Promise.resolve('chain')
                .then(function (v) { return v + '!'; })
-               .then(function (v) { console.log(v); });",
-        );
+               .then(function (v) { console.log(v); });");
         assert!(out.errors.is_empty(), "{:?}", out.errors);
         assert_eq!(out.console, vec!["42", "caught nope", "1-2", "chain!"]);
     }
 
     #[test]
     fn a_rejected_promise_throws_where_it_is_awaited() {
-        let out = run(
-            "async function main() {
+        let out = run("async function main() {
                try { await Promise.reject('boom'); } catch (e) { console.log('caught ' + e); }
              }
-             main();",
-        );
+             main();");
         assert!(out.errors.is_empty(), "{:?}", out.errors);
         assert_eq!(out.console, vec!["caught boom"]);
     }

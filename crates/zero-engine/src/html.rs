@@ -345,7 +345,10 @@ fn decode_one(body: &str) -> Option<char> {
         };
         return char::from_u32(code);
     }
-    ENTITIES.iter().find(|(name, _)| *name == body).map(|(_, c)| *c)
+    ENTITIES
+        .iter()
+        .find(|(name, _)| *name == body)
+        .map(|(_, c)| *c)
 }
 
 #[cfg(test)]

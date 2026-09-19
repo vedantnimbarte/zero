@@ -221,7 +221,9 @@ fn matches_chain<E: Matchable>(
     parts: &[SelectorPart],
     hovered: &HoverChain,
 ) -> bool {
-    let Some((subject, rest)) = parts.split_last() else { return true };
+    let Some((subject, rest)) = parts.split_last() else {
+        return true;
+    };
     if !matches_simple_selector(cursor.elem(), &subject.simple, hovered) {
         return false;
     }
@@ -256,13 +258,21 @@ fn matches_simple_selector<E: Matchable>(
     if selector.tag_name.iter().any(|name| elem.tag() != name) {
         return false;
     }
-    if selector.id.iter().any(|id| elem.elem_id() != Some(id.as_str())) {
+    if selector
+        .id
+        .iter()
+        .any(|id| elem.elem_id() != Some(id.as_str()))
+    {
         return false;
     }
     if selector.class.iter().any(|class| !elem.has_class(class)) {
         return false;
     }
-    if !selector.attrs.iter().all(|test| test.matches(elem.attr(&test.name))) {
+    if !selector
+        .attrs
+        .iter()
+        .all(|test| test.matches(elem.attr(&test.name)))
+    {
         return false;
     }
     selector
@@ -278,9 +288,11 @@ fn matches_pseudo<E: Matchable>(elem: &E, pseudo: &Pseudo, hovered: &HoverChain)
         Pseudo::NthChild(a, b) => nth_matches(*a, *b, pos.index),
         Pseudo::NthLastChild(a, b) => nth_matches(*a, *b, pos.count + 1 - pos.index.min(pos.count)),
         Pseudo::NthOfType(a, b) => nth_matches(*a, *b, pos.type_index),
-        Pseudo::NthLastOfType(a, b) => {
-            nth_matches(*a, *b, pos.type_count + 1 - pos.type_index.min(pos.type_count))
-        }
+        Pseudo::NthLastOfType(a, b) => nth_matches(
+            *a,
+            *b,
+            pos.type_count + 1 - pos.type_index.min(pos.type_count),
+        ),
         Pseudo::OnlyChild => pos.count == 1,
         Pseudo::OnlyOfType => pos.type_count == 1,
         Pseudo::Not(inner) => !matches_simple_selector(elem, inner, hovered),
@@ -424,7 +436,10 @@ fn specified_values(
             None => "",
         };
         for declaration in &rule.declarations {
-            values.insert(format!("{prefix}{}", declaration.name), declaration.value.clone());
+            values.insert(
+                format!("{prefix}{}", declaration.name),
+                declaration.value.clone(),
+            );
         }
     }
     // An inline `style` attribute is the last word in the cascade, whatever any
@@ -495,7 +510,11 @@ fn parse_attr_color(value: &str) -> Option<Value> {
 /// `width="120"` means pixels; `width="85%"` is a percentage.
 fn parse_attr_length(value: &str) -> Option<Value> {
     match value.strip_suffix('%') {
-        Some(number) => number.trim().parse().ok().map(|n| Value::Length(n, Unit::Percent)),
+        Some(number) => number
+            .trim()
+            .parse()
+            .ok()
+            .map(|n| Value::Length(n, Unit::Percent)),
         None => value.parse().ok().map(|n| Value::Length(n, Unit::Px)),
     }
 }
@@ -775,7 +794,12 @@ mod tests {
         node.value("color")
     }
 
-    const RED: Value = Value::ColorValue(crate::css::Color { r: 255, g: 0, b: 0, a: 255 });
+    const RED: Value = Value::ColorValue(crate::css::Color {
+        r: 255,
+        g: 0,
+        b: 0,
+        a: 255,
+    });
 
     /// Elements come out of the parser unnumbered; the Document assigns ids
     /// normally, so a bare tree has to be numbered before ids mean anything.
@@ -842,8 +866,8 @@ mod tests {
         assert_eq!(by_id[0].px("width", 0.0), Some(400.0)); // no attribute: the rule stands
         assert_eq!(by_id[1].px("width", 0.0), Some(120.0));
         assert_eq!(by_id[2].px("width", 0.0), Some(200.0)); // `var()` resolves inline too
-        // A declaration the parser cannot read must not swallow the ones after
-        // it — a page's inline styles are often machine-written and untidy.
+                                                            // A declaration the parser cannot read must not swallow the ones after
+                                                            // it — a page's inline styles are often machine-written and untidy.
         assert_eq!(by_id[3].px("width", 0.0), Some(300.0));
     }
 
@@ -854,8 +878,18 @@ mod tests {
         let mut dom = crate::html::parse(html.to_string());
         number_elements(&mut dom, &mut 0);
         let sheet = crate::css::parse(css.to_string());
-        let black = Value::ColorValue(crate::css::Color { r: 0, g: 0, b: 0, a: 255 });
-        let red = Value::ColorValue(crate::css::Color { r: 255, g: 0, b: 0, a: 255 });
+        let black = Value::ColorValue(crate::css::Color {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 255,
+        });
+        let red = Value::ColorValue(crate::css::Color {
+            r: 255,
+            g: 0,
+            b: 0,
+            a: 255,
+        });
 
         let id_of = |node: &Node| match &node.node_type {
             NodeType::Element(e) => e.node_id,
@@ -886,27 +920,38 @@ mod tests {
         let styled = style_tree(&dom, &sheet);
         let fields = elements(&styled);
         let color = |i: usize| fields[i].value("color");
-        let rgb = |r, g, b| {
-            Some(Value::ColorValue(crate::css::Color { r, g, b, a: 255 }))
-        };
+        let rgb = |r, g, b| Some(Value::ColorValue(crate::css::Color { r, g, b, a: 255 }));
 
         assert_eq!(color(0), rgb(255, 0, 0)); // [type=text]
         assert_eq!(color(1), rgb(0, 255, 0)); // input[type="submit"]
         assert_eq!(color(2), rgb(0, 0, 255)); // suffix match on href
-        // `~=` matches one word of a space-separated list.
+                                              // `~=` matches one word of a space-separated list.
         assert_eq!(
             fields[2].value("background-color"),
-            Some(Value::ColorValue(crate::css::Color { r: 17, g: 17, b: 17, a: 255 }))
+            Some(Value::ColorValue(crate::css::Color {
+                r: 17,
+                g: 17,
+                b: 17,
+                a: 255
+            }))
         );
         // Presence alone, and a prefix that does not match.
-        assert_eq!(fields[0].value("padding"), Some(Value::Length(4.0, Unit::Px)));
+        assert_eq!(
+            fields[0].value("padding"),
+            Some(Value::Length(4.0, Unit::Px))
+        );
         assert_eq!(fields[1].value("padding"), None);
     }
 
     #[test]
     fn html_attributes_style_elements_but_css_still_wins() {
         let html = "<body><td bgcolor=\"#ff6600\" width=\"85%\">head</td>                    <td bgcolor=\"ff6600\">bare hex</td>                    <td bgcolor=\"#ff6600\" class=\"over\">overridden</td></body>";
-        let orange = Value::ColorValue(crate::css::Color { r: 255, g: 102, b: 0, a: 255 });
+        let orange = Value::ColorValue(crate::css::Color {
+            r: 255,
+            g: 102,
+            b: 0,
+            a: 255,
+        });
 
         let dom = crate::html::parse(html.to_string());
         let sheet = crate::css::parse(".over { background-color: #000000; }".to_string());
@@ -923,7 +968,12 @@ mod tests {
         // A stylesheet beats a presentation hint.
         assert_eq!(
             cells[2].value("background-color"),
-            Some(Value::ColorValue(crate::css::Color { r: 0, g: 0, b: 0, a: 255 }))
+            Some(Value::ColorValue(crate::css::Color {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 255
+            }))
         );
     }
 
@@ -936,12 +986,25 @@ mod tests {
         let styled = style_tree(&dom, &sheet);
         let body = elements(&styled)[0];
 
-        let red = Value::ColorValue(crate::css::Color { r: 255, g: 0, b: 0, a: 255 });
-        let green = Value::ColorValue(crate::css::Color { r: 0, g: 255, b: 0, a: 255 });
+        let red = Value::ColorValue(crate::css::Color {
+            r: 255,
+            g: 0,
+            b: 0,
+            a: 255,
+        });
+        let green = Value::ColorValue(crate::css::Color {
+            r: 0,
+            g: 255,
+            b: 0,
+            a: 255,
+        });
         // Defined on :root, used several levels down.
         let cards = elements(body);
         assert_eq!(cards[0].value("color"), Some(red));
-        assert_eq!(cards[0].value("padding"), Some(Value::Length(12.0, Unit::Px)));
+        assert_eq!(
+            cards[0].value("padding"),
+            Some(Value::Length(12.0, Unit::Px))
+        );
         // A missing variable falls back to the value after the comma.
         assert_eq!(cards[1].value("color"), Some(green));
         // With no fallback the declaration is dropped, not left as raw text.
@@ -962,15 +1025,24 @@ mod tests {
         };
 
         // `+` is the element immediately after; `~` is any element after.
-        assert_eq!(colored("h2 + p { color: red; }"), [false, true, false, false]);
-        assert_eq!(colored("h2 ~ p { color: red; }"), [false, true, true, false]);
+        assert_eq!(
+            colored("h2 + p { color: red; }"),
+            [false, true, false, false]
+        );
+        assert_eq!(
+            colored("h2 ~ p { color: red; }"),
+            [false, true, true, false]
+        );
         // The chain above the sibling still has to hold.
         assert_eq!(
             colored("main h2 + p { color: red; }"),
             [false, false, false, false]
         );
         // Nothing precedes the first child.
-        assert_eq!(colored("p + h2 { color: red; }"), [false, false, false, false]);
+        assert_eq!(
+            colored("p + h2 { color: red; }"),
+            [false, false, false, false]
+        );
     }
 
     #[test]
@@ -988,14 +1060,23 @@ mod tests {
 
         assert_eq!(nth("li:first-child { color: red; }"), [true, false, false]);
         assert_eq!(nth("li:last-child { color: red; }"), [false, false, true]);
-        assert_eq!(nth("li:nth-child(odd) { color: red; }"), [true, false, true]);
+        assert_eq!(
+            nth("li:nth-child(odd) { color: red; }"),
+            [true, false, true]
+        );
         assert_eq!(nth("li:nth-child(2) { color: red; }"), [false, true, false]);
         // `-n+2` is the first two, and stops rather than wrapping.
-        assert_eq!(nth("li:nth-child(-n+2) { color: red; }"), [true, true, false]);
+        assert_eq!(
+            nth("li:nth-child(-n+2) { color: red; }"),
+            [true, true, false]
+        );
         assert_eq!(nth("li:not(.skip) { color: red; }"), [true, false, true]);
         assert_eq!(nth("li:only-child { color: red; }"), [false, false, false]);
         // Whitespace between the tags is a text node, and must not count.
-        assert_eq!(nth("li:nth-of-type(3) { color: red; }"), [false, false, true]);
+        assert_eq!(
+            nth("li:nth-of-type(3) { color: red; }"),
+            [false, false, true]
+        );
     }
 
     #[test]

@@ -103,7 +103,9 @@ const BUILT_IN: &str = "\
 impl Blocker {
     /// Parse filter rules, one per line. Unparseable lines are skipped.
     pub fn from_rules(text: &str) -> Blocker {
-        Blocker { rules: text.lines().filter_map(parse_rule).collect() }
+        Blocker {
+            rules: text.lines().filter_map(parse_rule).collect(),
+        }
     }
 
     /// True if this URL should not be requested.
@@ -111,10 +113,18 @@ impl Blocker {
         let host = host_of(url).unwrap_or_default();
         let matches = |r: &&Rule| rule_matches(r, url, &host);
         // An exception anywhere in the list wins, as in Adblock.
-        if self.rules.iter().filter(|r| r.exception).any(|r| matches(&r)) {
+        if self
+            .rules
+            .iter()
+            .filter(|r| r.exception)
+            .any(|r| matches(&r))
+        {
             return false;
         }
-        self.rules.iter().filter(|r| !r.exception).any(|r| matches(&r))
+        self.rules
+            .iter()
+            .filter(|r| !r.exception)
+            .any(|r| matches(&r))
     }
 
     #[cfg(test)]
@@ -191,25 +201,37 @@ fn parse_rule(line: &str) -> Option<Rule> {
     };
 
     // `^` is a separator placeholder; treat it as a wildcard boundary.
-    let parts: Vec<String> =
-        body.replace('^', "*").split('*').filter(|p| !p.is_empty()).map(str::to_string).collect();
+    let parts: Vec<String> = body
+        .replace('^', "*")
+        .split('*')
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .collect();
     // A bare domain rule needs no path parts, but every other kind does.
     if parts.is_empty() && domain.is_none() {
         return None;
     }
-    Some(Rule { anchor, domain, parts, exception })
+    Some(Rule {
+        anchor,
+        domain,
+        parts,
+        exception,
+    })
 }
 
 fn rule_matches(rule: &Rule, url: &str, host: &str) -> bool {
     match rule.anchor {
         Anchor::Domain => {
-            let Some(domain) = &rule.domain else { return false };
+            let Some(domain) = &rule.domain else {
+                return false;
+            };
             // The host itself, or any subdomain of it.
             let host_ok = host == domain || host.ends_with(&format!(".{domain}"));
             host_ok && contains_in_order(url, &rule.parts)
         }
-        Anchor::Start => url.starts_with(rule.parts[0].as_str())
-            && contains_in_order(url, &rule.parts[1..]),
+        Anchor::Start => {
+            url.starts_with(rule.parts[0].as_str()) && contains_in_order(url, &rule.parts[1..])
+        }
         Anchor::End => {
             let last = rule.parts.last().expect("checked non-empty");
             url.ends_with(last.as_str()) && contains_in_order(url, &rule.parts)
@@ -235,7 +257,12 @@ fn host_of(url: &str) -> Option<String> {
     let after_scheme = url.split("://").nth(1)?;
     let host = after_scheme.split('/').next()?;
     let host = host.rsplit('@').next()?;
-    Some(host.split(':').next()?.trim_end_matches('.').to_ascii_lowercase())
+    Some(
+        host.split(':')
+            .next()?
+            .trim_end_matches('.')
+            .to_ascii_lowercase(),
+    )
 }
 
 #[cfg(test)]

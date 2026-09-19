@@ -101,7 +101,10 @@ mod backend {
 
     /// DPAPI wants a mutable pointer even though it only reads the input.
     fn blob_of(buffer: &mut [u8]) -> CRYPT_INTEGER_BLOB {
-        CRYPT_INTEGER_BLOB { cbData: buffer.len() as u32, pbData: buffer.as_mut_ptr() }
+        CRYPT_INTEGER_BLOB {
+            cbData: buffer.len() as u32,
+            pbData: buffer.as_mut_ptr(),
+        }
     }
 
     /// Copy an output blob into owned memory and release what Windows allocated.
@@ -124,7 +127,10 @@ mod backend {
     pub fn encrypt(data: &[u8]) -> Option<Vec<u8>> {
         let mut input = data.to_vec();
         let blob_in = blob_of(&mut input);
-        let mut blob_out = CRYPT_INTEGER_BLOB { cbData: 0, pbData: core::ptr::null_mut() };
+        let mut blob_out = CRYPT_INTEGER_BLOB {
+            cbData: 0,
+            pbData: core::ptr::null_mut(),
+        };
         // SAFETY: the input blob outlives the call; the output is taken below.
         let ok = unsafe {
             CryptProtectData(
@@ -143,7 +149,10 @@ mod backend {
     pub fn decrypt(data: &[u8]) -> Option<Vec<u8>> {
         let mut input = data.to_vec();
         let blob_in = blob_of(&mut input);
-        let mut blob_out = CRYPT_INTEGER_BLOB { cbData: 0, pbData: core::ptr::null_mut() };
+        let mut blob_out = CRYPT_INTEGER_BLOB {
+            cbData: 0,
+            pbData: core::ptr::null_mut(),
+        };
         // SAFETY: as above; the description out-parameter is left null since we
         // never set one when encrypting.
         let ok = unsafe {
@@ -251,14 +260,30 @@ mod backend {
         let hex = hex(key);
         if cfg!(target_os = "macos") {
             return Command::new("security")
-                .args(["add-generic-password", "-U", "-s", SERVICE, "-a", ACCOUNT, "-w", &hex])
+                .args([
+                    "add-generic-password",
+                    "-U",
+                    "-s",
+                    SERVICE,
+                    "-a",
+                    ACCOUNT,
+                    "-w",
+                    &hex,
+                ])
                 .status()
                 .map(|status| status.success())
                 .unwrap_or(false);
         }
         // secret-tool takes the secret on stdin, so it never appears in `ps`.
         let Ok(mut child) = Command::new("secret-tool")
-            .args(["store", "--label=Zero Browser", "service", SERVICE, "account", ACCOUNT])
+            .args([
+                "store",
+                "--label=Zero Browser",
+                "service",
+                SERVICE,
+                "account",
+                ACCOUNT,
+            ])
             .stdin(Stdio::piped())
             .spawn()
         else {
@@ -370,7 +395,11 @@ mod cipher {
             let key = [7u8; 32];
             let secret = b"sid=super-secret-session-token";
             let sealed = seal(&key, secret).expect("sealed");
-            assert_ne!(&sealed[NONCE_LEN..], &secret[..], "plaintext must not survive");
+            assert_ne!(
+                &sealed[NONCE_LEN..],
+                &secret[..],
+                "plaintext must not survive"
+            );
             assert_eq!(open(&key, &sealed).as_deref(), Some(&secret[..]));
 
             // A different key cannot read it.
@@ -432,7 +461,11 @@ mod tests {
         }
         let mut corrupt = MAGIC.to_vec();
         corrupt.extend_from_slice(b"not actually ciphertext");
-        assert_eq!(unprotect(&corrupt), None, "must not return garbage as plaintext");
+        assert_eq!(
+            unprotect(&corrupt),
+            None,
+            "must not return garbage as plaintext"
+        );
     }
 
     #[test]

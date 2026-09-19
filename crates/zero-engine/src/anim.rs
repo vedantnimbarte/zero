@@ -64,7 +64,9 @@ impl Animator {
         }
         let declared = transitions(values);
         for (property, duration) in &declared {
-            let Some(target) = values.get(property).cloned() else { continue };
+            let Some(target) = values.get(property).cloned() else {
+                continue;
+            };
             let key = (node_id, property.clone());
             let previous = self.previous.insert(key.clone(), target.clone());
 
@@ -76,19 +78,28 @@ impl Animator {
                     // Retargeting mid-flight starts from where it has reached,
                     // so a cursor that leaves and returns does not jump.
                     let from = match self.running.get(&key) {
-                        Some(transit) => interpolate(&transit.from, &transit.to, self.progress(transit)),
+                        Some(transit) => {
+                            interpolate(&transit.from, &transit.to, self.progress(transit))
+                        }
                         None => Some(previous),
                     };
                     if let Some(from) = from {
                         self.running.insert(
                             key.clone(),
-                            Transit { from, to: target.clone(), started: self.now, duration: *duration },
+                            Transit {
+                                from,
+                                to: target.clone(),
+                                started: self.now,
+                                duration: *duration,
+                            },
                         );
                     }
                 }
             }
 
-            let Some(transit) = self.running.get(&key) else { continue };
+            let Some(transit) = self.running.get(&key) else {
+                continue;
+            };
             let progress = self.progress(transit);
             if progress >= 1.0 {
                 self.running.remove(&key);
@@ -130,7 +141,9 @@ fn transitions(values: &PropertyMap) -> Vec<(String, f32)> {
             .filter(|(name, _)| !name.is_empty())
             .collect();
     }
-    let Some(Value::Raw(shorthand)) = values.get("transition") else { return Vec::new() };
+    let Some(Value::Raw(shorthand)) = values.get("transition") else {
+        return Vec::new();
+    };
     shorthand
         .split(',')
         .filter_map(|part| {
@@ -203,11 +216,21 @@ mod tests {
     use super::*;
 
     fn red() -> Value {
-        Value::ColorValue(Color { r: 255, g: 0, b: 0, a: 255 })
+        Value::ColorValue(Color {
+            r: 255,
+            g: 0,
+            b: 0,
+            a: 255,
+        })
     }
 
     fn blue() -> Value {
-        Value::ColorValue(Color { r: 0, g: 0, b: 255, a: 255 })
+        Value::ColorValue(Color {
+            r: 0,
+            g: 0,
+            b: 255,
+            a: 255,
+        })
     }
 
     fn values(color: Value) -> PropertyMap {
@@ -241,7 +264,12 @@ mod tests {
         anim.apply(7, &mut midway);
         assert_eq!(
             midway["color"],
-            Value::ColorValue(Color { r: 128, g: 0, b: 128, a: 255 })
+            Value::ColorValue(Color {
+                r: 128,
+                g: 0,
+                b: 128,
+                a: 255
+            })
         );
 
         // Past the end: the target, and nothing left in flight.
@@ -274,12 +302,18 @@ mod tests {
                 "transition".to_string(),
                 Value::Raw("color 300ms, opacity 1s".into())
             )])),
-            vec![("color".to_string(), 300.0), ("opacity".to_string(), 1000.0)]
+            vec![
+                ("color".to_string(), 300.0),
+                ("opacity".to_string(), 1000.0)
+            ]
         );
         // The longhand pair.
         assert_eq!(
             transitions(&PropertyMap::from([
-                ("transition-property".to_string(), Value::Raw("width".into())),
+                (
+                    "transition-property".to_string(),
+                    Value::Raw("width".into())
+                ),
                 ("transition-duration".to_string(), Value::Raw(".25s".into())),
             ])),
             vec![("width".to_string(), 250.0)]
@@ -295,18 +329,33 @@ mod tests {
 
     #[test]
     fn only_values_that_can_be_mixed_are() {
-        assert_eq!(interpolate(&Value::Number(0.0), &Value::Number(1.0), 0.25), Some(Value::Number(0.25)));
         assert_eq!(
-            interpolate(&Value::Length(0.0, Unit::Px), &Value::Length(10.0, Unit::Px), 0.5),
+            interpolate(&Value::Number(0.0), &Value::Number(1.0), 0.25),
+            Some(Value::Number(0.25))
+        );
+        assert_eq!(
+            interpolate(
+                &Value::Length(0.0, Unit::Px),
+                &Value::Length(10.0, Unit::Px),
+                0.5
+            ),
             Some(Value::Length(5.0, Unit::Px))
         );
         // Different units, and keywords, have no midpoint — so they snap.
         assert_eq!(
-            interpolate(&Value::Length(0.0, Unit::Px), &Value::Length(10.0, Unit::Percent), 0.5),
+            interpolate(
+                &Value::Length(0.0, Unit::Px),
+                &Value::Length(10.0, Unit::Percent),
+                0.5
+            ),
             None
         );
         assert_eq!(
-            interpolate(&Value::Keyword("none".into()), &Value::Keyword("block".into()), 0.5),
+            interpolate(
+                &Value::Keyword("none".into()),
+                &Value::Keyword("block".into()),
+                0.5
+            ),
             None
         );
     }

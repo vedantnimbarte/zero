@@ -173,7 +173,10 @@ mod tests {
 
     #[test]
     fn strings_translate_and_fall_back() {
-        settings::preview(Settings { language: 1, ..Settings::default() });
+        settings::preview(Settings {
+            language: 1,
+            ..Settings::default()
+        });
         assert_eq!(t("New tab"), "नया टैब");
         // Anything not in the table shows in English rather than blank.
         assert_eq!(t("Frobnicate"), "Frobnicate");
@@ -189,7 +192,10 @@ mod tests {
     /// translation path — a `·` in the wrong place would swallow the shortcut.
     #[test]
     fn no_label_loses_its_shortcut() {
-        settings::preview(Settings { language: 1, ..Settings::default() });
+        settings::preview(Settings {
+            language: 1,
+            ..Settings::default()
+        });
         for (_, tip) in crate::app::TIPS {
             let out = t_tip(tip);
             if let Some((_, key)) = tip.split_once("  ·  ") {

@@ -201,7 +201,13 @@ impl Canvas {
     }
 
     /// Fill a rect by interpolating between colour stops along a gradient's geometry.
-    fn paint_gradient(&mut self, rect: Rect, radius: f32, stops: &[(Color, f32)], shape: GradientShape) {
+    fn paint_gradient(
+        &mut self,
+        rect: Rect,
+        radius: f32,
+        stops: &[(Color, f32)],
+        shape: GradientShape,
+    ) {
         if stops.is_empty() || rect.width <= 0.0 || rect.height <= 0.0 {
             return;
         }
@@ -326,7 +332,11 @@ impl Canvas {
     /// same thing — which pixels may be written — so they fold into one pair of
     /// tests per pixel rather than two, and clipping costs nothing.
     fn paint_text(&mut self, frag: &TextFragment, clip: Rect, fonts: &FontSet) {
-        let font = match fonts.entries.get(frag.font_index).and_then(|entry| entry.raster()) {
+        let font = match fonts
+            .entries
+            .get(frag.font_index)
+            .and_then(|entry| entry.raster())
+        {
             Some(raster) => raster,
             None => return,
         };
@@ -342,7 +352,11 @@ impl Canvas {
         // and a slant are synthesized here instead of picked from a face:
         // bold redraws each row a pixel wider, italic shears columns toward
         // the top by `row`'s distance from the baseline.
-        let stroke = if frag.bold { (frag.size / 24.0).max(1.0).round() as i32 } else { 0 };
+        let stroke = if frag.bold {
+            (frag.size / 24.0).max(1.0).round() as i32
+        } else {
+            0
+        };
         let shear = if frag.italic { 0.22 } else { 0.0 };
 
         for glyph in &frag.glyphs {
@@ -379,7 +393,12 @@ impl Canvas {
         // trimmed to the same clip the glyphs were.
         let stroke = (frag.size / 16.0).max(1.0);
         let mut rule = |y: f32| {
-            let line = Rect { x: frag.x, y, width: frag.width, height: stroke };
+            let line = Rect {
+                x: frag.x,
+                y,
+                width: frag.width,
+                height: stroke,
+            };
             if let Some(visible) = intersect(line, clip) {
                 self.paint_solid(frag.color, visible);
             }
@@ -432,7 +451,12 @@ impl Canvas {
         }
         let natural = (img.width as f32, img.height as f32);
         if fit == ObjectFit::Fill {
-            let full_src = Rect { x: 0.0, y: 0.0, width: natural.0, height: natural.1 };
+            let full_src = Rect {
+                x: 0.0,
+                y: 0.0,
+                width: natural.0,
+                height: natural.1,
+            };
             return self.paint_image_region(img, dest, full_src);
         }
         let cover = (dest.width / natural.0).max(dest.height / natural.1);
@@ -495,15 +519,28 @@ impl Canvas {
         // Step back from the first tile's offset to the tile that first
         // touches the box, so a tile only partly inside the top/left edge is
         // still drawn (just clipped), not skipped.
-        let start_x = if repeat_x { rect.x + ox - (ox / iw).ceil() * iw } else { rect.x + ox };
-        let start_y = if repeat_y { rect.y + oy - (oy / ih).ceil() * ih } else { rect.y + oy };
+        let start_x = if repeat_x {
+            rect.x + ox - (ox / iw).ceil() * iw
+        } else {
+            rect.x + ox
+        };
+        let start_y = if repeat_y {
+            rect.y + oy - (oy / ih).ceil() * ih
+        } else {
+            rect.y + oy
+        };
         let (scale_x, scale_y) = (natural.0 / iw, natural.1 / ih);
 
         let mut y = start_y;
         loop {
             let mut x = start_x;
             loop {
-                let tile = Rect { x, y, width: iw, height: ih };
+                let tile = Rect {
+                    x,
+                    y,
+                    width: iw,
+                    height: ih,
+                };
                 if let Some(dest) = intersect(tile, rect) {
                     let src = Rect {
                         x: (dest.x - tile.x) * scale_x,
@@ -599,10 +636,17 @@ pub fn paint(
     // `bounds.y` is the first document row this canvas stands for, so drawing it
     // is the whole document shifted up by that much. A band is exactly that and
     // nothing else, which is why painting one costs no special cases below.
-    let onto_canvas = Xf { scale: 1.0, dx: 0.0, dy: -bounds.y };
+    let onto_canvas = Xf {
+        scale: 1.0,
+        dx: 0.0,
+        dy: -bounds.y,
+    };
     let display_list: DisplayList = match onto_canvas.is_none() {
         true => display_list,
-        false => display_list.into_iter().map(|item| transform(item, onto_canvas)).collect(),
+        false => display_list
+            .into_iter()
+            .map(|item| transform(item, onto_canvas))
+            .collect(),
     };
     let matches_on_canvas: Vec<Rect> = match onto_canvas.is_none() {
         true => matches.clone(),
@@ -612,7 +656,14 @@ pub fn paint(
     // The root background paints the whole canvas, not just the root's box, so a
     // short dark page doesn't leave white below it (CSS 2.1 §14.2).
     if let Some(color) = canvas_background(layout_root) {
-        canvas.paint_solid(color, Rect { x: 0.0, y: 0.0, ..bounds });
+        canvas.paint_solid(
+            color,
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                ..bounds
+            },
+        );
     }
     // Two passes: everything under the text, then the find highlights, then the
     // text itself — a highlight must cover page backgrounds but sit under words.
@@ -650,7 +701,13 @@ pub fn paint(
                         canvas.paint_fitted_image(img, *rect, *fit);
                     }
                 }
-                DisplayCommand::BackgroundImage { src, rect, size, position, repeat } => {
+                DisplayCommand::BackgroundImage {
+                    src,
+                    rect,
+                    size,
+                    position,
+                    repeat,
+                } => {
                     if let Some(img) = images.get(src) {
                         canvas.paint_background_image(img, *rect, *size, *position, *repeat);
                     }
@@ -863,20 +920,33 @@ fn fade(item: DisplayCommand, alpha: f32) -> DisplayCommand {
         DisplayCommand::RoundedColor(c, rect, radius) => {
             DisplayCommand::RoundedColor(dim(c), rect, radius)
         }
-        DisplayCommand::Gradient { rect, radius, stops, shape } => DisplayCommand::Gradient {
+        DisplayCommand::Gradient {
+            rect,
+            radius,
+            stops,
+            shape,
+        } => DisplayCommand::Gradient {
             rect,
             radius,
             stops: stops.into_iter().map(|(c, pos)| (dim(c), pos)).collect(),
             shape,
         },
-        DisplayCommand::Shadow { rect, radius, blur, color } => DisplayCommand::Shadow {
+        DisplayCommand::Shadow {
+            rect,
+            radius,
+            blur,
+            color,
+        } => DisplayCommand::Shadow {
             rect,
             radius,
             blur,
             color: dim(color),
         },
         DisplayCommand::Text(frag, clip) => DisplayCommand::Text(
-            TextFragment { color: dim(frag.color), ..frag },
+            TextFragment {
+                color: dim(frag.color),
+                ..frag
+            },
             clip,
         ),
         other => other,
@@ -896,7 +966,11 @@ struct Xf {
 }
 
 impl Xf {
-    const NONE: Xf = Xf { scale: 1.0, dx: 0.0, dy: 0.0 };
+    const NONE: Xf = Xf {
+        scale: 1.0,
+        dx: 0.0,
+        dy: 0.0,
+    };
 
     fn is_none(&self) -> bool {
         self.scale == 1.0 && self.dx == 0.0 && self.dy == 0.0
@@ -944,9 +1018,18 @@ fn transform_of(layout_box: &LayoutBox) -> Xf {
     // Translations commute and a uniform scale commutes with them up to the
     // origin, which is handled once at the end — so the list can be summed.
     while let Some(open) = rest.find('(') {
-        let name = rest[..open].trim().trim_start_matches(',').trim().to_ascii_lowercase();
-        let Some(close) = rest[open..].find(')') else { break };
-        let args: Vec<&str> = rest[open + 1..open + close].split(',').map(str::trim).collect();
+        let name = rest[..open]
+            .trim()
+            .trim_start_matches(',')
+            .trim()
+            .to_ascii_lowercase();
+        let Some(close) = rest[open..].find(')') else {
+            break;
+        };
+        let args: Vec<&str> = rest[open + 1..open + close]
+            .split(',')
+            .map(str::trim)
+            .collect();
         let ctx = style.length_context(0.0);
         // A percentage is of this box's own size, so each axis has its own base.
         let px = |token: &str, base: f32| match token.strip_suffix('%') {
@@ -1000,20 +1083,36 @@ fn transform(item: DisplayCommand, xf: Xf) -> DisplayCommand {
         DisplayCommand::RoundedColor(c, rect, radius) => {
             DisplayCommand::RoundedColor(c, xf.rect(rect), radius * xf.scale)
         }
-        DisplayCommand::Gradient { rect, radius, stops, shape } => DisplayCommand::Gradient {
+        DisplayCommand::Gradient {
+            rect,
+            radius,
+            stops,
+            shape,
+        } => DisplayCommand::Gradient {
             rect: xf.rect(rect),
             radius: radius * xf.scale,
             stops,
             shape,
         },
-        DisplayCommand::Shadow { rect, radius, blur, color } => DisplayCommand::Shadow {
+        DisplayCommand::Shadow {
+            rect,
+            radius,
+            blur,
+            color,
+        } => DisplayCommand::Shadow {
             rect: xf.rect(rect),
             radius: radius * xf.scale,
             blur: blur * xf.scale,
             color,
         },
         DisplayCommand::Image(src, rect, fit) => DisplayCommand::Image(src, xf.rect(rect), fit),
-        DisplayCommand::BackgroundImage { src, rect, size, position, repeat } => {
+        DisplayCommand::BackgroundImage {
+            src,
+            rect,
+            size,
+            position,
+            repeat,
+        } => {
             // `cover`/`contain`/percentages are resolved from `rect` at paint
             // time, so they already track a scaled box for free; an explicit
             // px size/offset was baked in before this transform ran, so it
@@ -1278,14 +1377,19 @@ fn render_background(list: &mut DisplayList, layout_box: &LayoutBox) {
     // over `background-color` in a real cascade — nothing paints beneath it.
     if let Some(spec) = &spec {
         if let Some((shape, stops)) = parse_gradient(spec) {
-            list.push(DisplayCommand::Gradient { rect: box_rect, radius, stops, shape });
+            list.push(DisplayCommand::Gradient {
+                rect: box_rect,
+                radius,
+                stops,
+                shape,
+            });
             return;
         }
     }
     // `background-color` still paints first when there's a `url()` image on
     // top, so a transparent PNG (or one still loading) shows something.
-    if let Some(color) = get_color(layout_box, "background")
-        .or_else(|| get_color(layout_box, "background-color"))
+    if let Some(color) =
+        get_color(layout_box, "background").or_else(|| get_color(layout_box, "background-color"))
     {
         if radius > 0.0 {
             list.push(DisplayCommand::RoundedColor(color, box_rect, radius));
@@ -1327,7 +1431,12 @@ fn background_spec(style: &crate::style::StyledNode) -> Option<String> {
 
 fn bg_url(spec: &str) -> Option<String> {
     let inner = spec.trim().strip_prefix("url(")?.strip_suffix(')')?;
-    Some(inner.trim().trim_matches(|c| c == '"' || c == '\'').to_string())
+    Some(
+        inner
+            .trim()
+            .trim_matches(|c| c == '"' || c == '\'')
+            .to_string(),
+    )
 }
 
 /// The `url(...)` this styled node's background paints, if it has one — used
@@ -1425,12 +1534,14 @@ fn parse_bg_position(
 /// ...)` into its geometry and colour stops.
 fn parse_gradient(spec: &str) -> Option<(GradientShape, Vec<(Color, f32)>)> {
     let spec = spec.trim();
-    let (is_radial, inner) = if let Some(inner) =
-        spec.strip_prefix("linear-gradient(").and_then(|s| s.strip_suffix(')'))
+    let (is_radial, inner) = if let Some(inner) = spec
+        .strip_prefix("linear-gradient(")
+        .and_then(|s| s.strip_suffix(')'))
     {
         (false, inner)
-    } else if let Some(inner) =
-        spec.strip_prefix("radial-gradient(").and_then(|s| s.strip_suffix(')'))
+    } else if let Some(inner) = spec
+        .strip_prefix("radial-gradient(")
+        .and_then(|s| s.strip_suffix(')'))
     {
         (true, inner)
     } else {
@@ -1438,7 +1549,9 @@ fn parse_gradient(spec: &str) -> Option<(GradientShape, Vec<(Color, f32)>)> {
     };
 
     let parts = split_top_level_commas(inner);
-    let Some(first) = parts.first() else { return None };
+    let Some(first) = parts.first() else {
+        return None;
+    };
 
     let mut start = 0;
     let shape = if is_radial {
@@ -1459,8 +1572,10 @@ fn parse_gradient(spec: &str) -> Option<(GradientShape, Vec<(Color, f32)>)> {
         }
     };
 
-    let mut stops: Vec<(Color, Option<f32>)> =
-        parts[start..].iter().filter_map(|part| parse_color_stop(part)).collect();
+    let mut stops: Vec<(Color, Option<f32>)> = parts[start..]
+        .iter()
+        .filter_map(|part| parse_color_stop(part))
+        .collect();
     if stops.len() < 2 {
         return None;
     }
@@ -1769,10 +1884,30 @@ fn render_outline(list: &mut DisplayList, layout_box: &LayoutBox) {
         height: b.height + width * 2.0,
     };
     for strip in [
-        Rect { x: outer.x, y: outer.y, width: outer.width, height: width },
-        Rect { x: outer.x, y: outer.y + outer.height - width, width: outer.width, height: width },
-        Rect { x: outer.x, y: outer.y, width, height: outer.height },
-        Rect { x: outer.x + outer.width - width, y: outer.y, width, height: outer.height },
+        Rect {
+            x: outer.x,
+            y: outer.y,
+            width: outer.width,
+            height: width,
+        },
+        Rect {
+            x: outer.x,
+            y: outer.y + outer.height - width,
+            width: outer.width,
+            height: width,
+        },
+        Rect {
+            x: outer.x,
+            y: outer.y,
+            width,
+            height: outer.height,
+        },
+        Rect {
+            x: outer.x + outer.width - width,
+            y: outer.y,
+            width,
+            height: outer.height,
+        },
     ] {
         list.push(DisplayCommand::SolidColor(color, strip));
     }
@@ -1786,12 +1921,11 @@ fn canvas_background(root: &LayoutBox) -> Option<Color> {
     // Only `<body>` inherits this privilege. Taking it from whichever child
     // happened to have a background flooded the page with, say, a hidden
     // dropdown's colour.
-    let body = root
-        .children
-        .iter()
-        .find(|child| matches!(child.box_type,
+    let body = root.children.iter().find(|child| {
+        matches!(child.box_type,
             BoxType::BlockNode(s) | BoxType::InlineNode(s)
-                if matches!(&s.node.node_type, NodeType::Element(e) if e.tag_name == "body")));
+                if matches!(&s.node.node_type, NodeType::Element(e) if e.tag_name == "body"))
+    });
     of(root).or_else(|| body.and_then(of))
 }
 
@@ -1818,7 +1952,12 @@ mod tests {
             y,
             size: 16.0,
             line_height: 20.0,
-            color: Color { r: 0, g: 0, b: 0, a: 255 },
+            color: Color {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 255,
+            },
             underline: false,
             strikethrough: false,
             bold: false,
@@ -1833,16 +1972,27 @@ mod tests {
         // its box. It has to carry the clip to the rasterizer — otherwise a box
         // collapsed to a pixel, which is how every large site hides a heading
         // it keeps for screen readers, prints that heading across the page.
-        let narrow = Rect { x: 10.0, y: 100.0, width: 1.0, height: 1.0 };
-        let Some(DisplayCommand::Text(_, clip)) =
-            clip_command(DisplayCommand::Text(run(10.0, 100.0, 90.0), UNCLIPPED), narrow)
-        else {
+        let narrow = Rect {
+            x: 10.0,
+            y: 100.0,
+            width: 1.0,
+            height: 1.0,
+        };
+        let Some(DisplayCommand::Text(_, clip)) = clip_command(
+            DisplayCommand::Text(run(10.0, 100.0, 90.0), UNCLIPPED),
+            narrow,
+        ) else {
             panic!("a run overlapping its clip should survive, carrying it");
         };
         assert_eq!((clip.width, clip.height), (1.0, 1.0));
 
         // Clips compose: an inner one can only ever narrow an outer one.
-        let outer = Rect { x: 0.0, y: 100.0, width: 40.0, height: 20.0 };
+        let outer = Rect {
+            x: 0.0,
+            y: 100.0,
+            width: 40.0,
+            height: 20.0,
+        };
         let Some(DisplayCommand::Text(_, clip)) =
             clip_command(DisplayCommand::Text(run(10.0, 100.0, 90.0), narrow), outer)
         else {
@@ -1851,17 +2001,34 @@ mod tests {
         assert_eq!((clip.width, clip.height), (1.0, 1.0));
 
         // A run wholly outside its clip is dropped, as before.
-        let elsewhere = Rect { x: 500.0, y: 500.0, width: 10.0, height: 10.0 };
-        assert!(clip_command(DisplayCommand::Text(run(10.0, 100.0, 90.0), UNCLIPPED), elsewhere)
-            .is_none());
+        let elsewhere = Rect {
+            x: 500.0,
+            y: 500.0,
+            width: 10.0,
+            height: 10.0,
+        };
+        assert!(clip_command(
+            DisplayCommand::Text(run(10.0, 100.0, 90.0), UNCLIPPED),
+            elsewhere
+        )
+        .is_none());
     }
 
     #[test]
     fn a_transform_moves_a_runs_clip_along_with_the_run() {
         // Otherwise a transformed box goes on clipping where it used to be,
         // and its text is cut against empty space.
-        let clip = Rect { x: 10.0, y: 10.0, width: 20.0, height: 20.0 };
-        let xf = Xf { scale: 2.0, dx: 5.0, dy: 7.0 };
+        let clip = Rect {
+            x: 10.0,
+            y: 10.0,
+            width: 20.0,
+            height: 20.0,
+        };
+        let xf = Xf {
+            scale: 2.0,
+            dx: 5.0,
+            dy: 7.0,
+        };
         let DisplayCommand::Text(frag, moved) =
             transform(DisplayCommand::Text(run(10.0, 10.0, 20.0), clip), xf)
         else {

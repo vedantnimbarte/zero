@@ -46,9 +46,8 @@ pub fn describe() -> &'static str {
 #[cfg(windows)]
 mod backend {
     use windows_sys::Win32::System::Threading::{
-        GetCurrentProcess, SetProcessMitigationPolicy, ProcessDynamicCodePolicy,
-        ProcessExtensionPointDisablePolicy, ProcessStrictHandleCheckPolicy,
-        PROCESS_MITIGATION_POLICY,
+        GetCurrentProcess, ProcessDynamicCodePolicy, ProcessExtensionPointDisablePolicy,
+        ProcessStrictHandleCheckPolicy, SetProcessMitigationPolicy, PROCESS_MITIGATION_POLICY,
     };
 
     pub const DESCRIPTION: &str =

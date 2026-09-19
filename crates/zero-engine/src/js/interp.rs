@@ -327,8 +327,14 @@ impl Interp {
             ("fetch".to_string(), Value::Native("fetch")),
             // `storage` is really delivered; load/resize/scroll are still
             // accepted and never fired, since nothing raises them yet.
-            ("addEventListener".to_string(), Value::Native("window.addEventListener")),
-            ("removeEventListener".to_string(), Value::Native("window.removeEventListener")),
+            (
+                "addEventListener".to_string(),
+                Value::Native("window.addEventListener"),
+            ),
+            (
+                "removeEventListener".to_string(),
+                Value::Native("window.removeEventListener"),
+            ),
         ]);
         let window = interp.new_object(window_map);
         interp.env_define(root, "window".into(), window);
@@ -414,7 +420,9 @@ impl Interp {
     /// Fire every `window` listener for `event`, each with the same event
     /// object. Returns whether any ran, so the embedder knows to repaint.
     pub fn dispatch_window(&mut self, event: &str, detail: Value) -> bool {
-        let Some(listeners) = self.window_handlers.get(event).cloned() else { return false };
+        let Some(listeners) = self.window_handlers.get(event).cloned() else {
+            return false;
+        };
         if listeners.is_empty() {
             return false;
         }
@@ -439,7 +447,11 @@ impl Interp {
         url: &str,
     ) -> bool {
         // Nothing listening: don't build an object only to drop it.
-        if self.window_handlers.get("storage").is_none_or(|l| l.is_empty()) {
+        if self
+            .window_handlers
+            .get("storage")
+            .is_none_or(|l| l.is_empty())
+        {
             return false;
         }
         let nullable = |value: Option<&str>| match value {
@@ -647,7 +659,9 @@ impl Interp {
 
     /// `(settled value, was it a rejection)` if this is a promise.
     fn unwrap_promise(&self, value: &Value) -> Option<(Value, bool)> {
-        let Value::Object(id) = value else { return None };
+        let Value::Object(id) = value else {
+            return None;
+        };
         let map = self.objects[*id as usize].borrow();
         let inner = map.get(PROMISE_KEY)?.clone();
         Some((inner, map.contains_key(REJECTED_KEY)))
@@ -1007,7 +1021,9 @@ impl Interp {
             },
             Expr::Func { params, body } => Ok(self.make_function(params.clone(), body.clone())),
             Expr::This => Ok(self.env_get(self.env, "this").unwrap_or(Value::Undefined)),
-            Expr::Super => Ok(self.env_get(self.env, SUPER_KEY).unwrap_or(Value::Undefined)),
+            Expr::Super => Ok(self
+                .env_get(self.env, SUPER_KEY)
+                .unwrap_or(Value::Undefined)),
             Expr::Ternary {
                 cond,
                 then,
@@ -1164,7 +1180,9 @@ impl Interp {
                 }
                 // `super(...)` calls the parent constructor on the current `this`.
                 if matches!(**callee, Expr::Super) {
-                    let parent = self.env_get(self.env, SUPER_KEY).unwrap_or(Value::Undefined);
+                    let parent = self
+                        .env_get(self.env, SUPER_KEY)
+                        .unwrap_or(Value::Undefined);
                     let this = self.env_get(self.env, "this").unwrap_or(Value::Undefined);
                     let ctor = self.get_property(&parent, "constructor");
                     if let Value::Func(idx) = ctor {
@@ -1247,24 +1265,18 @@ impl Interp {
                         }
                         "textContent" | "innerText" => {
                             let text = self.to_display(&v);
-                            self.out
-                                .mutations
-                                .push(Mutation::SetText(i, text.clone()));
+                            self.out.mutations.push(Mutation::SetText(i, text.clone()));
                             self.reflect(i, |e| e.text = text);
                         }
                         "innerHTML" => {
                             let text = self.to_display(&v);
-                            self.out
-                                .mutations
-                                .push(Mutation::SetHtml(i, text.clone()));
+                            self.out.mutations.push(Mutation::SetHtml(i, text.clone()));
                             self.reflect(i, |e| e.text = text);
                         }
                         // Restyling: swapping the class re-runs the cascade for this node.
                         "className" => {
                             let text = self.to_display(&v);
-                            self.out
-                                .mutations
-                                .push(Mutation::SetClass(i, text.clone()));
+                            self.out.mutations.push(Mutation::SetClass(i, text.clone()));
                             self.reflect(i, |e| e.class = text);
                         }
                         _ => {} // other properties aren't modelled yet
@@ -1333,13 +1345,18 @@ impl Interp {
     /// `Object.keys(localStorage)` list what the page actually stored.
     fn own_keys(&self, subject: &Value) -> Vec<String> {
         match subject {
-            Value::Storage(session) => {
-                self.store_of(*session).map(|s| s.keys()).unwrap_or_default()
-            }
-            Value::Object(id) => self.objects[*id as usize].borrow().keys().cloned().collect(),
-            Value::Array(id) => {
-                (0..self.arrays[*id as usize].borrow().len()).map(|i| i.to_string()).collect()
-            }
+            Value::Storage(session) => self
+                .store_of(*session)
+                .map(|s| s.keys())
+                .unwrap_or_default(),
+            Value::Object(id) => self.objects[*id as usize]
+                .borrow()
+                .keys()
+                .cloned()
+                .collect(),
+            Value::Array(id) => (0..self.arrays[*id as usize].borrow().len())
+                .map(|i| i.to_string())
+                .collect(),
             _ => Vec::new(),
         }
     }
@@ -1347,9 +1364,9 @@ impl Interp {
     /// Whether `key` names something the container holds — what `in` answers.
     fn has_key(&self, container: &Value, key: &str) -> bool {
         match container {
-            Value::Storage(session) => {
-                self.store_of(*session).is_some_and(|s| s.get(key).is_some())
-            }
+            Value::Storage(session) => self
+                .store_of(*session)
+                .is_some_and(|s| s.get(key).is_some()),
             Value::Object(id) => self.objects[*id as usize].borrow().contains_key(key),
             // On an array `in` tests indices, not values — `0 in [7]` is true
             // and `7 in [7]` is false. Worth getting right rather than
@@ -1422,7 +1439,9 @@ impl Interp {
         // object calls back with the object instead of failing.
         let is_own_method = matches!(receiver, Value::Object(id) if self.objects[*id as usize].borrow().contains_key(method));
         if matches!(method, "then" | "catch" | "finally") && !is_own_method {
-            let (value, rejected) = self.unwrap_promise(receiver).unwrap_or((receiver.clone(), false));
+            let (value, rejected) = self
+                .unwrap_promise(receiver)
+                .unwrap_or((receiver.clone(), false));
             let handler = match method {
                 "then" if !rejected => args.first(),
                 "then" => args.get(1), // the second argument is the reject path
@@ -1473,9 +1492,10 @@ impl Interp {
                 self.arrays[id].borrow_mut().extend(args.iter().cloned());
                 Value::Num(self.arrays[id].borrow().len() as f64)
             }
-            (Value::Array(id), "pop") => {
-                self.arrays[*id as usize].borrow_mut().pop().unwrap_or(Value::Undefined)
-            }
+            (Value::Array(id), "pop") => self.arrays[*id as usize]
+                .borrow_mut()
+                .pop()
+                .unwrap_or(Value::Undefined),
             (Value::Array(id), "join") => {
                 let sep = match args.first() {
                     Some(v) => self.to_display(v),
@@ -1616,7 +1636,10 @@ impl Interp {
                     "window.addEventListener" => {
                         if let (Some(event), Some(handler)) = (args.first(), args.get(1)) {
                             let event = self.to_display(event);
-                            self.window_handlers.entry(event).or_default().push(handler.clone());
+                            self.window_handlers
+                                .entry(event)
+                                .or_default()
+                                .push(handler.clone());
                         }
                     }
                     "window.removeEventListener" => {
@@ -1713,19 +1736,15 @@ impl Interp {
                         // Both arguments are required, and the web throws
                         // rather than inventing an empty one.
                         if args.len() < 2 {
-                            return Err(self.err(
-                                "TypeError",
-                                "setItem requires 2 arguments",
-                            ));
+                            return Err(self.err("TypeError", "setItem requires 2 arguments"));
                         }
                         let key = self.to_display(&args[0]);
                         let value = self.to_display(&args[1]);
                         if let Some(store) = self.store_for(name) {
                             if !store.set(&key, &value) {
-                                return Err(self.err(
-                                    "QuotaExceededError",
-                                    "the storage area is full",
-                                ));
+                                return Err(
+                                    self.err("QuotaExceededError", "the storage area is full")
+                                );
                             }
                         }
                         return Ok(Value::Undefined);
@@ -1821,7 +1840,12 @@ impl Interp {
                 // Calls run in a child of the *defining* scope, not the calling one.
                 let (closure, this, params, body) = {
                     let fd = &self.funcs[f as usize];
-                    (fd.closure, fd.this.clone(), fd.params.clone(), fd.body.clone())
+                    (
+                        fd.closure,
+                        fd.this.clone(),
+                        fd.params.clone(),
+                        fd.body.clone(),
+                    )
                 };
                 let saved = self.env;
                 // A function boundary: where this call's own `var`s land,

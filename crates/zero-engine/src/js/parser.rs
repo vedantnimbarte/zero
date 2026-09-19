@@ -10,7 +10,10 @@ pub enum Expr {
     /// `a, b, c` — every part runs, the last one is the value.
     Sequence(Vec<Expr>),
     /// `/pattern/flags`
-    Regex { pattern: String, flags: String },
+    Regex {
+        pattern: String,
+        flags: String,
+    },
     Num(f64),
     Str(String),
     Bool(bool),
@@ -388,7 +391,11 @@ impl Parser {
             // after the name — so the head is looked at before it is parsed,
             // rather than parsed and then backed out of.
             if let Some((name, values)) = self.peek_for_each_head() {
-                self.pos += if matches!(self.peek(), Tok::Kw(_)) { 3 } else { 2 };
+                self.pos += if matches!(self.peek(), Tok::Kw(_)) {
+                    3
+                } else {
+                    2
+                };
                 let subject = self.parse_expr()?;
                 self.expect_op(")")?;
                 let body = Box::new(self.parse_stmt()?);

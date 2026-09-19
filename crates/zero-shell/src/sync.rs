@@ -33,7 +33,9 @@ pub fn export(path: &Path) -> Result<String, String> {
         }
         // Read through the at-rest layer: the other machine cannot undo this
         // machine's DPAPI or keystore, so what travels is the plain content.
-        let Some(text) = crate::crypto::read_file(&entry.path()) else { continue };
+        let Some(text) = crate::crypto::read_file(&entry.path()) else {
+            continue;
+        };
         bundle.extend_from_slice(format!("{name}\n{}\n", text.len()).as_bytes());
         bundle.extend_from_slice(text.as_bytes());
         bundle.push(b'\n');
@@ -58,8 +60,12 @@ pub fn import(path: &Path, code: &str) -> Result<usize, String> {
     let mut rest = &bundle[..];
     let mut restored = 0;
     while !rest.is_empty() {
-        let Some((name, after)) = split_line(rest) else { break };
-        let Some((len, after)) = split_line(after) else { break };
+        let Some((name, after)) = split_line(rest) else {
+            break;
+        };
+        let Some((len, after)) = split_line(after) else {
+            break;
+        };
         let Ok(len) = len.parse::<usize>() else { break };
         if after.len() < len {
             return Err("the bundle ends in the middle of a file".into());
@@ -146,7 +152,10 @@ mod tests {
             bundle.push(b'\n');
         }
         let sealed = crate::crypto::seal_with(&key, &bundle).expect("sealed");
-        assert_eq!(crate::crypto::open_with(&key, &sealed).as_deref(), Some(&bundle[..]));
+        assert_eq!(
+            crate::crypto::open_with(&key, &sealed).as_deref(),
+            Some(&bundle[..])
+        );
         // The wrong code reads nothing at all, rather than half a profile.
         assert_eq!(crate::crypto::open_with(&[8u8; 32], &sealed), None);
     }
