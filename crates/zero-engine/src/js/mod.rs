@@ -542,7 +542,7 @@ mod tests {
 
     #[test]
     fn query_selectors_find_elements_by_tag_class_and_id() {
-        let mut doc = crate::Document::load(
+        let doc = crate::Document::load(
             "<html><body>\
                <p class='note'>one</p>\
                <p class='note wide'>two</p>\
@@ -899,7 +899,7 @@ mod tests {
 
     #[test]
     fn script_can_set_a_field_value() {
-        let mut doc = crate::Document::load(
+        let doc = crate::Document::load(
             "<html><body><input id='q' value='old'>\
              <script>document.getElementById('q').value = 'new';</script></body></html>",
             "",

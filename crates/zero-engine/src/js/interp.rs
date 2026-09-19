@@ -242,6 +242,12 @@ pub struct Interp {
     pub out: Output,
 }
 
+impl Default for Interp {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Interp {
     pub fn new() -> Interp {
         Interp::with_dom(DomView::default())
@@ -1610,11 +1616,9 @@ impl Interp {
                 .borrow_mut()
                 .insert(name.clone(), bound);
         }
-        if let Some(ctor) = methods.get("constructor") {
-            if let Value::Func(idx) = ctor {
-                let bound = self.bind_this(*idx, instance.clone());
-                self.call(bound, args)?;
-            }
+        if let Some(Value::Func(idx)) = methods.get("constructor") {
+            let bound = self.bind_this(*idx, instance.clone());
+            self.call(bound, args)?;
         }
         Ok(instance)
     }

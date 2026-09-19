@@ -1216,7 +1216,7 @@ fn render_layout_box(
     // This box's own clip comes from where it is *drawn*, not where it was laid
     // out. An empty clip still has to be handed down: a child of a hidden box is
     // hidden too, however visible it declares itself.
-    let inner = child_clip(layout_box, clip, xf).unwrap_or(Rect::default());
+    let inner = child_clip(layout_box, clip, xf).unwrap_or_default();
     // A higher `z-index` paints later, and equal ones keep document order.
     //
     // ponytail: one flat order rather than real stacking contexts, so a child's
@@ -1402,7 +1402,7 @@ fn render_background(list: &mut DisplayList, layout_box: &LayoutBox) {
     // rounded box — matching the same gap `<img>` already has (`Image` isn't
     // masked either). Needs a per-pixel radius test in `paint_image_region`
     // to fix for both at once.
-    if let Some(src) = spec.as_deref().and_then(|s| bg_url(s)) {
+    if let Some(src) = spec.as_deref().and_then(bg_url) {
         let ctx_w = style.length_context(box_rect.width);
         let ctx_h = style.length_context(box_rect.height);
         list.push(DisplayCommand::BackgroundImage {
@@ -1539,19 +1539,15 @@ fn parse_gradient(spec: &str) -> Option<(GradientShape, Vec<(Color, f32)>)> {
         .and_then(|s| s.strip_suffix(')'))
     {
         (false, inner)
-    } else if let Some(inner) = spec
-        .strip_prefix("radial-gradient(")
-        .and_then(|s| s.strip_suffix(')'))
-    {
-        (true, inner)
     } else {
-        return None;
+        let inner = spec
+            .strip_prefix("radial-gradient(")
+            .and_then(|s| s.strip_suffix(')'))?;
+        (true, inner)
     };
 
     let parts = split_top_level_commas(inner);
-    let Some(first) = parts.first() else {
-        return None;
-    };
+    let first = parts.first()?;
 
     let mut start = 0;
     let shape = if is_radial {

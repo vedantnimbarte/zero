@@ -11,6 +11,10 @@ use std::fs;
 use std::io::Read;
 use std::rc::Rc;
 
+/// One request out of a parallel batch: its index in the batch, the url it
+/// ended on, and the body plus response headers when it succeeded.
+type BatchFetch = (usize, String, Option<(Vec<u8>, Vec<String>)>);
+
 /// How Zero identifies itself. Sites use this for rate limiting and for
 /// serving the right markup, and some (Wikimedia among them) reject requests
 /// that arrive with a library's default agent string.
@@ -187,7 +191,7 @@ impl zero_engine::ResourceLoader for ShellLoader {
         // Batches are built so no host appears more than PER_HOST times: hosts
         // rate-limit per client, and a burst of parallel requests to one of them
         // gets throttled (429) where the same requests spread out succeed.
-        let results: Vec<(usize, String, Option<(Vec<u8>, Vec<String>)>)> = batches(pending)
+        let results: Vec<BatchFetch> = batches(pending)
             .into_iter()
             .flat_map(|batch| {
                 std::thread::scope(|scope| {
@@ -263,6 +267,9 @@ fn host_of(url: &str) -> &str {
 
 /// A fetch with no access to shell state, so it can run on a worker thread.
 /// Returns the body and any `Set-Cookie` headers for the caller to store.
+// ureq::Error is 272 bytes and it is ureq's type, not ours -- boxing it here
+// would only move the cost behind an allocation on every request.
+#[allow(clippy::result_large_err)]
 fn fetch_detached(url: &str, cookies: &Option<String>) -> Option<(Vec<u8>, Vec<String>)> {
     if !is_url(url) {
         // Local files and unsupported schemes are cheap; no thread needed.
@@ -431,7 +438,7 @@ fn try_fetch(url: &str) -> Result<String, String> {
         Ok(response) => response,
         Err(ureq::Error::Status(code, response)) => {
             absorb_cookies(url, &response);
-            let status = format!("{code} {}", response.status_text().to_string());
+            let status = format!("{code} {}", response.status_text());
             return match response.into_string() {
                 Ok(body) if !body.trim().is_empty() => Ok(body),
                 _ => Err(format!("the server replied {status}")),

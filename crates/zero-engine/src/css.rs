@@ -1282,7 +1282,7 @@ impl Parser {
                 }
             }
         }
-        selectors.sort_by(|a, b| b.specificity().cmp(&a.specificity()));
+        selectors.sort_by_key(|s| std::cmp::Reverse(s.specificity()));
         Some(selectors)
     }
 

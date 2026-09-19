@@ -81,11 +81,11 @@ mod backend {
                 return;
             }
             // An empty privilege set with DISABLE_MAX_PRIVILEGE drops them all.
-            let mut empty: TOKEN_PRIVILEGES = std::mem::zeroed();
+            let empty: TOKEN_PRIVILEGES = std::mem::zeroed();
             AdjustTokenPrivileges(
                 token,
                 1, // DisableAllPrivileges
-                &mut empty,
+                &empty,
                 0,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),

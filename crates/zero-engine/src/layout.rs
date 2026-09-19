@@ -535,9 +535,7 @@ impl<'a> LayoutBox<'a> {
                     }
                     // Counted down once at the end of every row, including this
                     // one, so `rowspan: 2` still covers the row below.
-                    for c in column..column + colspan {
-                        carry[c] = rowspan;
-                    }
+                    carry[column..column + colspan].fill(rowspan);
                 }
                 column += colspan;
                 column_count = column_count.max(column);
@@ -583,12 +581,14 @@ impl<'a> LayoutBox<'a> {
             let width = span_width(&widths, item.column, item.colspan, spacing);
             let row_path = rows[item.row];
             let cell = &mut row_at_mut(&mut self.children, row_path).children[item.cell];
-            let mut slot: Dimensions = Default::default();
-            slot.content = Rect {
-                x: container.x,
-                y: container.y,
-                width,
-                height: 0.0,
+            let slot = Dimensions {
+                content: Rect {
+                    x: container.x,
+                    y: container.y,
+                    width,
+                    height: 0.0,
+                },
+                ..Default::default()
             };
             cell.layout(slot, fonts, images);
             if item.rowspan == 1 {
@@ -630,12 +630,14 @@ impl<'a> LayoutBox<'a> {
             let row_path = rows[item.row];
             let top = row_tops[item.row];
             let cell = &mut row_at_mut(&mut self.children, row_path).children[item.cell];
-            let mut slot: Dimensions = Default::default();
-            slot.content = Rect {
-                x,
-                y: top,
-                width,
-                height: 0.0,
+            let slot = Dimensions {
+                content: Rect {
+                    x,
+                    y: top,
+                    width,
+                    height: 0.0,
+                },
+                ..Default::default()
             };
             cell.layout(slot, fonts, images);
             // Stretch so a row's backgrounds share one baseline.
@@ -694,7 +696,7 @@ impl<'a> LayoutBox<'a> {
             Some(Value::Raw(spec)) => spec,
             // Sheets often set the tracks through the `grid-template` shorthand
             // instead; without reading it the whole grid falls back to blocks.
-            _ => match shorthand_tracks(&style, Axis::Columns) {
+            _ => match shorthand_tracks(style, Axis::Columns) {
                 Some(spec) => spec,
                 None => return self.layout_block_children_gapped(fonts, images, gap),
             },
@@ -706,7 +708,7 @@ impl<'a> LayoutBox<'a> {
         // Explicit row sizes, if any; extra rows fall back to content height.
         let row_spec = match style.value("grid-template-rows") {
             Some(Value::Raw(spec)) => Some(spec),
-            _ => shorthand_tracks(&style, Axis::Rows),
+            _ => shorthand_tracks(style, Axis::Rows),
         };
         let row_sizes = match row_spec {
             Some(spec) => resolve_tracks(&spec, container.height, gap, ctx),
@@ -763,10 +765,9 @@ impl<'a> LayoutBox<'a> {
                 let c = explicit_col
                     .unwrap_or(0)
                     .min(columns.len().saturating_sub(colspan));
-                for rr in r..r + rowspan {
-                    for cc in c..(c + colspan).min(columns.len()) {
-                        occupied[rr][cc] = true;
-                    }
+                let c_end = (c + colspan).min(columns.len());
+                for cells in &mut occupied[r..r + rowspan] {
+                    cells[c..c_end].fill(true);
                 }
                 placements.push((index, r, c, colspan, rowspan));
                 continue;
@@ -783,10 +784,8 @@ impl<'a> LayoutBox<'a> {
                     && (row..row + rowspan)
                         .all(|r| (start..start + colspan).all(|c| !occupied[r][c]));
                 if fits {
-                    for r in row..row + rowspan {
-                        for c in start..start + colspan {
-                            occupied[r][c] = true;
-                        }
+                    for cells in &mut occupied[row..row + rowspan] {
+                        cells[start..start + colspan].fill(true);
                     }
                     placements.push((index, row, start, colspan, rowspan));
                     col = if explicit_col.is_some() {
@@ -816,12 +815,14 @@ impl<'a> LayoutBox<'a> {
         for &(index, r, c, colspan, rowspan) in &placements {
             let width = columns[c..c + colspan].iter().sum::<f32>() + gap * (colspan - 1) as f32;
             let x = container.x + columns[..c].iter().sum::<f32>() + gap * c as f32;
-            let mut slot: Dimensions = Default::default();
-            slot.content = Rect {
-                x,
-                y: container.y,
-                width,
-                height: 0.0,
+            let slot = Dimensions {
+                content: Rect {
+                    x,
+                    y: container.y,
+                    width,
+                    height: 0.0,
+                },
+                ..Default::default()
             };
             self.children[index].layout(slot, fonts, images);
             if rowspan == 1 {
@@ -855,12 +856,14 @@ impl<'a> LayoutBox<'a> {
             let y = container.y + row_heights[..r].iter().sum::<f32>() + gap * r as f32;
             let width = columns[c..c + colspan].iter().sum::<f32>() + gap * (colspan - 1) as f32;
             let x = container.x + columns[..c].iter().sum::<f32>() + gap * c as f32;
-            let mut slot: Dimensions = Default::default();
-            slot.content = Rect {
-                x,
-                y,
-                width,
-                height: 0.0,
+            let slot = Dimensions {
+                content: Rect {
+                    x,
+                    y,
+                    width,
+                    height: 0.0,
+                },
+                ..Default::default()
             };
             self.children[index].layout(slot, fonts, images);
             let last = (r + rowspan - 1).min(row_heights.len().saturating_sub(1));
@@ -1034,12 +1037,14 @@ impl<'a> LayoutBox<'a> {
                         line_height = 0.0;
                     }
                     cursor_x += lead;
-                    let mut slot: Dimensions = Default::default();
-                    slot.content = Rect {
-                        x: cursor_x,
-                        y: cursor_y,
-                        width: outer,
-                        height: 0.0,
+                    let slot = Dimensions {
+                        content: Rect {
+                            x: cursor_x,
+                            y: cursor_y,
+                            width: outer,
+                            height: 0.0,
+                        },
+                        ..Default::default()
                     };
                     let placed = {
                         let box_at = descend(self, path);
@@ -1717,12 +1722,14 @@ impl<'a> LayoutBox<'a> {
             let mut cursor_x = container.x + offset;
             let mut tallest = 0.0_f32;
             for (slot_index, &i) in line.iter().enumerate() {
-                let mut slot: Dimensions = Default::default();
-                slot.content = Rect {
-                    x: cursor_x,
-                    y: cursor_y,
-                    width: widths[slot_index],
-                    height: 0.0,
+                let slot = Dimensions {
+                    content: Rect {
+                        x: cursor_x,
+                        y: cursor_y,
+                        width: widths[slot_index],
+                        height: 0.0,
+                    },
+                    ..Default::default()
                 };
                 self.children[i].layout(slot, fonts, images);
                 // The line's own grow/shrink math wins over whatever the item's
@@ -2345,18 +2352,20 @@ fn align_cross_axis(
     match mode {
         "center" | "flex-end" | "end" if slack > 0.0 => {
             let shift = if mode == "center" { slack / 2.0 } else { slack };
-            let mut slot: Dimensions = Default::default();
-            slot.content = Rect {
-                x: outer.x,
-                y: line_top + shift,
-                // Laying the box out again has to hand it a containing block it
-                // will arrive back at the same width from, and `width: auto`
-                // takes the box's own edges off whatever it is given — so that
-                // is the outer width, not the content width. Passing the content
-                // width charged every padded item for its padding twice, which
-                // is how a centred icon ended up narrower than its own picture.
-                width: outer.width,
-                height: 0.0,
+            let slot = Dimensions {
+                content: Rect {
+                    x: outer.x,
+                    y: line_top + shift,
+                    // Laying the box out again has to hand it a containing block it
+                    // will arrive back at the same width from, and `width: auto`
+                    // takes the box's own edges off whatever it is given — so that
+                    // is the outer width, not the content width. Passing the content
+                    // width charged every padded item for its padding twice, which
+                    // is how a centred icon ended up narrower than its own picture.
+                    width: outer.width,
+                    height: 0.0,
+                },
+                ..Default::default()
             };
             // Re-run layout so descendants move with the box.
             child.layout(slot, fonts, images);
@@ -3117,7 +3126,7 @@ mod tests {
         assert_eq!(areas.get("article"), Some(&(1, 1, 1)));
         assert_eq!(areas.get("footer"), Some(&(2, 0, 2)));
         // A `.` cell names nothing.
-        assert!(parse_grid_areas("'. a'").get(".").is_none());
+        assert!(!parse_grid_areas("'. a'").contains_key("."));
     }
 
     #[test]

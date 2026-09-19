@@ -328,7 +328,9 @@ fn points_of(text: &str) -> Vec<(f32, f32)> {
         .filter_map(|p| p.parse().ok())
         .collect();
     numbers
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| (pair[0], pair[1]))
         .collect()
 }
@@ -367,7 +369,7 @@ fn flatten_path(d: &str) -> Vec<Vec<(f32, f32)>> {
         };
         match command.to_ascii_uppercase() {
             'M' => {
-                for (i, pair) in args.chunks_exact(2).enumerate() {
+                for (i, pair) in args.as_chunks::<2>().0.iter().enumerate() {
                     let point = at(cursor, pair[0], pair[1]);
                     if i == 0 {
                         // A new subpath starts here; the previous one ends.
@@ -387,7 +389,7 @@ fn flatten_path(d: &str) -> Vec<Vec<(f32, f32)>> {
                 last_control = None;
             }
             'L' => {
-                for pair in args.chunks_exact(2) {
+                for pair in args.as_chunks::<2>().0 {
                     cursor = at(cursor, pair[0], pair[1]);
                     current.push(cursor);
                 }
@@ -414,7 +416,7 @@ fn flatten_path(d: &str) -> Vec<Vec<(f32, f32)>> {
                 last_control = None;
             }
             'C' | 'S' => {
-                let stride = if command.to_ascii_uppercase() == 'C' {
+                let stride = if command.eq_ignore_ascii_case(&'C') {
                     6
                 } else {
                     4
@@ -445,7 +447,7 @@ fn flatten_path(d: &str) -> Vec<Vec<(f32, f32)>> {
                 }
             }
             'Q' | 'T' => {
-                let stride = if command.to_ascii_uppercase() == 'Q' {
+                let stride = if command.eq_ignore_ascii_case(&'Q') {
                     4
                 } else {
                     2
@@ -482,7 +484,7 @@ fn flatten_path(d: &str) -> Vec<Vec<(f32, f32)>> {
             // every rounded corner drawn as a path, every refresh swirl — so an
             // arc is walked rather than cut across.
             'A' => {
-                for group in args.chunks_exact(7) {
+                for group in args.as_chunks::<7>().0 {
                     let end = at(cursor, group[5], group[6]);
                     flatten_arc(
                         cursor,
@@ -688,7 +690,7 @@ fn fill(ctx: &mut Ctx, subpaths: &[Vec<(f32, f32)>], paint: Paint) {
 /// makes unaffordable at any size bigger than an icon.
 fn fill_device(ctx: &mut Ctx, polygons: &[Vec<(f32, f32)>], color: Color, opacity: f32) {
     // Every polygon is closed for filling, whether or not it said `Z`.
-    let edges: Vec<((f32, f32), (f32, f32))> = polygons
+    let edges: Vec<Edge> = polygons
         .iter()
         .flat_map(|points| closed_edges(points))
         .collect();
@@ -813,10 +815,13 @@ fn disc(centre: (f32, f32), radius: f32) -> Vec<(f32, f32)> {
         .collect()
 }
 
+/// A line segment between two points, as the scanline filler passes them around.
+type Edge = ((f32, f32), (f32, f32));
+
 /// The columns a set of edges can possibly touch. Without this every fill
 /// walked the whole image width per scanline, which a stroke made of dozens of
 /// small quads pays for dozens of times over.
-fn horizontal_span(edges: &[((f32, f32), (f32, f32))], width: usize) -> (usize, usize) {
+fn horizontal_span(edges: &[Edge], width: usize) -> (usize, usize) {
     let (mut min, mut max) = (f32::MAX, f32::MIN);
     for (a, b) in edges {
         min = min.min(a.0).min(b.0);
@@ -827,9 +832,8 @@ fn horizontal_span(edges: &[((f32, f32), (f32, f32))], width: usize) -> (usize, 
     (low.min(width), high.min(width))
 }
 
-fn closed_edges(points: &[(f32, f32)]) -> Vec<((f32, f32), (f32, f32))> {
-    let mut edges: Vec<((f32, f32), (f32, f32))> =
-        points.windows(2).map(|pair| (pair[0], pair[1])).collect();
+fn closed_edges(points: &[(f32, f32)]) -> Vec<Edge> {
+    let mut edges: Vec<Edge> = points.windows(2).map(|pair| (pair[0], pair[1])).collect();
     match (points.first(), points.last()) {
         (Some(first), Some(last)) if first != last => edges.push((*last, *first)),
         _ => {}
@@ -839,7 +843,7 @@ fn closed_edges(points: &[(f32, f32)]) -> Vec<((f32, f32), (f32, f32))> {
 
 /// The rows a shape can possibly touch, so a small icon in a big canvas does
 /// not cost a full-canvas sweep per shape.
-fn vertical_span(edges: &[((f32, f32), (f32, f32))], height: usize) -> (usize, usize) {
+fn vertical_span(edges: &[Edge], height: usize) -> (usize, usize) {
     let min = edges
         .iter()
         .flat_map(|(a, b)| [a.1, b.1])
