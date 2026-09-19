@@ -15,13 +15,8 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
-      # ponytail: fmt and clippy are advisory until the backlog is cleared
-      # (whole-repo rustfmt diff + ~19 clippy errors). Drop continue-on-error
-      # once a cleanup PR lands, then they gate too.
       - run: cargo fmt --all --check
-        continue-on-error: true
       - run: cargo clippy --workspace --all-targets -- -D warnings
-        continue-on-error: true
 
   web:
     runs-on: ubuntu-latest
