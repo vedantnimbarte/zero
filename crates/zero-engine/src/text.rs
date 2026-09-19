@@ -29,9 +29,17 @@ pub struct FontEntry<'a> {
 }
 
 impl<'a> FontEntry<'a> {
-    pub(crate) fn new(font: &'a crate::LoadedFont, shaper: &'a rustybuzz::Face<'a>) -> FontEntry<'a> {
+    pub(crate) fn new(
+        font: &'a crate::LoadedFont,
+        shaper: &'a rustybuzz::Face<'a>,
+    ) -> FontEntry<'a> {
         let family = family_of(shaper);
-        FontEntry { font, shaper, family, page_supplied: false }
+        FontEntry {
+            font,
+            shaper,
+            family,
+            page_supplied: false,
+        }
     }
 
     /// Same, but answering to the name a page's `@font-face` gave it.
@@ -40,7 +48,12 @@ impl<'a> FontEntry<'a> {
         shaper: &'a rustybuzz::Face<'a>,
         family: &str,
     ) -> FontEntry<'a> {
-        FontEntry { font, shaper, family: family.to_ascii_lowercase(), page_supplied: true }
+        FontEntry {
+            font,
+            shaper,
+            family: family.to_ascii_lowercase(),
+            page_supplied: true,
+        }
     }
 
     /// The rasterizer, parsed the first time it is asked for. `None` when the
@@ -109,7 +122,12 @@ impl FontSet<'_> {
         self.entries
             .iter()
             .position(|e| !e.page_supplied && covers(e, text))
-            .unwrap_or_else(|| self.entries.iter().position(|e| covers(e, text)).unwrap_or(0))
+            .unwrap_or_else(|| {
+                self.entries
+                    .iter()
+                    .position(|e| covers(e, text))
+                    .unwrap_or(0)
+            })
     }
 }
 
@@ -132,8 +150,16 @@ fn generic_match(set: &FontSet, wanted: &str, text: &str) -> Option<usize> {
 /// say "Georgia" or "Times" — so the serif side needs the handful of names that
 /// actually ship on the three platforms.
 fn reads_as_generic(family: &str, wanted: &str) -> bool {
-    const SERIF_NAMES: [&str; 8] =
-        ["georgia", "times", "cambria", "garamond", "palatino", "charter", "book antiqua", "roman"];
+    const SERIF_NAMES: [&str; 8] = [
+        "georgia",
+        "times",
+        "cambria",
+        "garamond",
+        "palatino",
+        "charter",
+        "book antiqua",
+        "roman",
+    ];
     // Most say "mono"; macOS's two do not.
     const MONO_NAMES: [&str; 4] = ["consol", "courier", "menlo", "monaco"];
     match wanted {
@@ -155,11 +181,23 @@ mod tests {
     #[test]
     fn a_generic_family_is_matched_by_what_a_face_calls_itself() {
         // The faces that actually ship on the three platforms.
-        for mono in ["consolas", "dejavu sans mono", "menlo", "courier new", "fira mono"] {
+        for mono in [
+            "consolas",
+            "dejavu sans mono",
+            "menlo",
+            "courier new",
+            "fira mono",
+        ] {
             assert!(reads_as_generic(mono, "monospace"), "{mono} is monospace");
             assert!(!reads_as_generic(mono, "serif"), "{mono} is not a serif");
         }
-        for serif in ["georgia", "times new roman", "dejavu serif", "source serif 4", "cambria"] {
+        for serif in [
+            "georgia",
+            "times new roman",
+            "dejavu serif",
+            "source serif 4",
+            "cambria",
+        ] {
             assert!(reads_as_generic(serif, "serif"), "{serif} is a serif");
         }
         // The trap this is shaped around: a sans face whose name contains the

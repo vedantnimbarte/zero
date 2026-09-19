@@ -80,7 +80,9 @@ pub fn serve() {
             }
             _ => break,
         }
-        let Some(session) = session.as_mut() else { continue };
+        let Some(session) = session.as_mut() else {
+            continue;
+        };
         write_frame(&engine, session, &mut output);
     }
 }
@@ -188,8 +190,7 @@ impl Session {
                 // precedence collapses into one round trip now that both
                 // calls reach the same process.
                 self.doc.blur();
-                self.click_handled =
-                    self.doc.focus(node_id) || self.doc.click(node_id);
+                self.click_handled = self.doc.focus(node_id) || self.doc.click(node_id);
             }
             "focus" => {
                 self.doc.focus(request.num_at(0) as usize);
@@ -227,7 +228,8 @@ impl Session {
             }
             "find" => {
                 let query = request.str_at(0);
-                self.doc.set_find((!query.is_empty()).then(|| query.to_string()));
+                self.doc
+                    .set_find((!query.is_empty()).then(|| query.to_string()));
             }
             "submit" => {
                 self.pending_submission =
@@ -261,10 +263,18 @@ impl Session {
 /// offset math, just `nums`/`text`'s own lengths. One schema, documented once,
 /// same as every other message this pipe carries.
 fn write_frame(engine: &Engine, session: &mut Session, output: &mut std::io::Stdout) {
-    session.doc.set_time(session.created.elapsed().as_secs_f32() * 1000.0);
+    session
+        .doc
+        .set_time(session.created.elapsed().as_secs_f32() * 1000.0);
     let loader = PipeLoader;
     let band = session.band.map(|top| (top, session.height));
-    let page = engine.render_band(&mut session.doc, session.width, session.height, band, &loader);
+    let page = engine.render_band(
+        &mut session.doc,
+        session.width,
+        session.height,
+        band,
+        &loader,
+    );
 
     let mut pixels = Vec::with_capacity(page.canvas.pixels.len() * 4);
     for p in &page.canvas.pixels {
@@ -293,13 +303,25 @@ fn write_frame(engine: &Engine, session: &mut Session, output: &mut std::io::Std
         answer = answer.num(r.width as f64).num(r.height as f64);
     }
     for l in &page.links {
-        answer = answer.num(l.x as f64).num(l.y as f64).num(l.width as f64).num(l.height as f64);
+        answer = answer
+            .num(l.x as f64)
+            .num(l.y as f64)
+            .num(l.width as f64)
+            .num(l.height as f64);
     }
     for m in &page.find_matches {
-        answer = answer.num(m.x as f64).num(m.y as f64).num(m.width as f64).num(m.height as f64);
+        answer = answer
+            .num(m.x as f64)
+            .num(m.y as f64)
+            .num(m.width as f64)
+            .num(m.height as f64);
     }
     for r in &page.text_runs {
-        answer = answer.num(r.x as f64).num(r.y as f64).num(r.width as f64).num(r.height as f64);
+        answer = answer
+            .num(r.x as f64)
+            .num(r.y as f64)
+            .num(r.width as f64)
+            .num(r.height as f64);
     }
     for r in &page.element_rects {
         answer = answer.text(r.id.clone());
@@ -330,7 +352,10 @@ struct PipeLoader;
 
 impl ResourceLoader for PipeLoader {
     fn load(&self, url: &str) -> Option<Vec<u8>> {
-        self.load_all(&[url.to_string()]).into_iter().next().flatten()
+        self.load_all(&[url.to_string()])
+            .into_iter()
+            .next()
+            .flatten()
     }
 
     fn load_all(&self, urls: &[String]) -> Vec<Option<Vec<u8>>> {
@@ -378,7 +403,9 @@ impl zero_engine::KeyValueStore for PipeStore {
         if wire::write(&mut std::io::stdout(), &request).is_err() {
             return None;
         }
-        let Ok(Some(answer)) = wire::read(&mut std::io::stdin()) else { return None };
+        let Ok(Some(answer)) = wire::read(&mut std::io::stdin()) else {
+            return None;
+        };
         (answer.num_at(0) != 0.0).then(|| answer.str_at(0).to_string())
     }
 
@@ -390,12 +417,17 @@ impl zero_engine::KeyValueStore for PipeStore {
         if wire::write(&mut std::io::stdout(), &request).is_err() {
             return false;
         }
-        let Ok(Some(answer)) = wire::read(&mut std::io::stdin()) else { return false };
+        let Ok(Some(answer)) = wire::read(&mut std::io::stdin()) else {
+            return false;
+        };
         answer.num_at(0) != 0.0
     }
 
     fn remove(&self, key: &str) {
-        let _ = wire::write(&mut std::io::stdout(), &Msg::new(&self.verb("remove")).text(key));
+        let _ = wire::write(
+            &mut std::io::stdout(),
+            &Msg::new(&self.verb("remove")).text(key),
+        );
     }
 
     fn clear(&self) {
@@ -410,7 +442,9 @@ impl zero_engine::KeyValueStore for PipeStore {
         if wire::write(&mut std::io::stdout(), &request).is_err() {
             return Vec::new();
         }
-        let Ok(Some(answer)) = wire::read(&mut std::io::stdin()) else { return Vec::new() };
+        let Ok(Some(answer)) = wire::read(&mut std::io::stdin()) else {
+            return Vec::new();
+        };
         answer.text
     }
 }
@@ -638,7 +672,9 @@ fn handle_service_message(
             }
         }
         "storage_keys" | "session_keys" => {
-            let keys = pick(stores, &message.name).map(|s| s.keys()).unwrap_or_default();
+            let keys = pick(stores, &message.name)
+                .map(|s| s.keys())
+                .unwrap_or_default();
             let mut answer = Msg::new("storage_keys_value");
             for key in keys {
                 answer = answer.text(key);
@@ -979,7 +1015,11 @@ impl TabRenderer {
 
     /// Tell this page about a `localStorage` write another tab made, and get
     /// back whatever its `storage` handler painted.
-    pub fn storage_event(&mut self, notice: &crate::localstore::StorageNotice, url: &str) -> Option<Frame> {
+    pub fn storage_event(
+        &mut self,
+        notice: &crate::localstore::StorageNotice,
+        url: &str,
+    ) -> Option<Frame> {
         let field = |value: &Option<String>| value.clone().unwrap_or_default();
         let present = |value: &Option<String>| value.is_some() as u8 as f64;
         let request = Msg::new("storage_event")
@@ -1032,7 +1072,13 @@ impl TabRenderer {
 
     /// Ask for the band starting at `band_top`, `height` rows tall. Doubles as
     /// "the window changed size" and as "the page scrolled".
-    pub fn resize(&mut self, width: f32, height: f32, band_top: f32, scroll_top: f32) -> Option<Frame> {
+    pub fn resize(
+        &mut self,
+        width: f32,
+        height: f32,
+        band_top: f32,
+        scroll_top: f32,
+    ) -> Option<Frame> {
         self.send(
             Msg::new("resize")
                 .num(width as f64)
@@ -1071,7 +1117,12 @@ impl TabRenderer {
                 self.mark_dead();
                 return None;
             };
-            match handle_service_message(message, &mut self.stdin, self.loader.as_ref(), Some(&self.stores)) {
+            match handle_service_message(
+                message,
+                &mut self.stdin,
+                self.loader.as_ref(),
+                Some(&self.stores),
+            ) {
                 Service::Text(text, headings) => return Some((text, headings)),
                 Service::Continue => continue,
                 Service::Frame(_) | Service::Broken => {
@@ -1104,7 +1155,12 @@ impl TabRenderer {
                 self.mark_dead();
                 return None;
             };
-            match handle_service_message(message, &mut self.stdin, self.loader.as_ref(), Some(&self.stores)) {
+            match handle_service_message(
+                message,
+                &mut self.stdin,
+                self.loader.as_ref(),
+                Some(&self.stores),
+            ) {
                 Service::Frame(frame) => return Some(frame),
                 Service::Continue => continue,
                 Service::Text(..) | Service::Broken => {
@@ -1283,7 +1339,13 @@ impl FakeRenderer {
         Some(self.snapshot())
     }
 
-    pub fn resize(&mut self, width: f32, height: f32, band_top: f32, scroll_top: f32) -> Option<Frame> {
+    pub fn resize(
+        &mut self,
+        width: f32,
+        height: f32,
+        band_top: f32,
+        scroll_top: f32,
+    ) -> Option<Frame> {
         self.width = width;
         self.height = height;
         self.band_top = band_top;
@@ -1292,7 +1354,8 @@ impl FakeRenderer {
     }
 
     pub fn find(&mut self, query: Option<&str>) -> Option<Frame> {
-        self.doc.set_find(query.filter(|q| !q.is_empty()).map(str::to_string));
+        self.doc
+            .set_find(query.filter(|q| !q.is_empty()).map(str::to_string));
         Some(self.snapshot())
     }
 
@@ -1316,8 +1379,13 @@ impl FakeRenderer {
     /// every field means the same thing either way.
     fn snapshot(&mut self) -> Frame {
         let band = Some((self.band_top, self.height));
-        let page =
-            self.engine.render_band(&mut self.doc, self.width, self.height, band, self.loader.as_ref());
+        let page = self.engine.render_band(
+            &mut self.doc,
+            self.width,
+            self.height,
+            band,
+            self.loader.as_ref(),
+        );
         let mut pixels = Vec::with_capacity(page.canvas.pixels.len() * 4);
         for p in &page.canvas.pixels {
             pixels.extend_from_slice(&[p.r, p.g, p.b, p.a]);
@@ -1374,17 +1442,30 @@ mod tests {
         assert_eq!(first.len(), 1, "a new value is a change");
         assert_eq!(first[0].old, None);
         assert_eq!(first[0].new.as_deref(), Some("one"));
-        assert_eq!(first[0].tab, 3, "the notice must name its writer, to skip it");
+        assert_eq!(
+            first[0].tab, 3,
+            "the notice must name its writer, to skip it"
+        );
 
         let again = send(Msg::new("storage_set").text("k").text("one"));
-        assert!(again.is_empty(), "writing the value already there changes nothing");
+        assert!(
+            again.is_empty(),
+            "writing the value already there changes nothing"
+        );
 
         let changed = send(Msg::new("storage_set").text("k").text("two"));
         assert_eq!(changed.len(), 1, "a different value is a change again");
-        assert_eq!(changed[0].old.as_deref(), Some("one"), "the event carries what it replaced");
+        assert_eq!(
+            changed[0].old.as_deref(),
+            Some("one"),
+            "the event carries what it replaced"
+        );
 
         let absent = send(Msg::new("storage_remove").text("never-set"));
-        assert!(absent.is_empty(), "removing what was not there removes nothing");
+        assert!(
+            absent.is_empty(),
+            "removing what was not there removes nothing"
+        );
 
         let present = send(Msg::new("storage_remove").text("k"));
         assert_eq!(present.len(), 1);
@@ -1393,12 +1474,18 @@ mod tests {
         // sessionStorage belongs to one tab, which holds one document, so a
         // write to it has no other document to be told about.
         let session = send(Msg::new("session_set").text("s").text("x"));
-        assert!(session.is_empty(), "sessionStorage never raises a cross-tab event");
+        assert!(
+            session.is_empty(),
+            "sessionStorage never raises a cross-tab event"
+        );
 
         // `clear()` is announced with a null key, whatever it emptied.
         let cleared = send(Msg::new("storage_clear"));
         assert_eq!(cleared.len(), 1);
-        assert_eq!(cleared[0].key, None, "a cleared area is announced with a null key");
+        assert_eq!(
+            cleared[0].key, None,
+            "a cleared area is announced with a null key"
+        );
     }
 
     struct NoStore;
@@ -1430,7 +1517,8 @@ mod tests {
         // trivially — but "how fast does `TabRenderer` notice": a closed
         // pipe has to be caught immediately, not by sitting out
         // `REPLY_TIMEOUT` for a reply that was never going to arrive.
-        let loader: std::rc::Rc<dyn ResourceLoader> = std::rc::Rc::new(zero_engine::resource::NullLoader);
+        let loader: std::rc::Rc<dyn ResourceLoader> =
+            std::rc::Rc::new(zero_engine::resource::NullLoader);
         let stores = crate::localstore::Stores {
             local: std::rc::Rc::new(NoStore),
             session: std::rc::Rc::new(NoStore),
@@ -1439,7 +1527,10 @@ mod tests {
         };
         let start = std::time::Instant::now();
         let result = TabRenderer::spawn("<div></div>", "", 100.0, 100.0, loader, stores);
-        assert!(result.is_none(), "a process that never sends a frame should not produce a renderer");
+        assert!(
+            result.is_none(),
+            "a process that never sends a frame should not produce a renderer"
+        );
         assert!(
             start.elapsed() < REPLY_TIMEOUT / 2,
             "a closed pipe should be noticed almost immediately, not by waiting out the timeout"
@@ -1453,7 +1544,10 @@ mod tests {
         // this owns: one spare is kept, it goes to exactly one tab, and the
         // window can put it away again on its way out.
         drop_warm();
-        assert!(take_warm().is_none(), "nothing is warm until something warms it");
+        assert!(
+            take_warm().is_none(),
+            "nothing is warm until something warms it"
+        );
 
         warm();
         let taken = take_warm();

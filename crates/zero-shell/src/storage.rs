@@ -48,7 +48,10 @@ fn sanitize(field: &str) -> String {
 }
 
 fn now_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 #[derive(Debug, PartialEq)]
@@ -67,7 +70,9 @@ pub fn record_visit(url: &str, title: &str) {
 }
 
 pub fn load_history() -> Vec<Visit> {
-    profile_dir().map(|dir| read_history(&dir)).unwrap_or_default()
+    profile_dir()
+        .map(|dir| read_history(&dir))
+        .unwrap_or_default()
 }
 
 fn append_visit(dir: &Path, url: &str, title: &str) {
@@ -94,7 +99,11 @@ fn parse_visit(line: &str) -> Option<Visit> {
     if url.is_empty() {
         return None;
     }
-    Some(Visit { when, url, title: parts.next().unwrap_or("").to_string() })
+    Some(Visit {
+        when,
+        url,
+        title: parts.next().unwrap_or("").to_string(),
+    })
 }
 
 #[derive(Debug, PartialEq)]
@@ -118,7 +127,9 @@ pub fn add_bookmark(url: &str, title: &str) {
 
 /// Remove a bookmark. Returns whether anything was removed.
 pub fn remove_bookmark(url: &str) -> bool {
-    let Some(dir) = profile_dir() else { return false };
+    let Some(dir) = profile_dir() else {
+        return false;
+    };
     let mut marks = read_bookmarks(&dir);
     let before = marks.len();
     marks.retain(|b| b.url != url);
@@ -130,7 +141,9 @@ pub fn remove_bookmark(url: &str) -> bool {
 }
 
 pub fn load_bookmarks() -> Vec<Bookmark> {
-    profile_dir().map(|dir| read_bookmarks(&dir)).unwrap_or_default()
+    profile_dir()
+        .map(|dir| read_bookmarks(&dir))
+        .unwrap_or_default()
 }
 
 thread_local! {
@@ -163,13 +176,19 @@ fn read_bookmarks(dir: &Path) -> Vec<Bookmark> {
     text.lines()
         .filter_map(|line| {
             let (url, title) = line.split_once('\t')?;
-            (!url.is_empty()).then(|| Bookmark { url: url.into(), title: title.into() })
+            (!url.is_empty()).then(|| Bookmark {
+                url: url.into(),
+                title: title.into(),
+            })
         })
         .collect()
 }
 
 fn write_bookmarks(dir: &Path, marks: &[Bookmark]) {
-    let text: String = marks.iter().map(|b| format!("{}\t{}\n", b.url, b.title)).collect();
+    let text: String = marks
+        .iter()
+        .map(|b| format!("{}\t{}\n", b.url, b.title))
+        .collect();
     crate::crypto::write_file(&dir.join("bookmarks.tsv"), &text);
     // Every change to the list goes through here, so this is the one place that
     // has to tell the toolbar's cache it is out of date.
@@ -225,7 +244,13 @@ pub fn save_page(url: &str, title: &str, body: &str) -> Option<String> {
 /// so a title can never steer the write out of the Downloads folder.
 fn file_stem(title: &str, url: &str) -> String {
     let source = match title.trim() {
-        "" => url.split("://").nth(1).unwrap_or(url).split('/').next().unwrap_or("page"),
+        "" => url
+            .split("://")
+            .nth(1)
+            .unwrap_or(url)
+            .split('/')
+            .next()
+            .unwrap_or("page"),
         title => title,
     };
     let stem: String = source
@@ -255,7 +280,9 @@ fn unique_name(dir: &Path, name: &str) -> String {
 }
 
 pub fn load_downloads() -> Vec<Download> {
-    let Some(dir) = profile_dir() else { return Vec::new() };
+    let Some(dir) = profile_dir() else {
+        return Vec::new();
+    };
     let text = crate::crypto::read_file(&dir.join("downloads.tsv")).unwrap_or_default();
     text.lines().filter_map(parse_download).collect()
 }
@@ -332,7 +359,10 @@ mod tests {
             })
         );
         // A title is optional.
-        assert_eq!(parse_visit("5\thttps://a.com").map(|v| v.title), Some(String::new()));
+        assert_eq!(
+            parse_visit("5\thttps://a.com").map(|v| v.title),
+            Some(String::new())
+        );
         // Junk lines are dropped, not fatal.
         assert!(parse_visit("").is_none());
         assert!(parse_visit("not-a-timestamp\thttps://a.com").is_none());
@@ -366,7 +396,10 @@ mod tests {
         let dir = scratch("session");
         assert!(read_session(&dir).is_none()); // nothing saved yet
 
-        let tabs = vec![("https://a.com".to_string(), true), ("https://b.com".to_string(), false)];
+        let tabs = vec![
+            ("https://a.com".to_string(), true),
+            ("https://b.com".to_string(), false),
+        ];
         write_session(&dir, &tabs, 1);
         assert_eq!(read_session(&dir), Some((tabs.clone(), 1)));
 
@@ -378,19 +411,34 @@ mod tests {
     #[test]
     fn a_session_written_before_pinning_still_opens() {
         let dir = scratch("legacy-session");
-        crate::crypto::write_file(&dir.join("session.tsv"), "1\nhttps://a.com\nhttps://b.com\n");
+        crate::crypto::write_file(
+            &dir.join("session.tsv"),
+            "1\nhttps://a.com\nhttps://b.com\n",
+        );
         let (tabs, active) = read_session(&dir).expect("legacy session");
         assert_eq!(active, 1);
-        assert_eq!(tabs, vec![("https://a.com".into(), false), ("https://b.com".into(), false)]);
+        assert_eq!(
+            tabs,
+            vec![
+                ("https://a.com".into(), false),
+                ("https://b.com".into(), false)
+            ]
+        );
     }
 
     #[test]
     fn saved_pages_are_named_after_the_page_and_never_collide() {
         let dir = scratch("downloads");
         // A title becomes the file name; path-hostile characters do not survive.
-        assert_eq!(file_stem("Rust: a language/guide", "https://a.com"), "Rust- a language-guide.html");
+        assert_eq!(
+            file_stem("Rust: a language/guide", "https://a.com"),
+            "Rust- a language-guide.html"
+        );
         // No usable title falls back to the host.
-        assert_eq!(file_stem("  ", "https://news.ycombinator.com/x"), "news.ycombinator.com.html");
+        assert_eq!(
+            file_stem("  ", "https://news.ycombinator.com/x"),
+            "news.ycombinator.com.html"
+        );
         assert_eq!(file_stem("///", "https://a.com"), "page.html");
 
         // Saving twice keeps both copies.

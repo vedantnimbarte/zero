@@ -52,7 +52,9 @@ pub fn current() -> String {
 }
 
 fn read_current() -> String {
-    let Some(path) = marker() else { return DEFAULT.to_string() };
+    let Some(path) = marker() else {
+        return DEFAULT.to_string();
+    };
     match std::fs::read_to_string(path) {
         Ok(name) => match sanitize(&name) {
             Some(name) => name,
@@ -113,7 +115,9 @@ pub fn accent_of(name: &str) -> &'static str {
     if name == DEFAULT {
         return ACCENTS[0];
     }
-    let hash = name.bytes().fold(0usize, |acc, b| acc.wrapping_mul(31).wrapping_add(b as usize));
+    let hash = name.bytes().fold(0usize, |acc, b| {
+        acc.wrapping_mul(31).wrapping_add(b as usize)
+    });
     // The default's red is reserved, so other spaces are visibly not it.
     ACCENTS[1 + hash % (ACCENTS.len() - 1)]
 }
@@ -145,7 +149,10 @@ mod tests {
     #[test]
     fn names_are_cleaned_or_refused() {
         assert_eq!(sanitize("Work"), Some("work".to_string()));
-        assert_eq!(sanitize("  side project "), Some("side project".to_string()));
+        assert_eq!(
+            sanitize("  side project "),
+            Some("side project".to_string())
+        );
         // Path separators and dots cannot survive: a space name is a directory.
         assert_eq!(sanitize("../../etc"), Some("etc".to_string()));
         assert_eq!(sanitize("a/b"), Some("ab".to_string()));

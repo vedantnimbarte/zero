@@ -42,7 +42,13 @@ pub struct SiteStore {
 /// A file name that cannot escape its directory, whatever the site is called.
 fn safe_name(site: &str) -> String {
     site.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -139,13 +145,20 @@ impl SiteStore {
                 }
             }
         }
-        SiteStore { file, entries: RefCell::new(entries) }
+        SiteStore {
+            file,
+            entries: RefCell::new(entries),
+        }
     }
 
     fn flush(&self) {
         let Some(file) = &self.file else { return };
-        let text: String =
-            self.entries.borrow().iter().map(|(k, v)| format!("{k}\t{v}\n")).collect();
+        let text: String = self
+            .entries
+            .borrow()
+            .iter()
+            .map(|(k, v)| format!("{k}\t{v}\n"))
+            .collect();
         crate::crypto::write_file(file, &text);
     }
 }
@@ -286,7 +299,12 @@ impl TabSessions {
     /// in the same tab never see each other's keys, the same rule
     /// [`SiteStore`] follows on disk.
     pub fn for_site(&self, site: &str) -> std::rc::Rc<dyn zero_engine::KeyValueStore> {
-        let entries = self.sites.borrow_mut().entry(site.to_string()).or_default().clone();
+        let entries = self
+            .sites
+            .borrow_mut()
+            .entry(site.to_string())
+            .or_default()
+            .clone();
         std::rc::Rc::new(SessionStore { entries })
     }
 }
@@ -304,7 +322,9 @@ impl zero_engine::KeyValueStore for SessionStore {
         if !fits(&self.entries.borrow(), key, value) {
             return false;
         }
-        self.entries.borrow_mut().insert(key.to_string(), value.to_string());
+        self.entries
+            .borrow_mut()
+            .insert(key.to_string(), value.to_string());
         true
     }
 
@@ -333,9 +353,21 @@ mod tests {
         // secret the https origin had saved would be readable by a page an
         // attacker on the network can rewrite at will.
         assert_eq!(legacy_host("https://example.com"), Some("example.com"));
-        assert_eq!(legacy_host("http://example.com"), None, "plaintext must inherit nothing");
-        assert_eq!(legacy_host("https://example.com:8443"), None, "a port was never in the old key");
-        assert_eq!(legacy_host("example.com"), None, "a bare host is not an origin");
+        assert_eq!(
+            legacy_host("http://example.com"),
+            None,
+            "plaintext must inherit nothing"
+        );
+        assert_eq!(
+            legacy_host("https://example.com:8443"),
+            None,
+            "a port was never in the old key"
+        );
+        assert_eq!(
+            legacy_host("example.com"),
+            None,
+            "a bare host is not an origin"
+        );
         assert_eq!(legacy_host("zero://settings"), None);
     }
 
@@ -397,18 +429,33 @@ mod tests {
         // is also what makes a write in one tab visible in the other at all.
         let a = site_store("shared.example");
         let b = site_store("shared.example");
-        assert!(std::rc::Rc::ptr_eq(&a, &b), "one site must mean one open store");
+        assert!(
+            std::rc::Rc::ptr_eq(&a, &b),
+            "one site must mean one open store"
+        );
 
         a.set("from_a", "1");
         b.set("from_b", "2");
-        assert_eq!(a.get("from_b").as_deref(), Some("2"), "a must see b's write");
-        assert_eq!(b.get("from_a").as_deref(), Some("1"), "b must see a's write");
+        assert_eq!(
+            a.get("from_b").as_deref(),
+            Some("2"),
+            "a must see b's write"
+        );
+        assert_eq!(
+            b.get("from_a").as_deref(),
+            Some("1"),
+            "b must see a's write"
+        );
         assert_eq!(a.keys().len(), 2, "neither write may have erased the other");
 
         // A different site is a different store, as on disk.
         let other = site_store("elsewhere.example");
         assert!(!std::rc::Rc::ptr_eq(&a, &other));
-        assert_eq!(other.get("from_a"), None, "one site must not see another's keys");
+        assert_eq!(
+            other.get("from_a"),
+            None,
+            "one site must not see another's keys"
+        );
     }
 
     #[test]

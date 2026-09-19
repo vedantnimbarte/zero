@@ -122,7 +122,10 @@ const OPERATORS: &[&str] = &[
 fn starts_value(previous: Option<&Tok>) -> bool {
     match previous {
         Some(Tok::Num(_)) | Some(Tok::Str(_)) | Some(Tok::Regex(..)) | Some(Tok::Ident(_)) => true,
-        Some(Tok::Kw(kw)) => matches!(kw, Kw::This | Kw::True | Kw::False | Kw::Null | Kw::Undefined),
+        Some(Tok::Kw(kw)) => matches!(
+            kw,
+            Kw::This | Kw::True | Kw::False | Kw::Null | Kw::Undefined
+        ),
         Some(Tok::Op(op)) => matches!(op.as_str(), ")" | "]" | "}" | "++" | "--"),
         _ => false,
     }
@@ -142,7 +145,9 @@ pub fn tokenize(src: &str) -> Result<Vec<Tok>, String> {
         }
         // A `/` is division after something that can end an expression, and the
         // start of a regex otherwise: `a / b` versus `split(/,/)`.
-        if c == '/' && !starts_value(out.last()) && chars.get(i + 1) != Some(&'/')
+        if c == '/'
+            && !starts_value(out.last())
+            && chars.get(i + 1) != Some(&'/')
             && chars.get(i + 1) != Some(&'*')
         {
             let mut pattern = String::new();

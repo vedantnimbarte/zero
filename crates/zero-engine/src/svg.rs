@@ -32,7 +32,9 @@ pub fn looks_like_svg(bytes: &[u8]) -> bool {
 /// `viewBox`, else the 300×150 the spec falls back to.
 pub fn intrinsic_size(source: &str) -> (usize, usize) {
     let dom = crate::html::parse(source.to_string());
-    let Some(svg) = find_svg(&dom) else { return (300, 150) };
+    let Some(svg) = find_svg(&dom) else {
+        return (300, 150);
+    };
     let attr = |name: &str| element_of(svg).and_then(|e| attr_of(e, name)).cloned();
     let number = |name: &str| attr(name).and_then(|v| length(&v));
     if let (Some(w), Some(h)) = (number("width"), number("height")) {
@@ -73,16 +75,30 @@ pub fn rasterize(source: &str, width: usize, height: usize) -> Option<DecodedIma
     };
 
     let mut canvas = vec![
-        Color { r: 0, g: 0, b: 0, a: 0 };
+        Color {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 0
+        };
         width * height
     ];
-    let mut ctx = Ctx { canvas: &mut canvas, width, height, view };
+    let mut ctx = Ctx {
+        canvas: &mut canvas,
+        width,
+        height,
+        view,
+    };
     // The root `<svg>` carries presentation attributes like any other element —
     // `fill="none" stroke="…"` on the root is how icon sets state a line style
     // once for every path inside. Skipping it filled every one of them black.
     let inherited = Paint::root().with(elem);
     draw_children(svg, &mut ctx, inherited);
-    Some(DecodedImage { width, height, pixels: canvas })
+    Some(DecodedImage {
+        width,
+        height,
+        pixels: canvas,
+    })
 }
 
 /// The mapping from user units to pixels.
@@ -119,7 +135,12 @@ impl Paint {
     /// SVG's initial state: black fill, no stroke.
     fn root() -> Paint {
         Paint {
-            fill: Some(Color { r: 0, g: 0, b: 0, a: 255 }),
+            fill: Some(Color {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 255,
+            }),
             stroke: None,
             stroke_width: 1.0,
             opacity: 1.0,
@@ -164,7 +185,12 @@ fn paint_color(text: &str) -> Option<Color> {
     }
     // `currentColor` has no cascade to read here; black is the initial colour.
     if text.eq_ignore_ascii_case("currentcolor") {
-        return Some(Color { r: 0, g: 0, b: 0, a: 255 });
+        return Some(Color {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 255,
+        });
     }
     match crate::css::parse_value(text) {
         Some(crate::css::Value::ColorValue(color)) => Some(color),
@@ -199,7 +225,9 @@ fn find_svg(node: &Node) -> Option<&Node> {
 
 fn draw_children(parent: &Node, ctx: &mut Ctx, inherited: Paint) {
     for child in &parent.children {
-        let Some(elem) = element_of(child) else { continue };
+        let Some(elem) = element_of(child) else {
+            continue;
+        };
         let paint = inherited.with(elem);
         match elem.tag_name.as_str() {
             // A group paints nothing itself; it only passes its state down.
@@ -209,8 +237,7 @@ fn draw_children(parent: &Node, ctx: &mut Ctx, inherited: Paint) {
                 let (x, y) = (get("x"), get("y"));
                 let (w, h) = (get("width"), get("height"));
                 if w > 0.0 && h > 0.0 {
-                    let rect =
-                        vec![(x, y), (x + w, y), (x + w, y + h), (x, y + h), (x, y)];
+                    let rect = vec![(x, y), (x + w, y), (x + w, y + h), (x, y + h), (x, y)];
                     fill_and_stroke(ctx, &[rect], paint);
                 }
             }
@@ -300,7 +327,10 @@ fn points_of(text: &str) -> Vec<(f32, f32)> {
         .filter(|p| !p.is_empty())
         .filter_map(|p| p.parse().ok())
         .collect();
-    numbers.chunks_exact(2).map(|pair| (pair[0], pair[1])).collect()
+    numbers
+        .chunks_exact(2)
+        .map(|pair| (pair[0], pair[1]))
+        .collect()
 }
 
 /// A circle or ellipse as a closed polygon. 64 segments is under a third of a
@@ -384,7 +414,11 @@ fn flatten_path(d: &str) -> Vec<Vec<(f32, f32)>> {
                 last_control = None;
             }
             'C' | 'S' => {
-                let stride = if command.to_ascii_uppercase() == 'C' { 6 } else { 4 };
+                let stride = if command.to_ascii_uppercase() == 'C' {
+                    6
+                } else {
+                    4
+                };
                 for group in args.chunks_exact(stride) {
                     let (c1, c2, end) = match stride {
                         6 => (
@@ -411,10 +445,17 @@ fn flatten_path(d: &str) -> Vec<Vec<(f32, f32)>> {
                 }
             }
             'Q' | 'T' => {
-                let stride = if command.to_ascii_uppercase() == 'Q' { 4 } else { 2 };
+                let stride = if command.to_ascii_uppercase() == 'Q' {
+                    4
+                } else {
+                    2
+                };
                 for group in args.chunks_exact(stride) {
                     let (control, end) = match stride {
-                        4 => (at(cursor, group[0], group[1]), at(cursor, group[2], group[3])),
+                        4 => (
+                            at(cursor, group[0], group[1]),
+                            at(cursor, group[2], group[3]),
+                        ),
                         _ => {
                             let mirrored = match last_control {
                                 Some((cx, cy)) => (2.0 * cursor.0 - cx, 2.0 * cursor.1 - cy),
@@ -580,7 +621,9 @@ fn flatten_arc(
         delta += std::f32::consts::TAU;
     }
     // One segment per ~6°, the error budget `ellipse` already spends.
-    let steps = (delta.abs() / (std::f32::consts::TAU / 64.0)).ceil().max(1.0) as usize;
+    let steps = (delta.abs() / (std::f32::consts::TAU / 64.0))
+        .ceil()
+        .max(1.0) as usize;
     for step in 1..=steps {
         let angle = start + delta * step as f32 / steps as f32;
         let (s, c) = angle.sin_cos();
@@ -645,8 +688,10 @@ fn fill(ctx: &mut Ctx, subpaths: &[Vec<(f32, f32)>], paint: Paint) {
 /// makes unaffordable at any size bigger than an icon.
 fn fill_device(ctx: &mut Ctx, polygons: &[Vec<(f32, f32)>], color: Color, opacity: f32) {
     // Every polygon is closed for filling, whether or not it said `Z`.
-    let edges: Vec<((f32, f32), (f32, f32))> =
-        polygons.iter().flat_map(|points| closed_edges(points)).collect();
+    let edges: Vec<((f32, f32), (f32, f32))> = polygons
+        .iter()
+        .flat_map(|points| closed_edges(points))
+        .collect();
     if edges.is_empty() {
         return;
     }
@@ -760,7 +805,10 @@ fn disc(centre: (f32, f32), radius: f32) -> Vec<(f32, f32)> {
     (0..=SIDES)
         .map(|i| {
             let angle = i as f32 / SIDES as f32 * std::f32::consts::TAU;
-            (centre.0 + radius * angle.cos(), centre.1 - radius * angle.sin())
+            (
+                centre.0 + radius * angle.cos(),
+                centre.1 - radius * angle.sin(),
+            )
         })
         .collect()
 }
@@ -792,8 +840,14 @@ fn closed_edges(points: &[(f32, f32)]) -> Vec<((f32, f32), (f32, f32))> {
 /// The rows a shape can possibly touch, so a small icon in a big canvas does
 /// not cost a full-canvas sweep per shape.
 fn vertical_span(edges: &[((f32, f32), (f32, f32))], height: usize) -> (usize, usize) {
-    let min = edges.iter().flat_map(|(a, b)| [a.1, b.1]).fold(f32::MAX, f32::min);
-    let max = edges.iter().flat_map(|(a, b)| [a.1, b.1]).fold(f32::MIN, f32::max);
+    let min = edges
+        .iter()
+        .flat_map(|(a, b)| [a.1, b.1])
+        .fold(f32::MAX, f32::min);
+    let max = edges
+        .iter()
+        .flat_map(|(a, b)| [a.1, b.1])
+        .fold(f32::MIN, f32::max);
     (
         min.floor().max(0.0) as usize,
         (max.ceil().max(0.0) as usize + 1).min(height),
@@ -842,13 +896,24 @@ mod tests {
             100,
         )
         .expect("rasterized");
-        assert_eq!(at(&img, 50, 50), Color { r: 255, g: 0, b: 0, a: 255 });
+        assert_eq!(
+            at(&img, 50, 50),
+            Color {
+                r: 255,
+                g: 0,
+                b: 0,
+                a: 255
+            }
+        );
         // Outside the circle the image stays transparent, not black.
         assert_eq!(at(&img, 2, 2).a, 0);
         // The rim is anti-aliased rather than a hard jump — a circle drawn with
         // whole pixels alone would have no partial coverage anywhere.
         let soft = img.pixels.iter().filter(|p| p.a > 0 && p.a < 255).count();
-        assert!(soft > 20, "expected a soft rim, found {soft} partial pixels");
+        assert!(
+            soft > 20,
+            "expected a soft rim, found {soft} partial pixels"
+        );
     }
 
     #[test]
@@ -860,7 +925,15 @@ mod tests {
             100,
         )
         .expect("rasterized");
-        assert_eq!(at(&img, 20, 50), Color { r: 0, g: 0, b: 255, a: 255 });
+        assert_eq!(
+            at(&img, 20, 50),
+            Color {
+                r: 0,
+                g: 0,
+                b: 255,
+                a: 255
+            }
+        );
         // ...and not the corner outside it.
         assert_eq!(at(&img, 95, 95).a, 0);
     }
@@ -903,11 +976,27 @@ mod tests {
             .expect("rasterized")
         };
         let up = disc(1);
-        assert_eq!(at(&up, 50, 20), Color { r: 255, g: 0, b: 0, a: 255 });
+        assert_eq!(
+            at(&up, 50, 20),
+            Color {
+                r: 255,
+                g: 0,
+                b: 0,
+                a: 255
+            }
+        );
         assert_eq!(at(&up, 50, 80).a, 0);
 
         let down = disc(0);
-        assert_eq!(at(&down, 50, 80), Color { r: 255, g: 0, b: 0, a: 255 });
+        assert_eq!(
+            at(&down, 50, 80),
+            Color {
+                r: 255,
+                g: 0,
+                b: 0,
+                a: 255
+            }
+        );
         assert_eq!(at(&down, 50, 20).a, 0);
 
         // A radius too small to span the endpoints is grown until it fits,
@@ -918,7 +1007,15 @@ mod tests {
             100,
         )
         .expect("rasterized");
-        assert_eq!(at(&wide, 50, 20), Color { r: 255, g: 0, b: 0, a: 255 });
+        assert_eq!(
+            at(&wide, 50, 20),
+            Color {
+                r: 255,
+                g: 0,
+                b: 0,
+                a: 255
+            }
+        );
     }
 
     #[test]
@@ -932,7 +1029,15 @@ mod tests {
             20,
         )
         .expect("rasterized");
-        assert_eq!(at(&img, 10, 10), Color { r: 255, g: 0, b: 0, a: 255 });
+        assert_eq!(
+            at(&img, 10, 10),
+            Color {
+                r: 255,
+                g: 0,
+                b: 0,
+                a: 255
+            }
+        );
         // `fill:none` from the root holds too, or the line would be a filled blob.
         assert_eq!(at(&img, 2, 10).a, 0);
     }
@@ -950,16 +1055,35 @@ mod tests {
         )
         .expect("rasterized");
         // The group's fill reached its child.
-        assert_eq!(at(&img, 5, 10), Color { r: 0, g: 255, b: 0, a: 255 });
+        assert_eq!(
+            at(&img, 5, 10),
+            Color {
+                r: 0,
+                g: 255,
+                b: 0,
+                a: 255
+            }
+        );
         // The stroked line is four units wide around x=15.
-        assert_eq!(at(&img, 15, 10), Color { r: 255, g: 0, b: 0, a: 255 });
+        assert_eq!(
+            at(&img, 15, 10),
+            Color {
+                r: 255,
+                g: 0,
+                b: 0,
+                a: 255
+            }
+        );
         // `fill: none` painted nothing over the rest.
         assert_eq!(at(&img, 11, 2).a, 0);
     }
 
     #[test]
     fn the_view_box_scales_and_the_intrinsic_size_is_read() {
-        assert_eq!(intrinsic_size("<svg width='24' height='16'></svg>"), (24, 16));
+        assert_eq!(
+            intrinsic_size("<svg width='24' height='16'></svg>"),
+            (24, 16)
+        );
         assert_eq!(intrinsic_size("<svg viewBox='0 0 48 12'></svg>"), (48, 12));
         assert_eq!(intrinsic_size("<svg></svg>"), (300, 150));
 

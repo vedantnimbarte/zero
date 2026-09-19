@@ -19,10 +19,10 @@
 //! Horizontal layout puts a tab strip across the top instead, and the rail goes away.
 
 use crate::ai::{Assistant, LocalAssistant, PageContext};
-use crate::net::{load_target, normalize_target, resolve_url, ShellLoader};
 use crate::i18n::{t, t_tip};
-use crate::settings::{self, Rail, Settings, TabLayout, ZOOM_STEPS};
+use crate::net::{load_target, normalize_target, resolve_url, ShellLoader};
 use crate::renderer;
+use crate::settings::{self, Rail, Settings, TabLayout, ZOOM_STEPS};
 
 /// A real renderer spawns a child process, which a unit test's binary can't
 /// point at (see [`renderer::FakeRenderer`] for why) — so tests get an
@@ -278,7 +278,10 @@ pub mod icon {
         line(color, "<path d='m6 3 5 5-5 5'/>")
     }
     pub fn reload(color: &str) -> String {
-        line(color, "<path d='M13 8a5 5 0 1 1-1.46-3.54M13.25 2.25v3h-3'/>")
+        line(
+            color,
+            "<path d='M13 8a5 5 0 1 1-1.46-3.54M13.25 2.25v3h-3'/>",
+        )
     }
     pub fn star(color: &str, filled: bool) -> String {
         let fill = if filled { color } else { "none" };
@@ -306,7 +309,10 @@ pub mod icon {
         )
     }
     pub fn find(color: &str) -> String {
-        line(color, "<circle cx='7.2' cy='7.2' r='4.45'/><path d='M10.6 10.6 13.6 13.6'/>")
+        line(
+            color,
+            "<circle cx='7.2' cy='7.2' r='4.45'/><path d='M10.6 10.6 13.6 13.6'/>",
+        )
     }
     pub fn close(color: &str, size: u32) -> String {
         drawn(color, size, "<path d='m4.75 4.75 6.5 6.5m0-6.5-6.5 6.5'/>")
@@ -326,11 +332,17 @@ pub mod icon {
         )
     }
     pub fn insecure(color: &str) -> String {
-        line(color, "<path d='M8 2.6 14 13.2H2z'/><path d='M8 6.6v2.9'/><path d='M8 11.4v.1'/>")
+        line(
+            color,
+            "<path d='M8 2.6 14 13.2H2z'/><path d='M8 6.6v2.9'/><path d='M8 11.4v.1'/>",
+        )
     }
     /// The shield the site marks a clean page with.
     pub fn shield(color: &str) -> String {
-        line(color, "<path d='M8 1.8 13 3.6v4.1c0 3-2.1 5.4-5 6.5-2.9-1.1-5-3.5-5-6.5V3.6z'/>")
+        line(
+            color,
+            "<path d='M8 1.8 13 3.6v4.1c0 3-2.1 5.4-5 6.5-2.9-1.1-5-3.5-5-6.5V3.6z'/>",
+        )
     }
     /// The assistant's speech bubble.
     pub fn assistant(color: &str) -> String {
@@ -356,7 +368,10 @@ pub mod icon {
             true => "<path d='m8.4 6.2 1.8 1.8-1.8 1.8'/>",
             false => "<path d='M10.2 6.2 8.4 8l1.8 1.8'/>",
         };
-        line(color, &format!("<rect x='2' y='3' width='12' height='10' rx='2'/>{chevron}"))
+        line(
+            color,
+            &format!("<rect x='2' y='3' width='12' height='10' rx='2'/>{chevron}"),
+        )
     }
     /// Settings as two sliders rather than a gear: a gear at 16px with a 1.5px
     /// stroke is a smudge, and this says the same thing.
@@ -368,15 +383,26 @@ pub mod icon {
         )
     }
     pub fn download(color: &str) -> String {
-        line(color, "<path d='M8 2.5v7.75M4.9 7.4 8 10.5l3.1-3.1M3 13.25h10'/>")
+        line(
+            color,
+            "<path d='M8 2.5v7.75M4.9 7.4 8 10.5l3.1-3.1M3 13.25h10'/>",
+        )
     }
     /// A pinned tab's dot, small enough to sit inside a line of text.
     pub fn pinned(color: &str) -> String {
-        drawn(color, 8, &format!("<circle fill='{color}' stroke='none' cx='8' cy='8' r='4'/>"))
+        drawn(
+            color,
+            8,
+            &format!("<circle fill='{color}' stroke='none' cx='8' cy='8' r='4'/>"),
+        )
     }
     /// The space's dot in the rail's footer.
     pub fn dot(color: &str, size: u32) -> String {
-        drawn(color, size, &format!("<circle fill='{color}' stroke='none' cx='8' cy='8' r='4.5'/>"))
+        drawn(
+            color,
+            size,
+            &format!("<circle fill='{color}' stroke='none' cx='8' cy='8' r='4.5'/>"),
+        )
     }
 
     /// The mark: a ring with a gap near one o'clock, and the blue light where
@@ -659,7 +685,9 @@ fn scrollbar_thumb(content: f32, viewport: f32, scroll: f32) -> Option<(f32, f32
 
 /// Scroll offset for a cursor at `y` within the page area, centring the thumb.
 fn scroll_for_cursor(content: f32, viewport: f32, y: f32) -> f32 {
-    let Some((_, thumb)) = scrollbar_thumb(content, viewport, 0.0) else { return 0.0 };
+    let Some((_, thumb)) = scrollbar_thumb(content, viewport, 0.0) else {
+        return 0.0;
+    };
     let travel = (viewport - thumb).max(1.0);
     let ratio = ((y - thumb / 2.0) / travel).clamp(0.0, 1.0);
     ratio * (content - viewport)
@@ -671,20 +699,26 @@ fn scroll_for_cursor(content: f32, viewport: f32, y: f32) -> f32 {
 /// zoomed page gets a narrower viewport, so its media queries and wrapping
 /// behave as they would in a smaller window, instead of the page being cropped.
 fn layout_size(content_w: u32, content_h: u32, zoom: f32) -> (f32, f32) {
-    ((content_w as f32 / zoom).max(1.0), (content_h as f32 / zoom).max(1.0))
+    (
+        (content_w as f32 / zoom).max(1.0),
+        (content_h as f32 / zoom).max(1.0),
+    )
 }
 
 /// The next zoom step in `direction`, clamped at the ends of the scale.
 fn zoom_step(current: u32, direction: i32) -> u32 {
-    let at = ZOOM_STEPS.iter().position(|z| *z == current).unwrap_or_else(|| {
-        // An unlisted value (an old settings file) snaps to the nearest step.
-        ZOOM_STEPS
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, z)| z.abs_diff(current))
-            .map(|(i, _)| i)
-            .expect("the scale is not empty")
-    });
+    let at = ZOOM_STEPS
+        .iter()
+        .position(|z| *z == current)
+        .unwrap_or_else(|| {
+            // An unlisted value (an old settings file) snaps to the nearest step.
+            ZOOM_STEPS
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, z)| z.abs_diff(current))
+                .map(|(i, _)| i)
+                .expect("the scale is not empty")
+        });
     let next = (at as i32 + direction).clamp(0, ZOOM_STEPS.len() as i32 - 1);
     ZOOM_STEPS[next as usize]
 }
@@ -705,7 +739,9 @@ fn submission_url(address: &str, sent: &zero_engine::Submission) -> String {
 }
 
 fn escape(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// Ctrl+Shift+T and Ctrl+T arrive as different characters, so chords are matched
@@ -728,7 +764,11 @@ fn storage_site(address: &str) -> String {
     if host.is_empty() {
         return address_label(address);
     }
-    let scheme = address.split("://").next().unwrap_or("").to_ascii_lowercase();
+    let scheme = address
+        .split("://")
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
     if scheme.is_empty() || scheme == address {
         return host;
     }
@@ -812,7 +852,10 @@ fn initial(label: &str) -> String {
 enum Selection {
     /// Pressed at one point and dragged to another — or extended with Shift,
     /// which moves `focus` and leaves `anchor` where it was.
-    Span { anchor: (f32, f32), focus: (f32, f32) },
+    Span {
+        anchor: (f32, f32),
+        focus: (f32, f32),
+    },
     /// Double-click: the word under the point.
     Word((f32, f32)),
     /// Triple-click: the line under the point.
@@ -851,7 +894,11 @@ fn point_key(runs: &[TextRun], (x, y): (f32, f32)) -> (f32, f32) {
 fn selected_runs(runs: &[TextRun], selection: Selection) -> Vec<&TextRun> {
     match selection {
         Selection::All => runs.iter().collect(),
-        Selection::Word(point) => runs.iter().filter(|r| run_holds(r, point)).take(1).collect(),
+        Selection::Word(point) => runs
+            .iter()
+            .filter(|r| run_holds(r, point))
+            .take(1)
+            .collect(),
         // Runs on one line all carry that line's top as their `y`, set once by
         // inline layout — so "the same line" is an exact comparison, not a
         // tolerance.
@@ -862,7 +909,9 @@ fn selected_runs(runs: &[TextRun], selection: Selection) -> Vec<&TextRun> {
         Selection::Span { anchor, focus } => {
             let (a, b) = (point_key(runs, anchor), point_key(runs, focus));
             let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-            runs.iter().filter(|r| (lo..=hi).contains(&run_key(r))).collect()
+            runs.iter()
+                .filter(|r| (lo..=hi).contains(&run_key(r)))
+                .collect()
         }
     }
 }
@@ -1016,9 +1065,18 @@ fn next_tab_id() -> usize {
 fn canvas_from_frame(frame: &renderer::Frame) -> Canvas {
     let mut pixels = Vec::with_capacity(frame.width * frame.height);
     for p in frame.pixels.chunks_exact(4) {
-        pixels.push(zero_engine::Color { r: p[0], g: p[1], b: p[2], a: p[3] });
+        pixels.push(zero_engine::Color {
+            r: p[0],
+            g: p[1],
+            b: p[2],
+            a: p[3],
+        });
     }
-    Canvas { pixels, width: frame.width, height: frame.height }
+    Canvas {
+        pixels,
+        width: frame.width,
+        height: frame.height,
+    }
 }
 
 impl Tab {
@@ -1090,7 +1148,11 @@ impl Tab {
 
     fn blank() -> Tab {
         let address = "zero://newtab".to_string();
-        let mut tab = Tab::new(address.clone(), crate::internal::page(&address), String::new());
+        let mut tab = Tab::new(
+            address.clone(),
+            crate::internal::page(&address),
+            String::new(),
+        );
         tab.address = address; // shown in the bar, and reloadable like any page
         tab
     }
@@ -1143,7 +1205,9 @@ impl Tab {
 
     /// Whether the band this tab is holding covers `height` rows from `top`.
     fn band_covers(&self, top: f32, height: f32) -> bool {
-        let Some(canvas) = self.page_canvas.as_ref() else { return false };
+        let Some(canvas) = self.page_canvas.as_ref() else {
+            return false;
+        };
         let held = canvas.height as f32;
         // The bottom of the page is covered by a band that reaches the end of
         // the document, even when it is shorter than a screenful.
@@ -1239,12 +1303,18 @@ pub fn screenshot(
     // pose the chrome in Hindi around a page still written in English.
     if crate::internal::is_internal(&app.tabs[0].address) {
         let address = app.tabs[0].address.clone();
-        app.tabs[0] = Tab::new(address.clone(), crate::internal::page(&address), String::new());
+        app.tabs[0] = Tab::new(
+            address.clone(),
+            crate::internal::page(&address),
+            String::new(),
+        );
     }
     // A still image has no time to animate in, so the rail starts where it
     // lands — unless a pose asked for a particular point mid-slide.
     if let Some(px) = poses.iter().find_map(|p| p.strip_prefix("railpx:")) {
-        app.rail_px = px.parse().unwrap_or_else(|_| rail_target(app.settings) as f32);
+        app.rail_px = px
+            .parse()
+            .unwrap_or_else(|_| rail_target(app.settings) as f32);
     } else {
         app.rail_px = rail_target(app.settings) as f32;
     }
@@ -1261,7 +1331,9 @@ pub fn run_window_restoring_session(engine: Engine) -> bool {
     if !settings::current().restore {
         return false;
     }
-    let Some((saved, active)) = storage::load_session() else { return false };
+    let Some((saved, active)) = storage::load_session() else {
+        return false;
+    };
     let tabs: Vec<Tab> = saved
         .iter()
         .map(|(url, pinned)| {
@@ -1374,7 +1446,11 @@ impl ApplicationHandler for App {
             .with_title("Zero Browser")
             .with_window_icon(window_icon())
             .with_inner_size(LogicalSize::new(1180.0, 760.0));
-        let window = Rc::new(event_loop.create_window(attrs).expect("failed to create window"));
+        let window = Rc::new(
+            event_loop
+                .create_window(attrs)
+                .expect("failed to create window"),
+        );
         // Devanagari, Tamil and CJK are typed through an input method, which
         // sends composed text as its own event and never as a key press.
         window.set_ime_allowed(true);
@@ -1441,7 +1517,11 @@ impl ApplicationHandler for App {
                     self.update_hover();
                 }
             }
-            WindowEvent::MouseInput { state: ElementState::Released, button, .. } => {
+            WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button,
+                ..
+            } => {
                 self.dragging_scrollbar = false;
                 self.dragging_divider = false;
                 // A press that never became a drag was a click, and the page
@@ -1457,7 +1537,11 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
-            WindowEvent::MouseInput { state: ElementState::Pressed, button, .. } => {
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button,
+                ..
+            } => {
                 match button {
                     MouseButton::Left => self.handle_click(),
                     MouseButton::Back => self.back(),
@@ -1491,8 +1575,11 @@ fn window_icon() -> Option<winit::window::Icon> {
     };
     let source = icon::ring(ring, SIZE);
     let drawn = zero_engine::svg::rasterize(&source, SIZE as usize, SIZE as usize)?;
-    let rgba: Vec<u8> =
-        drawn.pixels.iter().flat_map(|p| [p.r, p.g, p.b, p.a]).collect();
+    let rgba: Vec<u8> = drawn
+        .pixels
+        .iter()
+        .flat_map(|p| [p.r, p.g, p.b, p.a])
+        .collect();
     winit::window::Icon::from_rgba(rgba, SIZE, SIZE).ok()
 }
 
@@ -1636,7 +1723,9 @@ impl App {
         } else {
             ("xdg-open", vec![url])
         };
-        let _ = std::process::Command::new(launcher.0).args(launcher.1).spawn();
+        let _ = std::process::Command::new(launcher.0)
+            .args(launcher.1)
+            .spawn();
     }
 
     /// Move to another space: a different profile, and so a different session,
@@ -1646,7 +1735,9 @@ impl App {
             return;
         }
         self.save_session(); // the space being left keeps its tabs
-        let Some(_) = crate::spaces::switch(name) else { return };
+        let Some(_) = crate::spaces::switch(name) else {
+            return;
+        };
         settings::reload();
         self.settings = settings::current();
         // Nothing from the old space may stay on screen: its tabs are its own.
@@ -1754,7 +1845,9 @@ impl App {
 
     /// Reopen the most recently closed tab, in front.
     fn reopen_closed(&mut self) {
-        let Some(address) = self.closed.pop() else { return };
+        let Some(address) = self.closed.pop() else {
+            return;
+        };
         self.tabs.push(Tab::blank());
         self.active = self.tabs.len() - 1;
         self.go_to(address);
@@ -2022,7 +2115,9 @@ impl App {
             return; // the assistant panel is not the page
         }
 
-        let Some(point) = self.page_coords((cx, cy), &regions) else { return };
+        let Some(point) = self.page_coords((cx, cy), &regions) else {
+            return;
+        };
         self.press_page(point);
     }
 
@@ -2055,16 +2150,20 @@ impl App {
             (3.., _) => Some(Selection::Line(point)),
             // Shift keeps the anchor and moves the far end, so a selection can
             // be grown after the fact without dragging it again.
-            (_, Some(Selection::Span { anchor, .. })) if extend => {
-                Some(Selection::Span { anchor, focus: point })
-            }
+            (_, Some(Selection::Span { anchor, .. })) if extend => Some(Selection::Span {
+                anchor,
+                focus: point,
+            }),
             // Shift after a double- or triple-click has no anchor of its own to
             // keep, so the selection's own first word stands in for one.
             (_, Some(existing)) if extend => {
                 let anchor = selected_runs(&tab.text_runs, existing)
                     .first()
                     .map_or(point, |r| (r.x, r.y + r.height / 2.0));
-                Some(Selection::Span { anchor, focus: point })
+                Some(Selection::Span {
+                    anchor,
+                    focus: point,
+                })
             }
             // A plain press clears what was selected; the drag, if there is
             // one, puts a new selection back.
@@ -2077,7 +2176,9 @@ impl App {
     fn extend_selection(&mut self) {
         let Some(anchor) = self.pressed else { return };
         let regions = self.regions();
-        let Some(focus) = self.page_coords(self.cursor, &regions) else { return };
+        let Some(focus) = self.page_coords(self.cursor, &regions) else {
+            return;
+        };
         // A few pixels of travel is a shaky click, not a drag — without this a
         // hand that moves while clicking would never reach `click_page`, and
         // links would stop working.
@@ -2095,7 +2196,9 @@ impl App {
     /// Put the selected text on the system clipboard.
     fn copy_selection(&mut self) {
         let tab = self.tab();
-        let Some(selection) = tab.selection else { return };
+        let Some(selection) = tab.selection else {
+            return;
+        };
         crate::clipboard::set(&selection_text(&selected_runs(&tab.text_runs, selection)));
     }
 
@@ -2154,7 +2257,11 @@ impl App {
 
     /// The chrome control under a window position, topmost and innermost first.
     fn hit_at(&self, x: f32, y: f32) -> Option<&str> {
-        self.hits.iter().rev().find(|hit| hit.contains(x, y)).map(|hit| hit.id.as_str())
+        self.hits
+            .iter()
+            .rev()
+            .find(|hit| hit.contains(x, y))
+            .map(|hit| hit.id.as_str())
     }
 
     /// Perform a chrome control's action. Returns whether anything happened.
@@ -2239,7 +2346,9 @@ impl App {
 
     /// Apply `zero://settings?key=value`, returning the address to actually open.
     fn apply_setting_link(&mut self, target: String) -> String {
-        let Some(query) = target.strip_prefix("zero://settings?") else { return target };
+        let Some(query) = target.strip_prefix("zero://settings?") else {
+            return target;
+        };
         // A space is not a preference — it decides which preferences file the
         // rest of this query would even be written to, so it goes first and
         // alone.
@@ -2399,8 +2508,16 @@ impl App {
             let tab = self.tab();
             (tab.address.clone(), tab.blocked_count, tab.secure)
         };
-        let Some((text, headings)) = self.tab_mut().renderer.page_text() else { return };
-        let ctx = PageContext { url, text, headings, blocked_trackers, secure };
+        let Some((text, headings)) = self.tab_mut().renderer.page_text() else {
+            return;
+        };
+        let ctx = PageContext {
+            url,
+            text,
+            headings,
+            blocked_trackers,
+            secure,
+        };
         let assistant = LocalAssistant;
         // The provenance is a plain sentence, not an aside in brackets: where
         // the summary came from is the most reassuring thing on the panel.
@@ -2413,7 +2530,11 @@ impl App {
             .lines()
             .map(|line| {
                 // A section label reads as one, rather than as another sentence.
-                let class = if crate::ai::is_section(line) { "sec" } else { "line" };
+                let class = if crate::ai::is_section(line) {
+                    "sec"
+                } else {
+                    "line"
+                };
                 format!("<div class=\"{class}\">{}</div>", escape(line))
             })
             .collect();
@@ -2489,7 +2610,11 @@ impl App {
             return;
         }
         let html = crate::internal::source_page(&address, &source);
-        self.tabs.push(Tab::new(format!("view-source:{address}"), html, String::new()));
+        self.tabs.push(Tab::new(
+            format!("view-source:{address}"),
+            html,
+            String::new(),
+        ));
         self.active = self.tabs.len() - 1;
         self.request_redraw();
     }
@@ -2561,8 +2686,12 @@ impl App {
         // Matches are in document order, so "next" is the first one past the top
         // of the viewport; a small margin stops the current match re-matching.
         let top = tab.scroll_y / tab.zoom_factor();
-        let next =
-            tab.matches.iter().find(|r| r.y > top + 4.0).or_else(|| tab.matches.first()).copied();
+        let next = tab
+            .matches
+            .iter()
+            .find(|r| r.y > top + 4.0)
+            .or_else(|| tab.matches.first())
+            .copied();
         if let Some(rect) = next {
             // Land the match a third of the way down rather than at the very top.
             tab.scroll_y = (rect.y * tab.zoom_factor() - viewport / 3.0).max(0.0);
@@ -2670,7 +2799,10 @@ impl App {
             left.push_str(&format!(
                 "<span id=\"rail\" class=\"{}\">{}</span>",
                 self.lit("rail", "btn"),
-                icon::rail(self.ink("rail", theme::muted()), self.settings.rail == Rail::Hidden),
+                icon::rail(
+                    self.ink("rail", theme::muted()),
+                    self.settings.rail == Rail::Hidden
+                ),
             ));
             buttons += 1;
         }
@@ -2818,7 +2950,10 @@ impl App {
                     );
                 }
                 let pin = match tab.pinned {
-                    true => format!("<span class=\"pin\">{}</span>", icon::pinned(theme::accent())),
+                    true => format!(
+                        "<span class=\"pin\">{}</span>",
+                        icon::pinned(theme::accent())
+                    ),
                     false => String::new(),
                 };
                 format!(
@@ -2835,7 +2970,11 @@ impl App {
             "<div id=\"new\" class=\"{}\"><span class=\"plus\">{}</span>{}</div>",
             self.lit("new", "tab new"),
             icon::add(self.ink("new", theme::faint())),
-            if icons { String::new() } else { escape(&t("New tab")) },
+            if icons {
+                String::new()
+            } else {
+                escape(&t("New tab"))
+            },
         );
         if icons {
             // Narrow: the mark alone, and a column of initials under it.
@@ -2860,7 +2999,10 @@ impl App {
             ),
         };
         let empty = match rows.is_empty() {
-            true => format!("<div class=\"none\">{}</div>", escape(&t("No tab matches that."))),
+            true => format!(
+                "<div class=\"none\">{}</div>",
+                escape(&t("No tab matches that."))
+            ),
             false => String::new(),
         };
         // Two places worth keeping one click away, as the site's rail does.
@@ -2997,7 +3139,10 @@ impl App {
                     false => "tab",
                 };
                 let pin = match tab.pinned {
-                    true => format!("<span class=\"pin\">{}</span>", icon::pinned(theme::accent())),
+                    true => format!(
+                        "<span class=\"pin\">{}</span>",
+                        icon::pinned(theme::accent())
+                    ),
                     false => String::new(),
                 };
                 // A strip tab is narrower than a rail row, so it names itself
@@ -3150,13 +3295,18 @@ impl App {
             return None; // an open menu already names everything it offers
         }
         let id = self.hovered.as_deref()?;
-        if let Some(index) = id.strip_prefix("tab:").and_then(|i| i.parse::<usize>().ok()) {
+        if let Some(index) = id
+            .strip_prefix("tab:")
+            .and_then(|i| i.parse::<usize>().ok())
+        {
             return self.tabs.get(index).map(|tab| tab.label());
         }
         if id.starts_with("close:") {
             return Some(t_tip("Close tab  ·  Ctrl+W"));
         }
-        TIPS.iter().find(|(key, _)| *key == id).map(|(_, tip)| t_tip(tip))
+        TIPS.iter()
+            .find(|(key, _)| *key == id)
+            .map(|(_, tip)| t_tip(tip))
     }
 
     // --- compositing ---
@@ -3253,13 +3403,18 @@ impl App {
         let loader = ShellLoader::new(String::new());
         let page = engine.render_page(html, css, w as f32, h as f32, &loader);
         if interactive {
-            hits.extend(page.element_rects.iter().filter(|r| !r.id.is_empty()).map(|r| Hit {
-                id: r.id.clone(),
-                x: r.x + x as f32,
-                y: r.y + y as f32,
-                width: r.width,
-                height: r.height,
-            }));
+            hits.extend(
+                page.element_rects
+                    .iter()
+                    .filter(|r| !r.id.is_empty())
+                    .map(|r| Hit {
+                        id: r.id.clone(),
+                        x: r.x + x as f32,
+                        y: r.y + y as f32,
+                        width: r.width,
+                        height: r.height,
+                    }),
+            );
         }
         page.canvas
     }
@@ -3414,13 +3569,21 @@ impl App {
         // part is chrome — filling it with the page's own colour would make the
         // card's margin look like a rendering gap.
         let mut buffer = vec![theme::packed(theme::chrome()); (w * h) as usize];
-        let page = self.tabs[self.active].page_canvas.as_ref().expect("rendered above");
+        let page = self.tabs[self.active]
+            .page_canvas
+            .as_ref()
+            .expect("rendered above");
         blit_page(
             &mut buffer,
             w,
             h,
             page,
-            (regions.content_x, regions.content_y, regions.content_w, regions.content_h),
+            (
+                regions.content_x,
+                regions.content_y,
+                regions.content_w,
+                regions.content_h,
+            ),
             scroll,
             zoom,
             self.tabs[self.active].band_top,
@@ -3431,7 +3594,12 @@ impl App {
                 &mut buffer,
                 w,
                 h,
-                (regions.content_x, regions.content_y, regions.content_w, regions.content_h),
+                (
+                    regions.content_x,
+                    regions.content_y,
+                    regions.content_w,
+                    regions.content_h,
+                ),
                 scroll,
                 zoom,
                 &selected_runs(&tab.text_runs, selection),
@@ -3516,11 +3684,20 @@ impl App {
         // edge is ruled — after the scrollbar, which draws inside it.
         let hairline = theme::packed(theme::line());
         let behind = theme::packed(theme::chrome());
-        let pane = (regions.content_x, regions.content_y, regions.content_w, regions.content_h);
+        let pane = (
+            regions.content_x,
+            regions.content_y,
+            regions.content_w,
+            regions.content_h,
+        );
         frame_pane(&mut buffer, w, h, pane, hairline, behind);
         if regions.other_w > 0 {
-            let other =
-                (regions.other_x, regions.content_y, regions.other_w, regions.content_h);
+            let other = (
+                regions.other_x,
+                regions.content_y,
+                regions.other_w,
+                regions.content_h,
+            );
             frame_pane(&mut buffer, w, h, other, hairline, behind);
         }
 
@@ -3544,7 +3721,10 @@ impl App {
                 let tip = Self::chrome(
                     engine,
                     &mut hits,
-                    &format!("<html><body><div id=\"tip\">{}</div></body></html>", escape(&text)),
+                    &format!(
+                        "<html><body><div id=\"tip\">{}</div></body></html>",
+                        escape(&text)
+                    ),
                     &Self::tooltip_css(),
                     (x, y),
                     (tw, 1),
@@ -3615,7 +3795,9 @@ impl App {
             return;
         }
         let frame = self.frame(w, h);
-        let Some(surface) = self.surface.as_mut() else { return };
+        let Some(surface) = self.surface.as_mut() else {
+            return;
+        };
         surface
             .resize(NonZeroU32::new(w).unwrap(), NonZeroU32::new(h).unwrap())
             .expect("surface resize");
@@ -3885,7 +4067,10 @@ mod tests {
             None,
             "a page served over http must not read the https origin's storage"
         );
-        assert!(!std::rc::Rc::ptr_eq(&secure, &plain), "they must not even be the same area");
+        assert!(
+            !std::rc::Rc::ptr_eq(&secure, &plain),
+            "they must not even be the same area"
+        );
 
         // And the reverse: what http writes cannot be mistaken for the secure
         // origin's own data.
@@ -3911,11 +4096,20 @@ mod tests {
             "an explicit port is a different origin"
         );
         // The things that must NOT split an area.
-        assert_eq!(site("https://example.com/a"), site("https://example.com/b/c?q=1"));
+        assert_eq!(
+            site("https://example.com/a"),
+            site("https://example.com/b/c?q=1")
+        );
         assert_eq!(site("https://EXAMPLE.com/a"), site("https://example.com/a"));
-        assert_eq!(site("https://user@example.com/a"), site("https://example.com/a"));
+        assert_eq!(
+            site("https://user@example.com/a"),
+            site("https://example.com/a")
+        );
         // A subdomain is its own origin, as on the web.
-        assert_ne!(site("https://app.example.com/"), site("https://example.com/"));
+        assert_ne!(
+            site("https://app.example.com/"),
+            site("https://example.com/")
+        );
     }
 
     /// The two rules that decide who hears a `localStorage` write. Getting
@@ -3950,7 +4144,11 @@ mod tests {
     use super::*;
 
     fn settings_with(layout: TabLayout, rail: Rail) -> Settings {
-        Settings { layout, rail, ..Settings::default() }
+        Settings {
+            layout,
+            rail,
+            ..Settings::default()
+        }
     }
 
     #[test]
@@ -3991,14 +4189,22 @@ mod tests {
         // A dragged divider moves the boundary without changing the total.
         let dragged = Regions::split(1000, 700, settings, false, 0, Some(0), 0.25);
         assert!(dragged.content_w < left.content_w);
-        assert_eq!(dragged.content_w + dragged.other_w + DIVIDER_W, whole.content_w);
+        assert_eq!(
+            dragged.content_w + dragged.other_w + DIVIDER_W,
+            whole.content_w
+        );
         // An unsplit window has no second pane at all.
         assert_eq!((whole.other_x, whole.other_w), (0, 0));
     }
 
     #[test]
     fn the_rail_takes_width_from_the_page_and_gives_it_back() {
-        let expanded = Regions::settled(1000, 700, settings_with(TabLayout::Vertical, Rail::Expanded), false);
+        let expanded = Regions::settled(
+            1000,
+            700,
+            settings_with(TabLayout::Vertical, Rail::Expanded),
+            false,
+        );
         assert_eq!(expanded.rail_w, RAIL_W);
         assert_eq!(expanded.content_x, RAIL_W);
         // The page is a card with a margin, so it is that much narrower than
@@ -4007,11 +4213,21 @@ mod tests {
         assert_eq!(expanded.content_w, 1000 - RAIL_W - PAGE_GAP);
         assert_eq!(expanded.strip_h, 0);
 
-        let icons = Regions::settled(1000, 700, settings_with(TabLayout::Vertical, Rail::Icons), false);
+        let icons = Regions::settled(
+            1000,
+            700,
+            settings_with(TabLayout::Vertical, Rail::Icons),
+            false,
+        );
         assert_eq!(icons.rail_w, RAIL_ICON_W);
 
         // Hidden gives the page the whole window width.
-        let hidden = Regions::settled(1000, 700, settings_with(TabLayout::Vertical, Rail::Hidden), false);
+        let hidden = Regions::settled(
+            1000,
+            700,
+            settings_with(TabLayout::Vertical, Rail::Hidden),
+            false,
+        );
         assert_eq!(hidden.rail_w, 0);
         assert_eq!(hidden.content_w, 1000 - PAGE_GAP);
         assert_eq!(hidden.content_y, TOOLBAR_H);
@@ -4020,7 +4236,12 @@ mod tests {
 
     #[test]
     fn horizontal_layout_trades_the_rail_for_a_strip() {
-        let regions = Regions::settled(1000, 700, settings_with(TabLayout::Horizontal, Rail::Expanded), false);
+        let regions = Regions::settled(
+            1000,
+            700,
+            settings_with(TabLayout::Horizontal, Rail::Expanded),
+            false,
+        );
         assert_eq!(regions.rail_w, 0, "no rail when tabs are on top");
         assert_eq!(regions.strip_h, TABSTRIP_H);
         // The page starts below both the strip and the toolbar.
@@ -4030,11 +4251,21 @@ mod tests {
 
     #[test]
     fn the_assistant_panel_never_squeezes_the_page_away() {
-        let regions = Regions::settled(400, 700, settings_with(TabLayout::Vertical, Rail::Expanded), true);
+        let regions = Regions::settled(
+            400,
+            700,
+            settings_with(TabLayout::Vertical, Rail::Expanded),
+            true,
+        );
         assert!(regions.content_w >= 1);
         assert!(regions.rail_w + regions.ai_w <= 400);
         // A window narrower than the chrome still produces a usable page area.
-        let tiny = Regions::settled(60, 40, settings_with(TabLayout::Vertical, Rail::Expanded), true);
+        let tiny = Regions::settled(
+            60,
+            40,
+            settings_with(TabLayout::Vertical, Rail::Expanded),
+            true,
+        );
         assert!(tiny.content_w >= 1 && tiny.content_h >= 1);
     }
 
@@ -4074,7 +4305,10 @@ mod tests {
     #[test]
     fn turning_motion_off_moves_the_rail_at_once() {
         let mut app = App::new(Engine::shapes_only(), vec![Tab::blank()], 0);
-        app.settings = Settings { motion: false, ..Settings::default() };
+        app.settings = Settings {
+            motion: false,
+            ..Settings::default()
+        };
         app.rail_px = RAIL_W as f32;
         app.settings.rail = Rail::Hidden;
         assert!(!app.advance_rail(), "nothing should be left to animate");
@@ -4123,8 +4357,14 @@ mod tests {
         assert!(can_share_a_renderer("zero://newtab", "zero://history"));
         // Everything the web touches keeps its own process, including one site
         // following another, and a site returning to a built-in page.
-        assert!(!can_share_a_renderer("https://example.com", "zero://settings"));
-        assert!(!can_share_a_renderer("zero://settings", "https://example.com"));
+        assert!(!can_share_a_renderer(
+            "https://example.com",
+            "zero://settings"
+        ));
+        assert!(!can_share_a_renderer(
+            "zero://settings",
+            "https://example.com"
+        ));
         assert!(!can_share_a_renderer("https://a.com", "https://b.com"));
         assert!(!can_share_a_renderer("https://a.com", "https://a.com"));
     }
@@ -4133,7 +4373,10 @@ mod tests {
     fn a_packed_colour_is_the_one_the_chrome_uses() {
         // The compositor fills whole rectangles itself rather than through the
         // engine, so it needs the palette as pixels. The two must not drift.
-        assert_eq!(format!("#{:06x}", theme::packed(theme::canvas())), theme::canvas());
+        assert_eq!(
+            format!("#{:06x}", theme::packed(theme::canvas())),
+            theme::canvas()
+        );
         assert_eq!(format!("#{:06x}", theme::packed("#1a222b")), "#1a222b");
     }
 
@@ -4148,8 +4391,20 @@ mod tests {
             crate::settings::preview(settings);
             let p = theme::palette();
             for colour in [
-                p.canvas, p.chrome, p.elevated, p.surface, p.hover, p.line, p.text, p.muted,
-                p.faint, p.saved, p.ok, p.link, p.edge, theme::accent(),
+                p.canvas,
+                p.chrome,
+                p.elevated,
+                p.surface,
+                p.hover,
+                p.line,
+                p.text,
+                p.muted,
+                p.faint,
+                p.saved,
+                p.ok,
+                p.link,
+                p.edge,
+                theme::accent(),
             ] {
                 assert_eq!(colour.len(), 7, "{colour} is not #rrggbb");
                 assert_eq!(theme::mix(colour, colour, 0.5), colour);
@@ -4175,7 +4430,10 @@ mod tests {
     fn zoom_walks_the_scale_and_stops_at_its_ends() {
         assert_eq!(zoom_step(100, 1), 110);
         assert_eq!(zoom_step(100, -1), 90);
-        assert_eq!(zoom_step(*ZOOM_STEPS.last().unwrap(), 1), *ZOOM_STEPS.last().unwrap());
+        assert_eq!(
+            zoom_step(*ZOOM_STEPS.last().unwrap(), 1),
+            *ZOOM_STEPS.last().unwrap()
+        );
         assert_eq!(zoom_step(ZOOM_STEPS[0], -1), ZOOM_STEPS[0]);
         // A value that is not a step snaps to the nearest one before moving.
         assert_eq!(zoom_step(103, 1), 110);
@@ -4185,9 +4443,21 @@ mod tests {
     fn a_click_lands_on_the_topmost_control_that_covers_it() {
         let mut app = App::new(Engine::shapes_only(), vec![Tab::blank()], 0);
         app.hits = vec![
-            Hit { id: "back".into(), x: 0.0, y: 0.0, width: 40.0, height: 40.0 },
+            Hit {
+                id: "back".into(),
+                x: 0.0,
+                y: 0.0,
+                width: 40.0,
+                height: 40.0,
+            },
             // A menu drawn later covers the same pixels and must win.
-            Hit { id: "menu:new".into(), x: 20.0, y: 20.0, width: 40.0, height: 40.0 },
+            Hit {
+                id: "menu:new".into(),
+                x: 20.0,
+                y: 20.0,
+                width: 40.0,
+                height: 40.0,
+            },
         ];
         assert_eq!(app.hit_at(5.0, 5.0), Some("back"));
         assert_eq!(app.hit_at(25.0, 25.0), Some("menu:new"));
@@ -4196,7 +4466,11 @@ mod tests {
 
     #[test]
     fn tab_ids_survive_the_rail_reordering_pinned_tabs_to_the_top() {
-        let mut app = App::new(Engine::shapes_only(), vec![Tab::blank(), Tab::blank(), Tab::blank()], 0);
+        let mut app = App::new(
+            Engine::shapes_only(),
+            vec![Tab::blank(), Tab::blank(), Tab::blank()],
+            0,
+        );
         app.tabs[2].pinned = true;
         // The pinned tab leads, but every row still carries its real index.
         assert_eq!(app.rail_order(), vec![2, 0, 1]);
@@ -4208,8 +4482,18 @@ mod tests {
     fn tab_search_filters_by_title_and_address() {
         let mut app = App::new(
             Engine::shapes_only(),
-            vec![Tab::new("https://news.ycombinator.com".into(), String::new(), String::new()),
-                 Tab::new("https://en.wikipedia.org".into(), String::new(), String::new())],
+            vec![
+                Tab::new(
+                    "https://news.ycombinator.com".into(),
+                    String::new(),
+                    String::new(),
+                ),
+                Tab::new(
+                    "https://en.wikipedia.org".into(),
+                    String::new(),
+                    String::new(),
+                ),
+            ],
             0,
         );
         app.focus = Focus::TabSearch("wiki".into());
@@ -4222,7 +4506,10 @@ mod tests {
     fn closing_a_tab_remembers_it_so_it_can_come_back() {
         let mut app = App::new(
             Engine::shapes_only(),
-            vec![Tab::new("https://a.com".into(), String::new(), String::new()), Tab::blank()],
+            vec![
+                Tab::new("https://a.com".into(), String::new(), String::new()),
+                Tab::blank(),
+            ],
             0,
         );
         app.close_tab_at(0);
@@ -4249,7 +4536,10 @@ mod tests {
     fn settings_link(value: &str) -> String {
         let page = crate::internal::page("zero://settings");
         let needle = format!("href=\"zero://settings?{value}\"");
-        assert!(page.contains(&needle), "no control on the page sets {value}");
+        assert!(
+            page.contains(&needle),
+            "no control on the page sets {value}"
+        );
         format!("zero://settings?{value}")
     }
 
@@ -4266,12 +4556,22 @@ mod tests {
         let target = crate::net::resolve_url("zero://settings", &href);
         assert_eq!(target, href, "the link must survive resolution intact");
         app.go_to(target);
-        assert_eq!(app.settings.layout, TabLayout::Horizontal, "the click did not land");
+        assert_eq!(
+            app.settings.layout,
+            TabLayout::Horizontal,
+            "the click did not land"
+        );
         // And the address that lands in the tab is clean.
         assert_eq!(app.tab().address, "zero://settings");
 
         // Every other control on the page reaches its setting too.
-        for value in ["rail=icons", "zoom=125", "engine=brave", "blocking=off", "restore=off"] {
+        for value in [
+            "rail=icons",
+            "zoom=125",
+            "engine=brave",
+            "blocking=off",
+            "restore=off",
+        ] {
             let href = settings_link(value);
             app.go_to(crate::net::resolve_url("zero://settings", &href));
         }
@@ -4293,11 +4593,19 @@ mod tests {
         let html = crate::internal::page("zero://settings");
         let loader = ShellLoader::new("zero://settings".to_string());
         let page = engine.render_page(&html, "", 1000.0, 700.0, &loader);
-        for value in ["layout=horizontal", "rail=icons", "zoom=125", "engine=brave"] {
+        for value in [
+            "layout=horizontal",
+            "rail=icons",
+            "zoom=125",
+            "engine=brave",
+        ] {
             let href = format!("zero://settings?{value}");
             let area = page.links.iter().find(|l| l.href == href);
             let area = area.unwrap_or_else(|| panic!("nothing to click for {value}"));
-            assert!(area.width > 0.0 && area.height > 0.0, "{value} has an empty target");
+            assert!(
+                area.width > 0.0 && area.height > 0.0,
+                "{value} has an empty target"
+            );
         }
     }
 
@@ -4305,10 +4613,16 @@ mod tests {
     fn a_settings_link_is_applied_and_then_forgotten() {
         let mut app = App::new(Engine::shapes_only(), vec![Tab::blank()], 0);
         let landed = app.apply_setting_link("zero://settings?rail=hidden".into());
-        assert_eq!(landed, "zero://settings", "the query does not belong in history");
+        assert_eq!(
+            landed, "zero://settings",
+            "the query does not belong in history"
+        );
         assert_eq!(app.settings.rail, Rail::Hidden);
         // Anything else passes straight through.
-        assert_eq!(app.apply_setting_link("https://a.com".into()), "https://a.com");
+        assert_eq!(
+            app.apply_setting_link("https://a.com".into()),
+            "https://a.com"
+        );
     }
 
     #[test]
@@ -4316,7 +4630,10 @@ mod tests {
         let mut app = App::new(Engine::shapes_only(), vec![Tab::blank()], 0);
         for (id, tip) in TIPS {
             assert!(!tip.is_empty(), "{id} has an empty tooltip");
-            assert!(app.act_on(id), "{id} has a tooltip but nothing happens when clicked");
+            assert!(
+                app.act_on(id),
+                "{id} has a tooltip but nothing happens when clicked"
+            );
         }
     }
 
@@ -4348,7 +4665,13 @@ mod tests {
         let regions = Regions::settled(800, 600, Settings::default(), false);
         // A control hard against the right edge.
         app.hovered = Some("menu".into());
-        let hits = vec![Hit { id: "menu".into(), x: 780.0, y: 10.0, width: 20.0, height: 20.0 }];
+        let hits = vec![Hit {
+            id: "menu".into(),
+            x: 780.0,
+            y: 10.0,
+            width: 20.0,
+            height: 20.0,
+        }];
         let (x, _, width) = app.tooltip_box("More", &hits, &regions).expect("a box");
         assert!(x + width <= 800, "tip runs off the right edge");
     }
@@ -4358,15 +4681,29 @@ mod tests {
         let mut app = App::new(Engine::shapes_only(), vec![Tab::blank()], 0);
         let regions = Regions::settled(1000, 700, Settings::default(), false);
         app.hovered = Some("tab:0".into());
-        let hits = vec![Hit { id: "tab:0".into(), x: 8.0, y: 90.0, width: 200.0, height: 34.0 }];
-        let (x, y, _) = app.tooltip_box("Hacker News", &hits, &regions).expect("a box");
-        assert!(x >= regions.rail_w, "a rail tooltip must not cover the rail");
+        let hits = vec![Hit {
+            id: "tab:0".into(),
+            x: 8.0,
+            y: 90.0,
+            width: 200.0,
+            height: 34.0,
+        }];
+        let (x, y, _) = app
+            .tooltip_box("Hacker News", &hits, &regions)
+            .expect("a box");
+        assert!(
+            x >= regions.rail_w,
+            "a rail tooltip must not cover the rail"
+        );
         assert_eq!(y, 90, "it lines up with the row it names");
     }
 
     #[test]
     fn tab_labels_prefer_the_page_title_and_fit_the_space_given() {
-        assert_eq!(label_for("Hacker News", "https://news.ycombinator.com", 22), "Hacker News");
+        assert_eq!(
+            label_for("Hacker News", "https://news.ycombinator.com", 22),
+            "Hacker News"
+        );
         // No title: fall back to the host, not the whole URL.
         assert_eq!(
             label_for("", "https://news.ycombinator.com/item?id=1", 22),
@@ -4445,7 +4782,10 @@ mod tests {
         // Round-trip: drag to a position, and the thumb lands back under the cursor.
         let scroll = scroll_for_cursor(content, viewport, 300.0);
         let (top, thumb) = scrollbar_thumb(content, viewport, scroll).unwrap();
-        assert!((top + thumb / 2.0 - 300.0).abs() < 1.0, "thumb centre should follow cursor");
+        assert!(
+            (top + thumb / 2.0 - 300.0).abs() < 1.0,
+            "thumb centre should follow cursor"
+        );
     }
 
     /// Two lines of three words each, laid out the way inline layout lays them
@@ -4479,16 +4819,28 @@ mod tests {
     fn a_drag_selects_from_where_it_started_to_where_it_ended() {
         let runs = two_lines();
         // Across one line: from inside "The" to past the middle of "fox".
-        let span = Selection::Span { anchor: (5.0, 10.0), focus: (110.0, 10.0) };
+        let span = Selection::Span {
+            anchor: (5.0, 10.0),
+            focus: (110.0, 10.0),
+        };
         assert_eq!(selected(&runs, span), "The quick fox");
         // Dragged backwards is the same selection, not an empty one.
-        let back = Selection::Span { anchor: (110.0, 10.0), focus: (5.0, 10.0) };
+        let back = Selection::Span {
+            anchor: (110.0, 10.0),
+            focus: (5.0, 10.0),
+        };
         assert_eq!(selected(&runs, back), "The quick fox");
         // Across lines, the line break comes back as one.
-        let down = Selection::Span { anchor: (40.0, 10.0), focus: (60.0, 30.0) };
+        let down = Selection::Span {
+            anchor: (40.0, 10.0),
+            focus: (60.0, 30.0),
+        };
         assert_eq!(selected(&runs, down), "quick fox\njumps");
         // A click selects nothing: both ends land in the same place.
-        let click = Selection::Span { anchor: (40.0, 10.0), focus: (40.0, 10.0) };
+        let click = Selection::Span {
+            anchor: (40.0, 10.0),
+            focus: (40.0, 10.0),
+        };
         assert_eq!(selected(&runs, click), "");
     }
 
@@ -4496,11 +4848,20 @@ mod tests {
     fn double_click_takes_a_word_triple_click_a_line_and_ctrl_a_the_page() {
         let runs = two_lines();
         assert_eq!(selected(&runs, Selection::Word((40.0, 10.0))), "quick");
-        assert_eq!(selected(&runs, Selection::Line((40.0, 10.0))), "The quick fox");
+        assert_eq!(
+            selected(&runs, Selection::Line((40.0, 10.0))),
+            "The quick fox"
+        );
         // The second line, not the first: a line is picked by where the click
         // landed, and the two share nothing but their words' height.
-        assert_eq!(selected(&runs, Selection::Line((60.0, 30.0))), "jumps over it");
-        assert_eq!(selected(&runs, Selection::All), "The quick fox\njumps over it");
+        assert_eq!(
+            selected(&runs, Selection::Line((60.0, 30.0))),
+            "jumps over it"
+        );
+        assert_eq!(
+            selected(&runs, Selection::All),
+            "The quick fox\njumps over it"
+        );
         // A gesture that lands in the margin selects nothing rather than
         // guessing at the nearest word.
         assert_eq!(selected(&runs, Selection::Word((300.0, 10.0))), "");
@@ -4512,9 +4873,15 @@ mod tests {
         let runs = two_lines();
         // "quick" spans 34..84, so its middle is 59. Stopping before the middle
         // leaves it out; stopping past the middle takes it.
-        let short = Selection::Span { anchor: (5.0, 10.0), focus: (50.0, 10.0) };
+        let short = Selection::Span {
+            anchor: (5.0, 10.0),
+            focus: (50.0, 10.0),
+        };
         assert_eq!(selected(&runs, short), "The");
-        let long = Selection::Span { anchor: (5.0, 10.0), focus: (70.0, 10.0) };
+        let long = Selection::Span {
+            anchor: (5.0, 10.0),
+            focus: (70.0, 10.0),
+        };
         assert_eq!(selected(&runs, long), "The quick");
     }
 
@@ -4523,11 +4890,23 @@ mod tests {
         // Black text under the wash stays darker than the white page around it
         // — the whole point of tinting rather than filling.
         let (ink, paper) = (tinted(0x000000), tinted(0xffffff));
-        assert!(ink < paper, "tinted text must stay darker than tinted background");
-        assert_ne!(paper, 0xffffff, "the wash has to be visible on a white page");
+        assert!(
+            ink < paper,
+            "tinted text must stay darker than tinted background"
+        );
+        assert_ne!(
+            paper, 0xffffff,
+            "the wash has to be visible on a white page"
+        );
         // The blend is integer maths on bytes: nothing may carry past the top
         // of the pixel, and what comes out has to read as the blue it is.
-        assert!(paper < 0x100_0000, "the blend must stay inside three channels");
-        assert!(paper & 0xff > (paper >> 16) & 0xff, "more blue left than red");
+        assert!(
+            paper < 0x100_0000,
+            "the blend must stay inside three channels"
+        );
+        assert!(
+            paper & 0xff > (paper >> 16) & 0xff,
+            "more blue left than red"
+        );
     }
 }

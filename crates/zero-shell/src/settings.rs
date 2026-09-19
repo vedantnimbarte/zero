@@ -89,8 +89,16 @@ fn wide(text: &str) -> Vec<u16> {
 /// Each is a key, a label, and the prefix a percent-encoded query is appended to.
 /// All four work without JavaScript, which Zero's engine does not run for them.
 pub const ENGINES: &[(&str, &str, &str)] = &[
-    ("duckduckgo", "DuckDuckGo", "https://duckduckgo.com/html/?q="),
-    ("startpage", "Startpage", "https://www.startpage.com/sp/search?query="),
+    (
+        "duckduckgo",
+        "DuckDuckGo",
+        "https://duckduckgo.com/html/?q=",
+    ),
+    (
+        "startpage",
+        "Startpage",
+        "https://www.startpage.com/sp/search?query=",
+    ),
     ("brave", "Brave", "https://search.brave.com/search?q="),
     ("google", "Google", "https://www.google.com/search?q="),
 ];
@@ -212,7 +220,9 @@ impl Settings {
     /// than refusing to start: a bad preference must never cost you the browser.
     fn read() -> Settings {
         let mut settings = Settings::default();
-        let Some(dir) = crate::storage::profile_dir() else { return settings };
+        let Some(dir) = crate::storage::profile_dir() else {
+            return settings;
+        };
         let Some(text) = crate::crypto::read_file(&dir.join("settings.tsv")) else {
             return settings;
         };
@@ -350,18 +360,42 @@ mod tests {
         // Every engine's prefix has to split cleanly into a form action and a
         // field name, or the new-tab box would search somewhere else.
         for (index, (key, _, prefix)) in ENGINES.iter().enumerate() {
-            let settings = Settings { engine: index, ..Settings::default() };
+            let settings = Settings {
+                engine: index,
+                ..Settings::default()
+            };
             let (action, field) = settings.search_form();
-            assert!(!field.is_empty() && !field.contains('='), "{key}: bad field {field}");
-            assert_eq!(format!("{action}?{field}="), *prefix, "{key} does not round-trip");
+            assert!(
+                !field.is_empty() && !field.contains('='),
+                "{key}: bad field {field}"
+            );
+            assert_eq!(
+                format!("{action}?{field}="),
+                *prefix,
+                "{key} does not round-trip"
+            );
         }
         // Startpage is the one that does not call its field "q".
-        assert_eq!(Settings { engine: 1, ..Settings::default() }.search_form().1, "query");
+        assert_eq!(
+            Settings {
+                engine: 1,
+                ..Settings::default()
+            }
+            .search_form()
+            .1,
+            "query"
+        );
     }
 
     #[test]
     fn search_uses_the_chosen_engine_and_encodes_the_query() {
-        let settings = Settings { engine: 3, ..Settings::default() };
-        assert_eq!(settings.search_url("rust lang"), "https://www.google.com/search?q=rust+lang");
+        let settings = Settings {
+            engine: 3,
+            ..Settings::default()
+        };
+        assert_eq!(
+            settings.search_url("rust lang"),
+            "https://www.google.com/search?q=rust+lang"
+        );
     }
 }

@@ -64,13 +64,20 @@ impl Assistant for LocalAssistant {
         }
         report.push_str(&format!("{words} words, about {minutes} min to read\n"));
         report.push_str(match ctx.secure {
-            true => "The connection is encrypted
-",
-            false => "The connection is not encrypted
-",
+            true => {
+                "The connection is encrypted
+"
+            }
+            false => {
+                "The connection is not encrypted
+"
+            }
         });
         if ctx.blocked_trackers > 0 {
-            report.push_str(&format!("Blocked {} tracker requests\n", ctx.blocked_trackers));
+            report.push_str(&format!(
+                "Blocked {} tracker requests\n",
+                ctx.blocked_trackers
+            ));
         }
         if !ctx.headings.is_empty() {
             report.push_str("\nOutline\n");
@@ -92,7 +99,8 @@ const STOPWORDS: &[&str] = &[
 ];
 
 fn normalize(word: &str) -> String {
-    word.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase()
+    word.trim_matches(|c: char| !c.is_alphanumeric())
+        .to_lowercase()
 }
 
 /// Split on sentence-ending punctuation followed by whitespace.
@@ -102,7 +110,10 @@ fn split_sentences(text: &str) -> Vec<&str> {
     let bytes = text.as_bytes();
     for (i, c) in text.char_indices() {
         if matches!(c, '.' | '!' | '?')
-            && bytes.get(i + 1).map(|b| b.is_ascii_whitespace()).unwrap_or(true)
+            && bytes
+                .get(i + 1)
+                .map(|b| b.is_ascii_whitespace())
+                .unwrap_or(true)
         {
             let end = i + c.len_utf8();
             let s = text[start..end].trim();
@@ -146,7 +157,11 @@ fn summarize(text: &str, max: usize) -> String {
         .filter(|(_, s)| (MIN_WORDS..=MAX_WORDS).contains(&s.split_whitespace().count()))
         .map(|(i, _)| i)
         .collect();
-    let pool = if substantial.len() >= max { substantial } else { (0..sentences.len()).collect() };
+    let pool = if substantial.len() >= max {
+        substantial
+    } else {
+        (0..sentences.len()).collect()
+    };
 
     let mut scored: Vec<(usize, f32)> = pool
         .into_iter()
@@ -162,7 +177,11 @@ fn summarize(text: &str, max: usize) -> String {
 
     let mut picked: Vec<usize> = scored.iter().take(max).map(|(i, _)| *i).collect();
     picked.sort_unstable();
-    picked.iter().map(|&i| sentences[i]).collect::<Vec<_>>().join(" ")
+    picked
+        .iter()
+        .map(|&i| sentences[i])
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[cfg(test)]
@@ -177,9 +196,14 @@ mod tests {
         // The off-topic sentence should lose to the Zero-heavy ones.
         assert!(!summary.contains("weather"), "got {summary}");
         // Whichever sentences win, they must appear in document order.
-        let positions: Vec<usize> =
-            split_sentences(&summary).iter().map(|s| text.find(s).expect("from source")).collect();
-        assert!(positions.windows(2).all(|w| w[0] < w[1]), "out of order: {summary}");
+        let positions: Vec<usize> = split_sentences(&summary)
+            .iter()
+            .map(|s| text.find(s).expect("from source"))
+            .collect();
+        assert!(
+            positions.windows(2).all(|w| w[0] < w[1]),
+            "out of order: {summary}"
+        );
     }
 
     #[test]

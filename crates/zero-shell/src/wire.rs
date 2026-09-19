@@ -39,7 +39,10 @@ pub struct Msg {
 
 impl Msg {
     pub fn new(name: &str) -> Msg {
-        Msg { name: name.to_string(), ..Default::default() }
+        Msg {
+            name: name.to_string(),
+            ..Default::default()
+        }
     }
 
     pub fn text(mut self, value: impl Into<String>) -> Msg {
@@ -99,7 +102,9 @@ pub fn write(to: &mut impl Write, msg: &Msg) -> std::io::Result<()> {
 /// Read one message. `None` at a clean end of stream; an error for anything
 /// malformed, which the caller treats as the peer being gone.
 pub fn read(from: &mut impl Read) -> std::io::Result<Option<Msg>> {
-    let Some(len) = read_u32(from)? else { return Ok(None) };
+    let Some(len) = read_u32(from)? else {
+        return Ok(None);
+    };
     let mut body = vec![0u8; bounded(len)?];
     from.read_exact(&mut body)?;
     let mut cursor = std::io::Cursor::new(body);
@@ -118,7 +123,12 @@ pub fn read(from: &mut impl Read) -> std::io::Result<Option<Msg>> {
     let blob_len = count(&mut cursor)?;
     let mut blob = vec![0u8; bounded(blob_len as u32)?];
     cursor.read_exact(&mut blob)?;
-    Ok(Some(Msg { name, text, nums, blob }))
+    Ok(Some(Msg {
+        name,
+        text,
+        nums,
+        blob,
+    }))
 }
 
 fn bounded(len: u32) -> std::io::Result<usize> {

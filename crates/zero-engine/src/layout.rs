@@ -356,7 +356,13 @@ impl<'a> LayoutBox<'a> {
         }
         self.calculate_block_height(containing_block);
         // A replaced element (<img>) overrides content size with its resolved dimensions.
-        if let Some((w, h)) = self.resolved_image_size(images, (containing_block.content.width, containing_block.content.height)) {
+        if let Some((w, h)) = self.resolved_image_size(
+            images,
+            (
+                containing_block.content.width,
+                containing_block.content.height,
+            ),
+        ) {
             self.dimensions.content.width = w;
             self.dimensions.content.height = h;
         }
@@ -402,23 +408,14 @@ impl<'a> LayoutBox<'a> {
 
     /// Lay out every out-of-flow descendant of the given kind that this box is
     /// the containing block for, and place it.
-    fn place_descendants(
-        &mut self,
-        want: OutOfFlow,
-        fonts: Option<&FontSet>,
-        images: &ImageMap,
-    ) {
+    fn place_descendants(&mut self, want: OutOfFlow, fonts: Option<&FontSet>, images: &ImageMap) {
         let container = self.dimensions;
         place_out_of_flow(&mut self.children, container, want, fonts, images);
     }
 
     /// If this box is an `<img>`, resolve its display size from CSS width/height,
     /// else the `width`/`height` attributes, else the image's intrinsic size.
-    fn resolved_image_size(
-        &self,
-        images: &ImageMap,
-        available: (f32, f32),
-    ) -> Option<(f32, f32)> {
+    fn resolved_image_size(&self, images: &ImageMap, available: (f32, f32)) -> Option<(f32, f32)> {
         let styled = match self.box_type {
             BoxType::BlockNode(n) | BoxType::InlineNode(n) => n,
             BoxType::AnonymousBlock => return None,
@@ -783,7 +780,8 @@ impl<'a> LayoutBox<'a> {
                 }
                 let start = explicit_col.unwrap_or(col);
                 let fits = start + colspan <= columns.len()
-                    && (row..row + rowspan).all(|r| (start..start + colspan).all(|c| !occupied[r][c]));
+                    && (row..row + rowspan)
+                        .all(|r| (start..start + colspan).all(|c| !occupied[r][c]));
                 if fits {
                     for r in row..row + rowspan {
                         for c in start..start + colspan {
@@ -845,8 +843,7 @@ impl<'a> LayoutBox<'a> {
         // attribution `layout_table_children` uses for a rowspan cell.
         for &(index, r, _, _, rowspan) in placements.iter().filter(|p| p.4 > 1) {
             let last = (r + rowspan - 1).min(row_heights.len().saturating_sub(1));
-            let covered: f32 =
-                row_heights[r..=last].iter().sum::<f32>() + gap * (last - r) as f32;
+            let covered: f32 = row_heights[r..=last].iter().sum::<f32>() + gap * (last - r) as f32;
             let needed = self.children[index].dimensions.margin_box().height;
             if needed > covered {
                 row_heights[last] += needed - covered;
@@ -925,10 +922,12 @@ impl<'a> LayoutBox<'a> {
         // so its inline children carry what its parent asked for.
         let styled = match self.box_type {
             BoxType::BlockNode(styled) | BoxType::InlineNode(styled) => Some(styled),
-            BoxType::AnonymousBlock => self.children.iter().find_map(|child| match child.box_type {
-                BoxType::BlockNode(styled) | BoxType::InlineNode(styled) => Some(styled),
-                BoxType::AnonymousBlock => None,
-            }),
+            BoxType::AnonymousBlock => {
+                self.children.iter().find_map(|child| match child.box_type {
+                    BoxType::BlockNode(styled) | BoxType::InlineNode(styled) => Some(styled),
+                    BoxType::AnonymousBlock => None,
+                })
+            }
         };
         let white_space = styled.and_then(|s| s.value("white-space"));
         let preserve_whitespace = matches!(
@@ -1150,8 +1149,7 @@ impl<'a> LayoutBox<'a> {
                 // Pick a font that can draw this word, then shape it: this is where
                 // Indic reordering/conjuncts happen.
                 let font_index = fonts.pick_in(&piece.families, word);
-                let (mut glyphs, word_w) =
-                    shape_run(&fonts.entries[font_index], word, piece.size);
+                let (mut glyphs, word_w) = shape_run(&fonts.entries[font_index], word, piece.size);
                 let word_w = word_w + spread_glyphs(&mut glyphs, piece.letter_spacing);
                 let mut lead = if pending_space && cursor_x > start_x {
                     space_w
@@ -1159,8 +1157,7 @@ impl<'a> LayoutBox<'a> {
                     0.0
                 };
                 // Wrap if this word overflows and we're not at line start.
-                if !nowrap && cursor_x > start_x && cursor_x + lead + word_w > start_x + max_width
-                {
+                if !nowrap && cursor_x > start_x && cursor_x + lead + word_w > start_x + max_width {
                     lead = 0.0;
                     // Close each open element on the line it is leaving, then
                     // reopen it on the next one, so a wrapped span paints twice.
@@ -1236,10 +1233,12 @@ impl<'a> LayoutBox<'a> {
         // so its inline children carry the value its parent set.
         let styled = match self.box_type {
             BoxType::BlockNode(styled) | BoxType::InlineNode(styled) => Some(styled),
-            BoxType::AnonymousBlock => self.children.iter().find_map(|child| match child.box_type {
-                BoxType::BlockNode(styled) | BoxType::InlineNode(styled) => Some(styled),
-                BoxType::AnonymousBlock => None,
-            }),
+            BoxType::AnonymousBlock => {
+                self.children.iter().find_map(|child| match child.box_type {
+                    BoxType::BlockNode(styled) | BoxType::InlineNode(styled) => Some(styled),
+                    BoxType::AnonymousBlock => None,
+                })
+            }
         };
         let align = match styled.and_then(|s| s.value("text-align")) {
             Some(Value::Keyword(word)) => word,
@@ -1315,15 +1314,20 @@ impl<'a> LayoutBox<'a> {
             style.value("box-sizing"),
             Some(Value::Keyword(ref k)) if k == "border-box"
         );
-        let edges: f32 =
-            [&border_left, &border_right, &padding_left, &padding_right]
-                .iter()
-                .map(|v| v.resolve(ctx))
-                .sum();
+        let edges: f32 = [&border_left, &border_right, &padding_left, &padding_right]
+            .iter()
+            .map(|v| v.resolve(ctx))
+            .sum();
         // `width`/`min-width`/`max-width` name the border box under border-box
         // sizing; subtract the edges once here so the rest of this function —
         // written for content-box — never has to know the difference.
-        let to_content = |px: f32| if border_box { (px - edges).max(0.0) } else { px };
+        let to_content = |px: f32| {
+            if border_box {
+                (px - edges).max(0.0)
+            } else {
+                px
+            }
+        };
         // `calc()` normalizes to a resolved px length here too, same as a
         // plain `Length` — everything downstream only ever needs to compare
         // against `auto` or read an already-resolved px value.
@@ -1629,8 +1633,10 @@ impl<'a> LayoutBox<'a> {
                         .and_then(|v| v.as_number())
                         .unwrap_or(0.0);
                     // Items shrink by default (`flex-shrink: 1`) unless told not to.
-                    let shrink =
-                        style.value("flex-shrink").and_then(|v| v.as_number()).unwrap_or(1.0);
+                    let shrink = style
+                        .value("flex-shrink")
+                        .and_then(|v| v.as_number())
+                        .unwrap_or(1.0);
                     Item { base, grow, shrink }
                 }
             })
@@ -1746,8 +1752,12 @@ impl<'a> LayoutBox<'a> {
                     }
                 };
                 let d = &mut self.children[i].dimensions;
-                let edges =
-                    margin_left + margin_right + d.border.left + d.border.right + d.padding.left + d.padding.right;
+                let edges = margin_left
+                    + margin_right
+                    + d.border.left
+                    + d.border.right
+                    + d.padding.left
+                    + d.padding.right;
                 d.margin.left = margin_left;
                 d.margin.right = margin_right;
                 d.content.width = (widths[slot_index] - edges).max(0.0);
@@ -1810,17 +1820,29 @@ impl<'a> LayoutBox<'a> {
         .iter()
         .map(|v| v.resolve(ctx))
         .sum();
-        let to_content = |px: f32| if border_box { (px - edges).max(0.0) } else { px };
+        let to_content = |px: f32| {
+            if border_box {
+                (px - edges).max(0.0)
+            } else {
+                px
+            }
+        };
 
         if let Some(value) = style.value("height") {
             if matches!(value, Value::Length(..) | Value::Calc(..)) {
                 self.dimensions.content.height = to_content(value.resolve(ctx));
             }
         }
-        if let Some(min) = style.value("min-height").map(|v| to_content(v.resolve(ctx))) {
+        if let Some(min) = style
+            .value("min-height")
+            .map(|v| to_content(v.resolve(ctx)))
+        {
             self.dimensions.content.height = self.dimensions.content.height.max(min);
         }
-        if let Some(max) = style.value("max-height").map(|v| to_content(v.resolve(ctx))) {
+        if let Some(max) = style
+            .value("max-height")
+            .map(|v| to_content(v.resolve(ctx)))
+        {
             self.dimensions.content.height = self.dimensions.content.height.min(max);
         }
     }
@@ -1875,7 +1897,13 @@ pub fn layout_tree_scrolled<'a>(
     // positioned ancestor anywhere above it anchors to the page, and every
     // `fixed` box anchors to the viewport no matter what it sits inside.
     root_box.place_descendants(OutOfFlow::Absolute, fonts, images);
-    place_out_of_flow(&mut root_box.children, viewport, OutOfFlow::Fixed, fonts, images);
+    place_out_of_flow(
+        &mut root_box.children,
+        viewport,
+        OutOfFlow::Fixed,
+        fonts,
+        images,
+    );
     // Last, because a sticky box is pinned relative to where flow left it, and
     // an out-of-flow one inside it has to have been placed first.
     if scroll_top > 0.0 {
@@ -2112,7 +2140,13 @@ fn collect_inline_text(
         if matches!(child.box_type, BoxType::BlockNode(_)) {
             out.push(InlinePiece::Atomic(child_path));
         } else {
-            collect_inline_text(child, default_size, current_href.as_deref(), out, &child_path);
+            collect_inline_text(
+                child,
+                default_size,
+                current_href.as_deref(),
+                out,
+                &child_path,
+            );
         }
     }
     if let BoxType::InlineNode(styled) | BoxType::BlockNode(styled) = bx.box_type {
@@ -2139,7 +2173,9 @@ fn push_generated(
     href: &Option<String>,
     out: &mut Vec<InlinePiece>,
 ) {
-    let Some(Value::Raw(raw)) = styled.value(key) else { return };
+    let Some(Value::Raw(raw)) = styled.value(key) else {
+        return;
+    };
     let text = unquote_content(&raw);
     if text.is_empty() {
         return; // `content: ""` marks a box to style, and there is no box yet
@@ -2159,7 +2195,12 @@ fn push_generated(
         letter_spacing: styled.px("letter-spacing", 0.0).unwrap_or(0.0),
         color: match styled.value("color") {
             Some(Value::ColorValue(c)) => c,
-            _ => Color { r: 0, g: 0, b: 0, a: 255 },
+            _ => Color {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 255,
+            },
         },
         underline: false,
         strikethrough: false,
@@ -2337,7 +2378,9 @@ enum Axis {
 /// `rows / columns`. Area strings may appear before the slash, so only the
 /// track list on each side is taken.
 fn shorthand_tracks(style: &StyledNode, axis: Axis) -> Option<String> {
-    let Some(Value::Raw(spec)) = style.value("grid-template") else { return None };
+    let Some(Value::Raw(spec)) = style.value("grid-template") else {
+        return None;
+    };
     let (rows, columns) = spec.split_once('/')?;
     let text = match axis {
         Axis::Rows => rows,
@@ -2370,7 +2413,11 @@ type Area = (usize, usize, usize);
 fn parse_grid_areas(spec: &str) -> std::collections::HashMap<String, Area> {
     let mut areas: std::collections::HashMap<String, Area> = Default::default();
     let quotes: [char; 2] = ['"', '\''];
-    for (row, line) in spec.split(quotes).filter(|s| !s.trim().is_empty()).enumerate() {
+    for (row, line) in spec
+        .split(quotes)
+        .filter(|s| !s.trim().is_empty())
+        .enumerate()
+    {
         for (col, name) in line.split_whitespace().enumerate() {
             if name == "." {
                 continue;
@@ -2396,7 +2443,11 @@ fn named_area(style: &StyledNode, areas: &std::collections::HashMap<String, Area
 /// Read `grid-column` or `grid-row` as (zero-based start, span). `track_count`
 /// bounds a valid start line — pass `usize::MAX` for `grid-row`, since rows
 /// have no fixed count the way `grid-template-columns` gives columns one.
-fn parse_grid_span(style: &StyledNode, property: &str, track_count: usize) -> (Option<usize>, usize) {
+fn parse_grid_span(
+    style: &StyledNode,
+    property: &str,
+    track_count: usize,
+) -> (Option<usize>, usize) {
     let spec = match style.value(property) {
         Some(Value::Raw(spec)) => spec,
         Some(Value::Number(n)) => return (Some((n as usize).saturating_sub(1)), 1),
@@ -2454,8 +2505,7 @@ pub fn resolve_tracks(spec: &str, available: f32, gap: f32, ctx: LengthContext) 
                         // items than columns, which needs the item count this
                         // function never receives. Covers the common case
                         // (enough items to fill every computed column).
-                        let pattern_min: f32 =
-                            pattern.iter().map(|t| track_min_size(t, ctx)).sum();
+                        let pattern_min: f32 = pattern.iter().map(|t| track_min_size(t, ctx)).sum();
                         let pattern_gap = gap * pattern.len().saturating_sub(1) as f32;
                         let span = pattern_min + pattern_gap + gap; // plus the gap before a repeat
                         if span > 0.0 {
@@ -2555,7 +2605,10 @@ fn find_matching_close_paren(s: &str) -> Option<usize> {
 /// `minmax(min, max)`'s max argument, which is what a track resolves to — or
 /// the token itself, unchanged, if it isn't a `minmax()`.
 fn minmax_max(token: &str) -> &str {
-    match token.strip_prefix("minmax(").and_then(|s| s.strip_suffix(')')) {
+    match token
+        .strip_prefix("minmax(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
         Some(inside) => inside.rsplit(',').next().unwrap_or("").trim(),
         None => token,
     }
@@ -2623,7 +2676,11 @@ pub fn max_content_width(style: &StyledNode, fonts: Option<&FontSet>, images: &I
             };
             key.and_then(|src| images.get(&src).map(|img| img.width as f32))
                 // A picture that failed to load still reserves what it asked for.
-                .or_else(|| e.attributes.get("width").and_then(|w| w.trim().parse().ok()))
+                .or_else(|| {
+                    e.attributes
+                        .get("width")
+                        .and_then(|w| w.trim().parse().ok())
+                })
                 .unwrap_or(0.0)
         }
         NodeType::Element(_) => {
@@ -2839,7 +2896,8 @@ fn apply_ellipsis(fragments: &mut Vec<TextFragment>, limit: f32, fonts: &FontSet
             .iter()
             .position(|f| f.y != y)
             .map_or(fragments.len(), |n| line_start + n);
-        if let Some(over) = (line_start..line_end).find(|&i| fragments[i].x + fragments[i].width > limit)
+        if let Some(over) =
+            (line_start..line_end).find(|&i| fragments[i].x + fragments[i].width > limit)
         {
             shorten_to_fit(&mut fragments[over], limit, fonts);
             dropped.extend(over + 1..line_end);
@@ -2854,13 +2912,19 @@ fn apply_ellipsis(fragments: &mut Vec<TextFragment>, limit: f32, fonts: &FontSet
 /// Re-shape a run as however much of itself fits before `limit`, ending in `…`.
 fn shorten_to_fit(frag: &mut TextFragment, limit: f32, fonts: &FontSet) {
     const ELLIPSIS: char = '\u{2026}';
-    let Some(entry) = fonts.entries.get(frag.font_index) else { return };
+    let Some(entry) = fonts.entries.get(frag.font_index) else {
+        return;
+    };
     let room = (limit - frag.x).max(0.0);
     // A fragment is one word, so walking back a character at a time is a
     // handful of steps — not a search worth being clever about.
     let mut chars: Vec<char> = frag.text.chars().collect();
     loop {
-        let candidate: String = chars.iter().copied().chain(std::iter::once(ELLIPSIS)).collect();
+        let candidate: String = chars
+            .iter()
+            .copied()
+            .chain(std::iter::once(ELLIPSIS))
+            .collect();
         let (glyphs, width) = shape_run(entry, &candidate, frag.size);
         // The ellipsis alone may not fit either, and it is still what the line
         // ends with — paint clips whatever hangs past the box.
@@ -3012,9 +3076,21 @@ mod tests {
     #[test]
     fn letter_spacing_pushes_each_glyph_past_the_last_and_widens_the_run() {
         let mut glyphs = vec![
-            PositionedGlyph { id: 1, x: 0.0, y: 0.0 },
-            PositionedGlyph { id: 2, x: 10.0, y: 0.0 },
-            PositionedGlyph { id: 3, x: 18.0, y: 0.0 },
+            PositionedGlyph {
+                id: 1,
+                x: 0.0,
+                y: 0.0,
+            },
+            PositionedGlyph {
+                id: 2,
+                x: 10.0,
+                y: 0.0,
+            },
+            PositionedGlyph {
+                id: 3,
+                x: 18.0,
+                y: 0.0,
+            },
         ];
         let extra = spread_glyphs(&mut glyphs, 5.0);
         assert_eq!(extra, 15.0); // 5px after each of the 3 glyphs
@@ -3023,7 +3099,11 @@ mod tests {
         assert_eq!(glyphs[2].x, 28.0); // 18 + 2*5
 
         // No spacing: nothing moves, nothing is added.
-        let mut untouched = vec![PositionedGlyph { id: 1, x: 3.0, y: 0.0 }];
+        let mut untouched = vec![PositionedGlyph {
+            id: 1,
+            x: 3.0,
+            y: 0.0,
+        }];
         assert_eq!(spread_glyphs(&mut untouched, 0.0), 0.0);
         assert_eq!(untouched[0].x, 3.0);
     }
@@ -3111,7 +3191,12 @@ mod tests {
             .map(|r| {
                 (
                     r.id,
-                    Rect { x: r.x, y: r.y, width: r.width, height: r.height },
+                    Rect {
+                        x: r.x,
+                        y: r.y,
+                        width: r.width,
+                        height: r.height,
+                    },
                 )
             })
             .collect()
@@ -3408,9 +3493,16 @@ mod tests {
             let mut v = HashMap::new();
             v.insert("display".to_string(), Value::Keyword("block".into()));
             v.insert("height".to_string(), Value::Length(height, Unit::Px));
-            v.insert("grid-column".to_string(), Value::Raw(grid_column.to_string()));
+            v.insert(
+                "grid-column".to_string(),
+                Value::Raw(grid_column.to_string()),
+            );
             v.insert("grid-row".to_string(), Value::Raw(grid_row.to_string()));
-            StyledNode { node: &node, specified_values: v, children: vec![] }
+            StyledNode {
+                node: &node,
+                specified_values: v,
+                children: vec![],
+            }
         };
         let mut values = HashMap::new();
         values.insert("display".to_string(), Value::Keyword("grid".into()));
@@ -3431,14 +3523,29 @@ mod tests {
         viewport.content.width = 200.0; // 2 columns of 100
 
         let laid = layout_tree(&root, viewport, None, &ImageMap::new());
-        let xs: Vec<f32> = laid.children.iter().map(|c| c.dimensions.content.x).collect();
-        let ys: Vec<f32> = laid.children.iter().map(|c| c.dimensions.content.y).collect();
-        let heights: Vec<f32> =
-            laid.children.iter().map(|c| c.dimensions.content.height).collect();
+        let xs: Vec<f32> = laid
+            .children
+            .iter()
+            .map(|c| c.dimensions.content.x)
+            .collect();
+        let ys: Vec<f32> = laid
+            .children
+            .iter()
+            .map(|c| c.dimensions.content.y)
+            .collect();
+        let heights: Vec<f32> = laid
+            .children
+            .iter()
+            .map(|c| c.dimensions.content.height)
+            .collect();
 
         // `grid-row` pins the explicit items to their own row/column.
         assert_eq!(xs, vec![0.0, 100.0, 100.0]);
-        assert_eq!(ys, vec![0.0, 0.0, 40.0], "row 1 starts where row 0 (sized by item 1) ends");
+        assert_eq!(
+            ys,
+            vec![0.0, 0.0, 40.0],
+            "row 1 starts where row 0 (sized by item 1) ends"
+        );
         // The spanning item keeps its own requested height, which is taller
         // than the two rows it covers (40 + 40 = 80) — the extra 50px grows
         // the last row it spans, the way a table's rowspan cell does.
@@ -3503,7 +3610,9 @@ mod tests {
         // and what is dropped after it. Re-shaping that run to end in `…` needs
         // a real font, which the engine never owns (the embedder supplies the
         // bytes), so an empty set leaves each surviving run's text as it was.
-        let fonts = FontSet { entries: Vec::new() };
+        let fonts = FontSet {
+            entries: Vec::new(),
+        };
         let run = |x: f32, y: f32, text: &str| TextFragment {
             glyphs: Vec::new(),
             text: text.to_string(),
@@ -3512,7 +3621,12 @@ mod tests {
             y,
             size: 16.0,
             line_height: 20.0,
-            color: Color { r: 0, g: 0, b: 0, a: 255 },
+            color: Color {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 255,
+            },
             underline: false,
             strikethrough: false,
             bold: false,
@@ -3561,11 +3675,19 @@ mod tests {
         // photo then covered whatever column it was supposed to sit in. And a
         // scaled width with the original height is a picture stretched down
         // over the text beneath it, so the ratio has to come along.
-        let node = dom::elem("img".into(), HashMap::from([("src".into(), "pic".into())]), vec![]);
+        let node = dom::elem(
+            "img".into(),
+            HashMap::from([("src".into(), "pic".into())]),
+            vec![],
+        );
         let mut values = HashMap::new();
         values.insert("display".to_string(), Value::Keyword("block".into()));
         values.insert("width".to_string(), Value::Length(50.0, Unit::Percent));
-        let img = StyledNode { node: &node, specified_values: values, children: vec![] };
+        let img = StyledNode {
+            node: &node,
+            specified_values: values,
+            children: vec![],
+        };
 
         let root_node = dom::elem("div".into(), HashMap::new(), vec![]);
         let mut root_values = HashMap::new();
@@ -3581,7 +3703,11 @@ mod tests {
         let mut images = ImageMap::new();
         images.insert(
             "pic".to_string(),
-            crate::resource::DecodedImage { width: 40, height: 20, pixels: vec![] },
+            crate::resource::DecodedImage {
+                width: 40,
+                height: 20,
+                pixels: vec![],
+            },
         );
         let mut viewport: Dimensions = Default::default();
         viewport.content.width = 200.0;
@@ -3777,7 +3903,11 @@ mod tests {
         let sized = laid.children.last().expect("two items");
         assert_eq!(sized.dimensions.content.width, 200.0);
         // ...and it sits where the text leaves it, not pushed off the end.
-        assert!(sized.dimensions.content.x <= 200.0, "at x={}", sized.dimensions.content.x);
+        assert!(
+            sized.dimensions.content.x <= 200.0,
+            "at x={}",
+            sized.dimensions.content.x
+        );
     }
 
     #[test]
@@ -3790,7 +3920,11 @@ mod tests {
             if let Some(s) = shrink {
                 v.insert("flex-shrink".to_string(), Value::Number(s));
             }
-            StyledNode { node: &node, specified_values: v, children: vec![] }
+            StyledNode {
+                node: &node,
+                specified_values: v,
+                children: vec![],
+            }
         };
         let mut values = HashMap::new();
         values.insert("display".to_string(), Value::Keyword("flex".into()));
@@ -3804,9 +3938,16 @@ mod tests {
         let mut viewport: Dimensions = Default::default();
         viewport.content.width = 700.0;
         let laid = layout_tree(&root, viewport, None, &ImageMap::new());
-        let widths: Vec<f32> =
-            laid.children.iter().map(|c| c.dimensions.content.width).collect();
-        assert_eq!(widths, vec![300.0, 400.0], "only the shrinkable item gives up space");
+        let widths: Vec<f32> = laid
+            .children
+            .iter()
+            .map(|c| c.dimensions.content.width)
+            .collect();
+        assert_eq!(
+            widths,
+            vec![300.0, 400.0],
+            "only the shrinkable item gives up space"
+        );
 
         // With both items shrinkable (default flex-shrink: 1), the overflow
         // splits by base-size weight: 600 gives up 600/1000 of it, 400 gives
@@ -3817,8 +3958,11 @@ mod tests {
             children: vec![item(600.0, None), item(400.0, None)],
         };
         let laid_both = layout_tree(&root_both, viewport, None, &ImageMap::new());
-        let widths_both: Vec<f32> =
-            laid_both.children.iter().map(|c| c.dimensions.content.width).collect();
+        let widths_both: Vec<f32> = laid_both
+            .children
+            .iter()
+            .map(|c| c.dimensions.content.width)
+            .collect();
         assert_eq!(widths_both, vec![420.0, 280.0]);
     }
 
@@ -3829,10 +3973,18 @@ mod tests {
         item_values.insert("display".to_string(), Value::Keyword("block".into()));
         item_values.insert("width".to_string(), Value::Length(100.0, Unit::Px));
         item_values.insert("flex-basis".to_string(), Value::Length(250.0, Unit::Px));
-        let item = StyledNode { node: &node, specified_values: item_values, children: vec![] };
+        let item = StyledNode {
+            node: &node,
+            specified_values: item_values,
+            children: vec![],
+        };
         let mut values = HashMap::new();
         values.insert("display".to_string(), Value::Keyword("flex".into()));
-        let root = StyledNode { node: &node, specified_values: values, children: vec![item] };
+        let root = StyledNode {
+            node: &node,
+            specified_values: values,
+            children: vec![item],
+        };
         let mut viewport: Dimensions = Default::default();
         viewport.content.width = 900.0;
         let laid = layout_tree(&root, viewport, None, &ImageMap::new());
@@ -3850,26 +4002,33 @@ mod tests {
             if let Some(a) = align_self {
                 v.insert("align-self".to_string(), Value::Keyword(a.into()));
             }
-            StyledNode { node: &node, specified_values: v, children: vec![] }
+            StyledNode {
+                node: &node,
+                specified_values: v,
+                children: vec![],
+            }
         };
         let mut values = HashMap::new();
         values.insert("display".to_string(), Value::Keyword("flex".into()));
-        values.insert("align-items".to_string(), Value::Keyword("flex-start".into()));
+        values.insert(
+            "align-items".to_string(),
+            Value::Keyword("flex-start".into()),
+        );
         // A 100px-tall sibling makes the line tall enough for alignment to move things.
         let root = StyledNode {
             node: &node,
             specified_values: values,
-            children: vec![
-                item(None),
-                item(Some("flex-end")),
-                {
-                    let mut v = HashMap::new();
-                    v.insert("display".to_string(), Value::Keyword("block".into()));
-                    v.insert("width".to_string(), Value::Length(20.0, Unit::Px));
-                    v.insert("height".to_string(), Value::Length(100.0, Unit::Px));
-                    StyledNode { node: &node, specified_values: v, children: vec![] }
-                },
-            ],
+            children: vec![item(None), item(Some("flex-end")), {
+                let mut v = HashMap::new();
+                v.insert("display".to_string(), Value::Keyword("block".into()));
+                v.insert("width".to_string(), Value::Length(20.0, Unit::Px));
+                v.insert("height".to_string(), Value::Length(100.0, Unit::Px));
+                StyledNode {
+                    node: &node,
+                    specified_values: v,
+                    children: vec![],
+                }
+            }],
         };
         let mut viewport: Dimensions = Default::default();
         viewport.content.width = 900.0;

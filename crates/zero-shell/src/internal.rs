@@ -75,7 +75,9 @@ fn newtab_style() -> String {
 }
 
 fn escape(text: &str) -> String {
-    text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// True for addresses this module serves.
@@ -97,7 +99,11 @@ pub fn page(target: &str) -> String {
         "zero://settings" => settings_page(),
         other => wrap(
             &t("Unknown page"),
-            &format!("<div class=\"empty\">{} {}.</div>", t("No built-in page at"), escape(other)),
+            &format!(
+                "<div class=\"empty\">{} {}.</div>",
+                t("No built-in page at"),
+                escape(other)
+            ),
         ),
     }
 }
@@ -142,7 +148,10 @@ pub fn source_page(url: &str, source: &str) -> String {
         .map(|line| {
             let indent = line.len() - line.trim_start().len();
             let spaces = "\u{a0}".repeat(indent);
-            format!("<div class=\"ln\">{spaces}{}</div>", escape(line.trim_start()))
+            format!(
+                "<div class=\"ln\">{spaces}{}</div>",
+                escape(line.trim_start())
+            )
         })
         .collect();
     format!(
@@ -183,7 +192,10 @@ fn newtab_page() -> String {
             // host has not already said, so the tile stays one line.
             let says_more = !title.trim().is_empty() && title != url && title.trim() != host;
             let name = match says_more {
-                true => format!("<span class=\"tile-page\">{}</span>", escape(&short(title, 26))),
+                true => format!(
+                    "<span class=\"tile-page\">{}</span>",
+                    escape(&short(title, 26))
+                ),
                 false => String::new(),
             };
             format!(
@@ -273,7 +285,11 @@ fn setting(name: &str, hint: &str, control: &str) -> String {
 /// so it errs high — and the control has no background of its own, which is what
 /// makes the slack invisible. Measure properly if the engine grows an API for it.
 fn control_width(labels: &[&str]) -> u32 {
-    labels.iter().map(|label| 30 + (label.chars().count() as u32 * 8)).sum::<u32>() + 10
+    labels
+        .iter()
+        .map(|label| 30 + (label.chars().count() as u32 * 8))
+        .sum::<u32>()
+        + 10
 }
 
 /// A segmented control built from links. Each option is a `zero://settings` URL
@@ -309,7 +325,11 @@ fn wrap_control(labels: &[&str], inner: &str) -> String {
 }
 
 fn on_off(key: &str, on: bool) -> String {
-    segmented(key, &[("on", "On"), ("off", "Off")], if on { "on" } else { "off" })
+    segmented(
+        key,
+        &[("on", "On"), ("off", "Off")],
+        if on { "on" } else { "off" },
+    )
 }
 
 /// A settings row whose name and hint are translated.
@@ -329,7 +349,11 @@ fn settings_page() -> String {
     );
     let rail = segmented(
         "rail",
-        &[("expanded", "Expanded"), ("icons", "Icons"), ("hidden", "Hidden")],
+        &[
+            ("expanded", "Expanded"),
+            ("icons", "Icons"),
+            ("hidden", "Hidden"),
+        ],
         match now.rail {
             crate::settings::Rail::Expanded => "expanded",
             crate::settings::Rail::Icons => "icons",
@@ -342,11 +366,16 @@ fn settings_page() -> String {
         .collect();
     let zoom = segmented(
         "zoom",
-        &zoom_options.iter().map(|(v, l)| (v.as_str(), l.as_str())).collect::<Vec<_>>(),
+        &zoom_options
+            .iter()
+            .map(|(v, l)| (v.as_str(), l.as_str()))
+            .collect::<Vec<_>>(),
         &now.zoom.to_string(),
     );
-    let engines: Vec<(&str, &str)> =
-        crate::settings::ENGINES.iter().map(|(key, label, _)| (*key, *label)).collect();
+    let engines: Vec<(&str, &str)> = crate::settings::ENGINES
+        .iter()
+        .map(|(key, label, _)| (*key, *label))
+        .collect();
     let engine = segmented("engine", &engines, now.engine().0);
     let theme_control = segmented(
         "theme",
@@ -455,13 +484,19 @@ fn downloads_page() -> String {
             setting(
                 &escape(&file.name),
                 &escape(&file.url),
-                &format!("<span class=\"fact\">{}</span>", escape(&date_of(file.when))),
+                &format!(
+                    "<span class=\"fact\">{}</span>",
+                    escape(&date_of(file.when))
+                ),
             )
         })
         .collect();
     console_wrap(
         &t("Downloads"),
-        &format!("<div class=\"lede\">{}</div>{rows}", t("Saved pages, newest first.")),
+        &format!(
+            "<div class=\"lede\">{}</div>{rows}",
+            t("Saved pages, newest first.")
+        ),
     )
 }
 
@@ -492,16 +527,16 @@ fn history_page() -> String {
     }
     wrap(
         &t("History"),
-        &format!("<div class=\"lede\">{}</div>{rows}", t("Most recent first.")),
+        &format!(
+            "<div class=\"lede\">{}</div>{rows}",
+            t("Most recent first.")
+        ),
     )
 }
 
 fn bookmarks_page() -> String {
     let marks = storage::load_bookmarks();
-    let rows: String = marks
-        .iter()
-        .map(|b| row(&b.url, &b.title, None))
-        .collect();
+    let rows: String = marks.iter().map(|b| row(&b.url, &b.title, None)).collect();
 
     if rows.is_empty() {
         return wrap(
@@ -599,12 +634,21 @@ mod tests {
 
     #[test]
     fn a_tile_is_named_by_its_host_and_cut_to_fit() {
-        assert_eq!(host_of("https://news.ycombinator.com/item?id=1"), "news.ycombinator.com");
+        assert_eq!(
+            host_of("https://news.ycombinator.com/item?id=1"),
+            "news.ycombinator.com"
+        );
         // `www.` is noise on a tile this small.
-        assert_eq!(host_of("https://www.wikipedia.org/wiki/Rust"), "wikipedia.org");
+        assert_eq!(
+            host_of("https://www.wikipedia.org/wiki/Rust"),
+            "wikipedia.org"
+        );
         assert_eq!(short("github.com", 24), "github.com");
         // The engine has no `text-overflow`, so anything too long is cut here.
-        assert_eq!(short("a-very-long-hostname.example.com", 12), "a-very-long…");
+        assert_eq!(
+            short("a-very-long-hostname.example.com", 12),
+            "a-very-long…"
+        );
     }
 
     #[test]
