@@ -1,3 +1,16 @@
 [workspace]
 resolver = "2"
 members = ["crates/zero-engine", "crates/zero-shell"]
+
+# `cargo run` is how the README says to try the browser, and unoptimized it is
+# not usable: at 1920x1080 a page takes 550-720 ms to lay out and paint and the
+# chrome 44-70 ms a redraw, against 36-42 ms and 3-4 ms in release. The shell
+# waits on its renderer, so every click, resize and hover blocked the window
+# until Windows called it Not Responding. The workspace's own crates keep debug
+# assertions and stay quick to rebuild at opt-level 1; dependencies (shaping,
+# font rasterizing, image decoding) are built once, so they get full speed.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
