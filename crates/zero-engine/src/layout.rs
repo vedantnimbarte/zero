@@ -276,7 +276,8 @@ pub struct InlineBox {
     pub width: f32,
     pub height: f32,
     pub background: Option<Color>,
-    pub border_color: Option<Color>,
+    pub border_top: Option<Color>,
+    pub border_bottom: Option<Color>,
     pub radius: f32,
 }
 
@@ -1518,8 +1519,8 @@ impl<'a> LayoutBox<'a> {
             .unwrap_or_else(|| auto.clone());
         let mut margin_left = style.lookup("margin-left", "margin", &zero);
         let mut margin_right = style.lookup("margin-right", "margin", &zero);
-        let border_left = style.lookup("border-left-width", "border-width", &zero);
-        let border_right = style.lookup("border-right-width", "border-width", &zero);
+        let border_left = style.border_width("left");
+        let border_right = style.border_width("right");
         let padding_left = style.lookup("padding-left", "padding", &zero);
         let padding_right = style.lookup("padding-right", "padding", &zero);
         // `margin: 0 auto` is the case worth getting right: both sides start
@@ -1651,12 +1652,8 @@ impl<'a> LayoutBox<'a> {
         let d = &mut self.dimensions;
         d.margin.top = style.lookup("margin-top", "margin", &zero).resolve(ctx);
         d.margin.bottom = style.lookup("margin-bottom", "margin", &zero).resolve(ctx);
-        d.border.top = style
-            .lookup("border-top-width", "border-width", &zero)
-            .resolve(ctx);
-        d.border.bottom = style
-            .lookup("border-bottom-width", "border-width", &zero)
-            .resolve(ctx);
+        d.border.top = style.border_width("top").resolve(ctx);
+        d.border.bottom = style.border_width("bottom").resolve(ctx);
         d.padding.top = style.lookup("padding-top", "padding", &zero).resolve(ctx);
         d.padding.bottom = style
             .lookup("padding-bottom", "padding", &zero)
@@ -2032,8 +2029,8 @@ impl<'a> LayoutBox<'a> {
         );
         let zero = Value::Length(0.0, Unit::Px);
         let edges: f32 = [
-            style.lookup("border-top-width", "border-width", &zero),
-            style.lookup("border-bottom-width", "border-width", &zero),
+            style.border_width("top"),
+            style.border_width("bottom"),
             style.lookup("padding-top", "padding", &zero),
             style.lookup("padding-bottom", "padding", &zero),
         ]
@@ -2231,7 +2228,8 @@ fn spread_glyphs(glyphs: &mut [PositionedGlyph], spacing: f32) -> f32 {
 #[derive(Clone)]
 struct InlineStyle {
     background: Option<Color>,
-    border_color: Option<Color>,
+    border_top: Option<Color>,
+    border_bottom: Option<Color>,
     radius: f32,
     pad_left: f32,
     pad_right: f32,
@@ -2269,7 +2267,8 @@ impl OpenInline {
             width: (end_x - self.start_x).max(0.0),
             height: self.height + self.style.pad_top + self.style.pad_bottom,
             background: self.style.background,
-            border_color: self.style.border_color,
+            border_top: self.style.border_top,
+            border_bottom: self.style.border_bottom,
             radius: self.style.radius,
         }
     }
@@ -2621,12 +2620,13 @@ fn inline_style_of(styled: &StyledNode) -> Option<InlineStyle> {
         _ => None,
     };
     let background = color_of("background").or_else(|| color_of("background-color"));
-    let border_color = color_of("border-color");
+    let (border_top, border_bottom) = (styled.border_color("top"), styled.border_color("bottom"));
     let (pad_left, pad_right) = (pad("padding-left"), pad("padding-right"));
     let (pad_top, pad_bottom) = (pad("padding-top"), pad("padding-bottom"));
 
     if background.is_none()
-        && border_color.is_none()
+        && border_top.is_none()
+        && border_bottom.is_none()
         && pad_left == 0.0
         && pad_right == 0.0
         && pad_top == 0.0
@@ -2636,7 +2636,8 @@ fn inline_style_of(styled: &StyledNode) -> Option<InlineStyle> {
     }
     Some(InlineStyle {
         background,
-        border_color,
+        border_top,
+        border_bottom,
         radius: styled.px("border-radius", 0.0).unwrap_or(0.0),
         pad_left,
         pad_right,
@@ -2649,15 +2650,15 @@ fn inline_style_of(styled: &StyledNode) -> Option<InlineStyle> {
 fn horizontal_edges(style: &StyledNode, ctx: LengthContext) -> f32 {
     let zero = Value::Length(0.0, Unit::Px);
     [
-        ("margin-left", "margin"),
-        ("margin-right", "margin"),
-        ("border-left-width", "border-width"),
-        ("border-right-width", "border-width"),
-        ("padding-left", "padding"),
-        ("padding-right", "padding"),
+        style.lookup("margin-left", "margin", &zero),
+        style.lookup("margin-right", "margin", &zero),
+        style.border_width("left"),
+        style.border_width("right"),
+        style.lookup("padding-left", "padding", &zero),
+        style.lookup("padding-right", "padding", &zero),
     ]
     .iter()
-    .map(|(name, short)| style.lookup(name, short, &zero).resolve(ctx))
+    .map(|v| v.resolve(ctx))
     .sum()
 }
 

@@ -1,8 +1,8 @@
 //! Style: match CSS rules to DOM nodes and produce a styled tree (the cascade).
 
 use crate::css::{
-    Combinator, LengthContext, Pseudo, PseudoElement, Rule, Selector, SelectorPart, SimpleSelector,
-    Specificity, Stylesheet, Unit, Value, DEFAULT_FONT_SIZE,
+    Color, Combinator, LengthContext, Pseudo, PseudoElement, Rule, Selector, SelectorPart,
+    SimpleSelector, Specificity, Stylesheet, Unit, Value, DEFAULT_FONT_SIZE,
 };
 use crate::dom::{ElementData, Node, NodeType};
 use std::collections::HashMap;
@@ -81,6 +81,44 @@ impl<'a> StyledNode<'a> {
         self.value(name)
             .or_else(|| self.value(fallback_name))
             .unwrap_or_else(|| default.clone())
+    }
+
+    /// One side's (`top`, `right` …) border width. Zero unless the side has a
+    /// style that draws: `none` and `hidden` take the width with them, and so
+    /// does no style at all, since the initial style is `none`.
+    pub fn border_width(&self, side: &str) -> Value {
+        match self.value(&format!("border-{side}-style")) {
+            Some(Value::Keyword(k)) if k != "none" && k != "hidden" => self
+                .value(&format!("border-{side}-width"))
+                .unwrap_or(Value::Length(3.0, Unit::Px)), // `medium`
+            _ => Value::Length(0.0, Unit::Px),
+        }
+    }
+
+    /// The colour one side's border paints in, or `None` if it paints nothing.
+    /// No colour, or `currentcolor`, is the text colour.
+    pub fn border_color(&self, side: &str) -> Option<Color> {
+        if self.border_width(side).resolve(self.length_context(0.0)) <= 0.0 {
+            return None;
+        }
+        match self.value(&format!("border-{side}-color")) {
+            Some(Value::ColorValue(c)) => Some(c),
+            None => self.text_color(),
+            Some(Value::Keyword(k)) if k.eq_ignore_ascii_case("currentcolor") => self.text_color(),
+            _ => None,
+        }
+    }
+
+    fn text_color(&self) -> Option<Color> {
+        match self.value("color") {
+            Some(Value::ColorValue(c)) => Some(c),
+            _ => Some(Color {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 255,
+            }),
+        }
     }
 
     pub fn display(&self) -> Display {
@@ -228,7 +266,7 @@ fn matches_chain<E: Matchable>(
     let Some((subject, rest)) = parts.split_last() else {
         return true;
     };
-    if !matches_simple_selector(cursor.elem(), &subject.simple, hovered) {
+    if !matches_simple_selector(cursor, ancestors, &subject.simple, hovered) {
         return false;
     }
     if rest.is_empty() {
@@ -255,10 +293,12 @@ fn matches_chain<E: Matchable>(
 }
 
 fn matches_simple_selector<E: Matchable>(
-    elem: &E,
+    cursor: &Cursor<E>,
+    ancestors: &[Cursor<E>],
     selector: &SimpleSelector,
     hovered: &HoverChain,
 ) -> bool {
+    let elem = cursor.elem();
     if selector.tag_name.iter().any(|name| elem.tag() != name) {
         return false;
     }
@@ -282,11 +322,19 @@ fn matches_simple_selector<E: Matchable>(
     selector
         .pseudos
         .iter()
-        .all(|pseudo| matches_pseudo(elem, pseudo, hovered))
+        .all(|pseudo| matches_pseudo(cursor, ancestors, pseudo, hovered))
 }
 
-fn matches_pseudo<E: Matchable>(elem: &E, pseudo: &Pseudo, hovered: &HoverChain) -> bool {
+fn matches_pseudo<E: Matchable>(
+    cursor: &Cursor<E>,
+    ancestors: &[Cursor<E>],
+    pseudo: &Pseudo,
+    hovered: &HoverChain,
+) -> bool {
+    let elem = cursor.elem();
     let pos = elem.pos();
+    // An argument may be a whole chain (`:not(nav a)`), checked from here up.
+    let any = |list: &[Selector]| list.iter().any(|s| matches(cursor, ancestors, s, hovered));
     match pseudo {
         Pseudo::Hover => hovered.contains(&elem.node_id()),
         Pseudo::NthChild(a, b) => nth_matches(*a, *b, pos.index),
@@ -299,7 +347,8 @@ fn matches_pseudo<E: Matchable>(elem: &E, pseudo: &Pseudo, hovered: &HoverChain)
         ),
         Pseudo::OnlyChild => pos.count == 1,
         Pseudo::OnlyOfType => pos.type_count == 1,
-        Pseudo::Not(inner) => !matches_simple_selector(elem, inner, hovered),
+        Pseudo::Is(list) | Pseudo::Where(list) => any(list),
+        Pseudo::Not(list) => !any(list),
         Pseudo::AttrPresent(name) => elem.attr(name).is_some(),
         Pseudo::AttrAbsent(name) => elem.attr(name).is_none(),
         Pseudo::Never => false,
@@ -1085,6 +1134,24 @@ mod tests {
     }
 
     #[test]
+    fn is_where_and_not_match_whole_selectors() {
+        let html =
+            "<body><nav><a class=x>1</a></nav><p><a class=x>2</a><a class=y>3</a></p></body>";
+        // `:not(nav a)` looks up the tree from the element itself, and
+        // `:where()` loses to a plain class however late it comes.
+        let css = "a:not(nav a) { color: #ff0000; }                    :is(nav, .nope) > a { color: #00ff00; }                    .y { background-color: #0000ff; }                    p :where(.y) { background-color: #ff0000; }";
+        let dom = crate::html::parse(html.to_string());
+        let sheet = crate::css::parse(css.to_string());
+        let styled = style_tree(&dom, &sheet);
+        let kids = elements(&styled); // the root is <body> itself here
+        let (nav, p) = (kids[0], kids[1]);
+        let rgb = |r, g, b| Some(Value::ColorValue(crate::css::Color { r, g, b, a: 255 }));
+        assert_eq!(elements(nav)[0].value("color"), rgb(0, 255, 0));
+        assert_eq!(elements(p)[0].value("color"), rgb(255, 0, 0));
+        assert_eq!(elements(p)[1].value("background-color"), rgb(0, 0, 255));
+    }
+
+    #[test]
     fn attribute_selectors_match_on_value() {
         let html = "<body><input type=\"text\" name=\"q\">                    <input type=\"submit\">                    <a href=\"https://a.com/x.pdf\" rel=\"nofollow noopener\">link</a></body>";
         let css = "[type=text] { color: #ff0000; }                    input[type=\"submit\"] { color: #00ff00; }                    a[href$=\".pdf\"] { color: #0000ff; }                    a[rel~=noopener] { background-color: #111111; }                    [name] { padding: 4px; }                    a[href^=\"ftp\"] { color: #ffffff; }";
@@ -1110,10 +1177,10 @@ mod tests {
         );
         // Presence alone, and a prefix that does not match.
         assert_eq!(
-            fields[0].value("padding"),
+            fields[0].value("padding-left"),
             Some(Value::Length(4.0, Unit::Px))
         );
-        assert_eq!(fields[1].value("padding"), None);
+        assert_eq!(fields[1].value("padding-left"), None);
     }
 
     #[test]
@@ -1175,7 +1242,7 @@ mod tests {
         let cards = elements(body);
         assert_eq!(cards[0].value("color"), Some(red));
         assert_eq!(
-            cards[0].value("padding"),
+            cards[0].value("padding-top"),
             Some(Value::Length(12.0, Unit::Px))
         );
         // A missing variable falls back to the value after the comma.

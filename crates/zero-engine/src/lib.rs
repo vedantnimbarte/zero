@@ -419,10 +419,13 @@ impl Document {
     }
 
     fn run_initial_scripts(&mut self) {
-        let mut source = String::new();
-        collect_script_text(&self.root, &mut source);
-        if !source.trim().is_empty() {
-            match js::lexer::tokenize(&source).and_then(js::parser::parse) {
+        let mut sources = Vec::new();
+        collect_script_text(&self.root, &mut sources);
+        // Each `<script>` is its own program, as in a browser: one that fails to
+        // parse or throws stops only itself, and the globals the earlier ones
+        // defined are still there for the next.
+        for source in sources.iter().filter(|s| !s.trim().is_empty()) {
+            match js::lexer::tokenize(source).and_then(js::parser::parse) {
                 Ok(program) => self.interp.run(&program),
                 Err(e) => self.interp.out.errors.push(format!("SyntaxError: {e}")),
             }
@@ -839,7 +842,7 @@ impl Engine {
         // Cascade order (later wins on ties):
         // UA stylesheet < linked stylesheets < page <style> < caller CSS.
         let mut source = USER_AGENT_CSS.to_string();
-        collect_linked_css(root, loader, &mut source);
+        collect_linked_css(root, loader, width, height, &mut source);
         source.push('\n');
         collect_style_text(root, &mut source);
         source.push('\n');
@@ -865,13 +868,10 @@ impl Engine {
 
         // Whether any rule cares about the cursor, so the embedder can skip
         // re-rendering on mouse movement when nothing would change.
-        let uses_hover = stylesheet.rules.iter().any(|rule| {
-            rule.selectors.iter().any(|s| {
-                s.parts
-                    .iter()
-                    .any(|p| p.simple.pseudos.contains(&css::Pseudo::Hover))
-            })
-        });
+        let uses_hover = stylesheet
+            .rules
+            .iter()
+            .any(|rule| rule.selectors.iter().any(css::Selector::mentions_hover));
         // Whether anything on the page is `position: sticky`. Layout is
         // scroll-independent for every other page, so the embedder can keep
         // reusing the band it has while scrolling — and must not, here, because
@@ -1004,9 +1004,15 @@ pub fn is_text_field(tag: &str) -> bool {
 /// ponytail: `@import` inside a fetched sheet is not followed, so a site that
 /// splits its CSS that way still renders under-styled. One more pass over the
 /// parsed sheet would fix it.
-fn collect_linked_css(node: &Node, loader: &dyn ResourceLoader, out: &mut String) {
+fn collect_linked_css(
+    node: &Node,
+    loader: &dyn ResourceLoader,
+    width: f32,
+    height: f32,
+    out: &mut String,
+) {
     let mut hrefs = Vec::new();
-    collect_stylesheet_hrefs(node, &mut hrefs);
+    collect_stylesheet_hrefs(node, width, height, &mut hrefs);
     for (href, bytes) in hrefs.iter().zip(loader.load_all(&hrefs)) {
         let Some(text) = bytes.and_then(|b| String::from_utf8(b).ok()) else {
             continue;
@@ -1163,16 +1169,20 @@ fn import_urls(text: &str) -> Vec<String> {
     urls
 }
 
-fn collect_stylesheet_hrefs(node: &Node, out: &mut Vec<String>) {
+/// A sheet whose `media` does not match the viewport (`print`, a dark-mode
+/// sheet in light mode) is not fetched at all; a viewport change re-collects.
+fn collect_stylesheet_hrefs(node: &Node, width: f32, height: f32, out: &mut Vec<String>) {
     if let NodeType::Element(ref e) = node.node_type {
-        if e.tag_name == "link" && is_stylesheet(e) {
+        let media = e.attributes.get("media").map(String::as_str);
+        let media = media.filter(|m| !m.trim().is_empty()); // `media=""` means all
+        if e.tag_name == "link" && is_stylesheet(e) && css::media_matches(media, width, height) {
             if let Some(href) = e.attributes.get("href").filter(|h| !h.is_empty()) {
                 out.push(href.clone());
             }
         }
     }
     for child in &node.children {
-        collect_stylesheet_hrefs(child, out);
+        collect_stylesheet_hrefs(child, width, height, out);
     }
 }
 
@@ -1372,7 +1382,6 @@ fn node_at<'a>(root: &'a mut Node, path: &[usize]) -> Option<&'a mut Node> {
     Some(current)
 }
 
-/// Gather the text inside every `<script>` element into one JS source string.
 /// A cheap content hash, to notice when a page's CSS actually changes.
 fn hash_of(text: &str) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -1479,20 +1488,38 @@ pub fn percent_encode(text: &str) -> String {
     out
 }
 
-fn collect_script_text(node: &Node, out: &mut String) {
+/// The text of every inline classic or module `<script>`, one entry per
+/// element. Data blocks (`application/json`, `ld+json`, `importmap`,
+/// `text/template` …) are not script and are left out.
+fn collect_script_text(node: &Node, out: &mut Vec<String>) {
     if let NodeType::Element(ref e) = node.node_type {
-        if e.tag_name == "script" && !e.attributes.contains_key("src") {
+        if e.tag_name == "script" && !e.attributes.contains_key("src") && is_js_type(e) {
+            let mut text = String::new();
             for child in &node.children {
                 if let NodeType::Text(ref t) = child.node_type {
-                    out.push_str(t);
-                    out.push('\n');
+                    text.push_str(t);
                 }
             }
+            out.push(text);
         }
     }
     for child in &node.children {
         collect_script_text(child, out);
     }
+}
+
+/// No `type`, an empty one, `module`, or a JavaScript MIME type
+/// (`text/javascript`, `application/ecmascript; charset=…`).
+fn is_js_type(element: &dom::ElementData) -> bool {
+    let kind = element
+        .attributes
+        .get("type")
+        .map(|t| t.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    kind.is_empty()
+        || kind == "module"
+        || kind.contains("javascript")
+        || kind.contains("ecmascript")
 }
 
 /// Append a node to <body> (or the root if there is none).
@@ -1719,6 +1746,94 @@ mod tests {
         // The border strip would be the outer 4px; with it suppressed the
         // whole box is background, not red.
         assert_eq!(rgb(canvas.pixels[0]), (255, 255, 255));
+    }
+
+    #[test]
+    fn a_one_value_padding_beats_the_user_agent_list_indent() {
+        let engine = super::Engine::shapes_only();
+        let canvas = engine.render(
+            "<body><ul><li>x</li></ul></body>",
+            "body { margin: 0 } ul { padding: 0; margin: 0 }              li { height: 10px; background: #ff0000 }",
+            60.0,
+            20.0,
+        );
+        let px = canvas.pixels[5 * canvas.width + 5];
+        // The UA's `padding-left: 40px` would leave x=5 white.
+        assert_eq!((px.r, px.g, px.b), (255, 0, 0));
+    }
+
+    #[test]
+    fn each_border_side_takes_its_own_shorthand() {
+        let engine = super::Engine::shapes_only();
+        let canvas = engine.render(
+            "<body><div id=a></div><div id=b></div></body>",
+            "body { margin: 0 }              #a { width: 20px; height: 20px; border: 4px solid #ff0000;                   border-bottom: none; border-left: 2px solid #0000ff; }              #b { width: 20px; height: 10px; border-top: 4px solid #ff0000; }              div#b { border: 0; }",
+            40.0,
+            40.0,
+        );
+        let rgb = |x: usize, y: usize| {
+            let c = canvas.pixels[y * canvas.width + x];
+            (c.r, c.g, c.b)
+        };
+        assert_eq!(rgb(1, 10), (0, 0, 255)); // left: its own width and colour
+        assert_eq!(rgb(10, 1), (255, 0, 0)); // top: from `border`
+        assert_eq!(rgb(24, 10), (255, 0, 0)); // right: x 22..26
+                                              // No bottom border, so #a ends at y=24 and #b starts there; and the
+                                              // later `border: 0` removed the top border #b set per side.
+        assert_eq!(rgb(10, 25), (255, 255, 255));
+    }
+
+    #[test]
+    fn a_linked_sheet_applies_only_when_its_media_matches() {
+        struct Sheets;
+        impl super::ResourceLoader for Sheets {
+            fn load(&self, url: &str) -> Option<Vec<u8>> {
+                let color = match url {
+                    "print.css" => "#ff0000",
+                    "wide.css" => "#0000ff",
+                    _ => "#00ff00",
+                };
+                Some(format!("#a {{ background: {color} }}").into_bytes())
+            }
+        }
+        let engine = super::Engine::shapes_only();
+        let mut doc = super::Document::load(
+            "<link rel=stylesheet href=all.css media=\"\">             <link rel=stylesheet href=print.css media=print>             <link rel=stylesheet href=wide.css media=\"(min-width: 600px)\">             <div id=a></div>",
+            "body { margin: 0 } #a { height: 10px }",
+        );
+        let mut rgb = |width: f32| {
+            let page = engine.render_document(&mut doc, width, 20.0, &Sheets);
+            let c = page.canvas.pixels[5 * page.canvas.width + 5];
+            (c.r, c.g, c.b)
+        };
+        assert_eq!(rgb(400.0), (0, 255, 0)); // print never applies on screen
+        assert_eq!(rgb(800.0), (0, 0, 255)); // the wide sheet, once it is wide
+    }
+
+    #[test]
+    fn each_script_runs_alone_and_data_blocks_are_not_run() {
+        let doc = super::Document::load(
+            "<script type=\"application/ld+json\">{\"@context\": \"x\"}</script>             <script>var a = 1; console.log('first');</script>             <script>this is not javascript</script>             <script type=\"text/javascript\">console.log('a=' + a);</script>             <script type=importmap>{\"imports\": {}}</script>",
+            "",
+        );
+        // The broken script stops only itself, and the globals of the first
+        // are there for the last. The JSON blocks are never parsed as JS.
+        assert!(
+            doc.console.contains(&"first".to_string()),
+            "{:?}",
+            doc.console
+        );
+        assert!(
+            doc.console.contains(&"a=1".to_string()),
+            "{:?}",
+            doc.console
+        );
+        let errors = doc
+            .console
+            .iter()
+            .filter(|l| l.starts_with("[error]"))
+            .count();
+        assert_eq!(errors, 1, "{:?}", doc.console);
     }
 
     #[test]

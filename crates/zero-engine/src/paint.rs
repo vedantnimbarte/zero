@@ -2221,8 +2221,8 @@ fn render_own(list: &mut DisplayList, layout_box: &LayoutBox) {
                 list.push(DisplayCommand::SolidColor(background, rect));
             }
         }
-        if let Some(border) = inline.border_color {
-            // A hairline outline is enough until inline border widths are modelled.
+        // A hairline is enough until inline border widths are modelled.
+        if let Some(border) = inline.border_top {
             list.push(DisplayCommand::SolidColor(
                 border,
                 Rect {
@@ -2230,6 +2230,8 @@ fn render_own(list: &mut DisplayList, layout_box: &LayoutBox) {
                     ..rect
                 },
             ));
+        }
+        if let Some(border) = inline.border_bottom {
             list.push(DisplayCommand::SolidColor(
                 border,
                 Rect {
@@ -2779,62 +2781,60 @@ fn border_radius(layout_box: &LayoutBox, box_rect: Rect) -> f32 {
 }
 
 fn render_borders(list: &mut DisplayList, layout_box: &LayoutBox) {
-    // `border: none` (or `border-style: none`/`hidden`) suppresses the border
-    // outright, whatever width or colour another rule gave it — the common
-    // case being one rule setting a border and a more specific one turning it
-    // off. Every other style (solid, dashed, ...) paints as a solid strip:
-    // the engine doesn't model dash patterns, and solid is the closer
-    // approximation than not drawing anything.
-    if let BoxType::BlockNode(style) | BoxType::InlineNode(style) = layout_box.box_type {
-        if matches!(style.value("border-style"), Some(Value::Keyword(k)) if k == "none" || k == "hidden")
-        {
-            return;
-        }
-    }
-    let color = match get_color(layout_box, "border-color") {
-        Some(color) => color,
-        None => return,
+    // Layout already zeroed the width of a side whose style draws nothing
+    // (`none`, `hidden`, unset), and `border_color` says so too. Every other
+    // style (solid, dashed, ...) paints as a solid strip: the engine doesn't
+    // model dash patterns, and solid is closer than not drawing anything.
+    let (BoxType::BlockNode(style) | BoxType::InlineNode(style)) = layout_box.box_type else {
+        return;
     };
     let d = &layout_box.dimensions;
     let b = d.border_box();
-
-    // Left, right, top, bottom border strips.
-    list.push(DisplayCommand::SolidColor(
-        color,
-        Rect {
-            x: b.x,
-            y: b.y,
-            width: d.border.left,
-            height: b.height,
-        },
-    ));
-    list.push(DisplayCommand::SolidColor(
-        color,
-        Rect {
-            x: b.x + b.width - d.border.right,
-            y: b.y,
-            width: d.border.right,
-            height: b.height,
-        },
-    ));
-    list.push(DisplayCommand::SolidColor(
-        color,
-        Rect {
-            x: b.x,
-            y: b.y,
-            width: b.width,
-            height: d.border.top,
-        },
-    ));
-    list.push(DisplayCommand::SolidColor(
-        color,
-        Rect {
-            x: b.x,
-            y: b.y + b.height - d.border.bottom,
-            width: b.width,
-            height: d.border.bottom,
-        },
-    ));
+    let strips = [
+        (
+            "left",
+            Rect {
+                x: b.x,
+                y: b.y,
+                width: d.border.left,
+                height: b.height,
+            },
+        ),
+        (
+            "right",
+            Rect {
+                x: b.x + b.width - d.border.right,
+                y: b.y,
+                width: d.border.right,
+                height: b.height,
+            },
+        ),
+        (
+            "top",
+            Rect {
+                x: b.x,
+                y: b.y,
+                width: b.width,
+                height: d.border.top,
+            },
+        ),
+        (
+            "bottom",
+            Rect {
+                x: b.x,
+                y: b.y + b.height - d.border.bottom,
+                width: b.width,
+                height: d.border.bottom,
+            },
+        ),
+    ];
+    for (side, rect) in strips {
+        if rect.width > 0.0 && rect.height > 0.0 {
+            if let Some(color) = style.border_color(side) {
+                list.push(DisplayCommand::SolidColor(color, rect));
+            }
+        }
+    }
 }
 
 /// Unlike a border, an outline takes no layout space — it is drawn one ring

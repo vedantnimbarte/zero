@@ -50,12 +50,12 @@ pub struct Rule {
 
 /// A selector is a chain of compounds read left to right, e.g. `nav > ul li`.
 /// The last part is the *subject* — the element the rule actually styles.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct Selector {
     pub parts: Vec<SelectorPart>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct SelectorPart {
     pub simple: SimpleSelector,
     /// How this part relates to the one on its left. Ignored on the first part.
@@ -109,8 +109,12 @@ pub enum Pseudo {
     NthLastOfType(i32, i32),
     OnlyChild,
     OnlyOfType,
-    /// `:not(...)` over one compound selector.
-    Not(Box<SimpleSelector>),
+    /// `:is(...)`: any of the selectors matches this element.
+    Is(Vec<Selector>),
+    /// `:where(...)`: `:is` that adds nothing to specificity.
+    Where(Vec<Selector>),
+    /// `:not(...)`: none of the selectors matches this element.
+    Not(Vec<Selector>),
     /// An attribute that is present when the state is on (`checked`, `disabled`).
     AttrPresent(&'static str),
     AttrAbsent(&'static str),
@@ -156,6 +160,29 @@ impl AttrTest {
 }
 
 impl SimpleSelector {
+    /// Ids, then classes, attributes and pseudo-classes, then tags. `:is()`
+    /// and `:not()` count as their most specific argument, `:where()` as nothing.
+    pub fn specificity(&self) -> Specificity {
+        let mut total = (
+            self.id.iter().count(),
+            self.class.len() + self.attrs.len(),
+            self.tag_name.iter().count(),
+        );
+        for pseudo in &self.pseudos {
+            let (ids, classes, tags) = match pseudo {
+                Pseudo::Where(_) => (0, 0, 0),
+                Pseudo::Is(list) | Pseudo::Not(list) => list
+                    .iter()
+                    .map(Selector::specificity)
+                    .max()
+                    .unwrap_or_default(),
+                _ => (0, 1, 0),
+            };
+            total = (total.0 + ids, total.1 + classes, total.2 + tags);
+        }
+        total
+    }
+
     /// True for `*` or for a compound we failed to read anything out of.
     pub fn is_empty(&self) -> bool {
         self.tag_name.is_none()
@@ -399,15 +426,22 @@ impl Selector {
         self.parts
             .iter()
             .fold((0, 0, 0), |(ids, classes, tags), part| {
-                (
-                    ids + part.simple.id.iter().count(),
-                    // A pseudo-class counts alongside classes, per the spec.
-                    classes
-                        + part.simple.class.len()
-                        + part.simple.attrs.len()
-                        + part.simple.pseudos.len(),
-                    tags + part.simple.tag_name.iter().count(),
-                )
+                let (i, c, t) = part.simple.specificity();
+                (ids + i, classes + c, tags + t)
+            })
+    }
+
+    /// Does `:hover` decide this selector anywhere, including inside `:is()`?
+    pub fn mentions_hover(&self) -> bool {
+        self.parts
+            .iter()
+            .flat_map(|part| &part.simple.pseudos)
+            .any(|pseudo| match pseudo {
+                Pseudo::Hover => true,
+                Pseudo::Is(list) | Pseudo::Where(list) | Pseudo::Not(list) => {
+                    list.iter().any(Selector::mentions_hover)
+                }
+                _ => false,
             })
     }
 
@@ -871,7 +905,7 @@ fn classify_value(s: &str) -> Option<Value> {
     None
 }
 
-/// The `<width> <style> <color>` grammar `border` and `outline` share, picked
+/// `outline`'s `<width> <style> <color>` grammar, picked
 /// out of `tokens` by which [`Value`] variant each one classifies as rather
 /// than by position — CSS allows any order.
 fn border_like_longhands(
@@ -932,6 +966,13 @@ pub(crate) fn declarations_for(name: &str, raw: &str) -> Vec<Declaration> {
             value: Value::Raw(raw.to_string()),
         }];
     }
+    // Per-side shorthands always become their longhands, even at one value: a
+    // longhand from an earlier rule (the UA's `ul { padding-left: 40px }`)
+    // would otherwise outrank a later `padding: 0` that only set the name the
+    // longhand lookup falls back to.
+    if let Some(longhands) = expand_sides(name, raw) {
+        return longhands;
+    }
     if let Some(value) = classify_value(raw) {
         return vec![Declaration {
             name: name.to_string(),
@@ -941,9 +982,118 @@ pub(crate) fn declarations_for(name: &str, raw: &str) -> Vec<Declaration> {
     expand_shorthand(name, raw).unwrap_or_default()
 }
 
+const SIDES: [&str; 4] = ["top", "right", "bottom", "left"];
+
+const BORDER_STYLES: [&str; 10] = [
+    "none", "hidden", "dotted", "dashed", "solid", "double", "groove", "ridge", "inset", "outset",
+];
+
+/// `padding`, `margin`, `border-width/-style/-color`, `border` and
+/// `border-top/right/bottom/left`, as the per-side longhands layout and paint
+/// read. `None` for any other property, or a value that does not parse.
+fn expand_sides(name: &str, raw: &str) -> Option<Vec<Declaration>> {
+    let tokens = split_top_level_whitespace(raw);
+    let longhand = |side: &str| match name {
+        "padding" | "margin" => format!("{name}-{side}"),
+        _ => format!("border-{side}-{}", &name["border-".len()..]),
+    };
+    match name {
+        "padding" | "margin" | "border-width" | "border-style" | "border-color" => {
+            let values: Vec<Value> = tokens
+                .iter()
+                .map(|t| match name {
+                    "border-width" => border_width_value(t),
+                    _ => classify_value(t),
+                })
+                .collect::<Option<_>>()?;
+            let per_side = match values.as_slice() {
+                [all] => [all, all, all, all],
+                [v, h] => [v, h, v, h],
+                [t, h, b] => [t, h, b, h],
+                [t, r, b, l] => [t, r, b, l],
+                _ => return None,
+            };
+            Some(
+                SIDES
+                    .iter()
+                    .zip(per_side)
+                    .map(|(side, value)| Declaration {
+                        name: longhand(side),
+                        value: value.clone(),
+                    })
+                    .collect(),
+            )
+        }
+        "border" => {
+            let parts = border_parts(&tokens)?;
+            Some(
+                SIDES
+                    .iter()
+                    .flat_map(|side| border_side(side, &parts))
+                    .collect(),
+            )
+        }
+        _ => {
+            let side = name.strip_prefix("border-").filter(|s| SIDES.contains(s))?;
+            Some(border_side(side, &border_parts(&tokens)?))
+        }
+    }
+}
+
+/// `thin`/`medium`/`thick`, or a length.
+fn border_width_value(token: &str) -> Option<Value> {
+    match token.to_ascii_lowercase().as_str() {
+        "thin" => Some(Value::Length(1.0, Unit::Px)),
+        "medium" => Some(Value::Length(3.0, Unit::Px)),
+        "thick" => Some(Value::Length(5.0, Unit::Px)),
+        _ => classify_value(token)
+            .filter(|v| matches!(v, Value::Length(..) | Value::Number(_) | Value::Calc(..))),
+    }
+}
+
+/// `<width> || <style> || <color>` in any order. What the value leaves out is
+/// reset, as with every shorthand: width `medium`, style `none`, colour
+/// `currentcolor`. A token we cannot read is skipped; a value with none we
+/// can read (`inherit`) is `None`, and the declaration is dropped.
+fn border_parts(tokens: &[&str]) -> Option<[Value; 3]> {
+    let (mut width, mut style, mut color) = (None, None, None);
+    for token in tokens {
+        let lower = token.to_ascii_lowercase();
+        if width.is_none() && border_width_value(token).is_some() {
+            width = border_width_value(token);
+        } else if style.is_none() && BORDER_STYLES.contains(&lower.as_str()) {
+            style = Some(Value::Keyword(lower));
+        } else if color.is_none() && lower == "currentcolor" {
+            color = Some(Value::Keyword(lower));
+        } else if let Some(v @ Value::ColorValue(_)) =
+            classify_value(token).filter(|_| color.is_none())
+        {
+            color = Some(v);
+        }
+    }
+    if width.is_none() && style.is_none() && color.is_none() {
+        return None;
+    }
+    Some([
+        width.unwrap_or(Value::Length(3.0, Unit::Px)),
+        style.unwrap_or_else(|| Value::Keyword("none".to_string())),
+        color.unwrap_or_else(|| Value::Keyword("currentcolor".to_string())),
+    ])
+}
+
+fn border_side(side: &str, [width, style, color]: &[Value; 3]) -> Vec<Declaration> {
+    [("width", width), ("style", style), ("color", color)]
+        .into_iter()
+        .map(|(part, value)| Declaration {
+            name: format!("border-{side}-{part}"),
+            value: value.clone(),
+        })
+        .collect()
+}
+
 /// Split a multi-token shorthand into the longhands the rest of the engine
 /// already reads. Only reached once [`classify_value`] has failed on the whole
-/// string, so the common single-token case (`padding: 10px`, `flex: 1`) is
+/// string, so the common single-token case (`flex: 1`) is
 /// untouched and keeps working exactly as it did.
 fn expand_shorthand(name: &str, raw: &str) -> Option<Vec<Declaration>> {
     // `font`, like `background`, cannot be split on whitespace: the family runs
@@ -965,43 +1115,8 @@ fn expand_shorthand(name: &str, raw: &str) -> Option<Vec<Declaration>> {
         return None;
     }
     match name {
-        "padding" | "margin" => {
-            let values: Vec<Value> = tokens
-                .iter()
-                .map(|t| classify_value(t))
-                .collect::<Option<_>>()?;
-            let (top, right, bottom, left) = match values.as_slice() {
-                [all] => (all.clone(), all.clone(), all.clone(), all.clone()),
-                [v, h] => (v.clone(), h.clone(), v.clone(), h.clone()),
-                [t, h, b] => (t.clone(), h.clone(), b.clone(), h.clone()),
-                [t, r, b, l] => (t.clone(), r.clone(), b.clone(), l.clone()),
-                _ => return None,
-            };
-            Some(vec![
-                Declaration {
-                    name: format!("{name}-top"),
-                    value: top,
-                },
-                Declaration {
-                    name: format!("{name}-right"),
-                    value: right,
-                },
-                Declaration {
-                    name: format!("{name}-bottom"),
-                    value: bottom,
-                },
-                Declaration {
-                    name: format!("{name}-left"),
-                    value: left,
-                },
-            ])
-        }
-        // Uniform on every side, which is the overwhelming common case
-        // (`border: 1px solid #ccc`) — the per-side longhands already fall
-        // back to `border-width`, so setting it once covers all four.
-        "border" => border_like_longhands(&tokens, "border-width", "border-color", "border-style"),
-        // `outline` has the same three-part grammar as `border` and no sides
-        // to distribute over (it is drawn outside the box, not part of it).
+        // `outline` has `border`'s three-part grammar but no sides to
+        // distribute over (it is drawn outside the box, not part of it).
         "outline" => {
             border_like_longhands(&tokens, "outline-width", "outline-color", "outline-style")
         }
@@ -1306,6 +1421,37 @@ fn scan_top_level(text: &str, stops: &[char]) -> Option<(usize, char)> {
         }
     }
     None
+}
+
+/// The selectors of an `:is()`/`:where()`/`:not()` argument, one per
+/// top-level comma; `None` for one that does not parse.
+fn selector_list_arg(text: &str) -> Vec<Option<Selector>> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    loop {
+        let (one, more) = match scan_top_level(rest, &[',']) {
+            Some((at, _)) => (&rest[..at], Some(&rest[at + 1..])),
+            None => (rest, None),
+        };
+        // The rule parser reads a selector list up to its block; give it one.
+        let mut sub = Parser {
+            pos: 0,
+            input: format!("{} {{", one.trim()),
+        };
+        out.push(sub.parse_selectors().and_then(|mut list| {
+            let parsed = (list.len() == 1).then(|| list.remove(0))?;
+            // A pseudo-element is not something an element can *be*.
+            parsed
+                .parts
+                .iter()
+                .all(|p| p.simple.pseudo_element.is_none())
+                .then_some(parsed)
+        }));
+        match more {
+            Some(more) => rest = more,
+            None => return out,
+        }
+    }
 }
 
 /// A keyframe selector as a fraction: `from` is 0, `to` is 1, `35%` is 0.35.
@@ -2024,6 +2170,21 @@ impl Parser {
                 } else {
                     self.skip_balanced_braces();
                 }
+            } else if self.starts_with("@layer") {
+                // `@layer a, b;` only declares an order and has no block, so
+                // the prelude reader consumes it and there is nothing to parse.
+                //
+                // ponytail: layered rules cascade by specificity and source
+                // order like unlayered ones. Real precedence (layer order, and
+                // unlayered beating every layer) needs a layer rank on `Rule`
+                // ahead of specificity in the cascade sort.
+                self.pos += "@layer".len();
+                if self.at_rule_prelude().is_some() {
+                    let (inner, faces, frames) = self.parse_rule_list(media, true);
+                    rules.extend(inner);
+                    font_faces.extend(faces);
+                    keyframes.extend(frames);
+                }
             } else if self.starts_with("@font-face") {
                 if let Some(face) = self.parse_font_face() {
                     font_faces.push(face);
@@ -2229,12 +2390,15 @@ impl Parser {
         let name = self.parse_identifier().to_ascii_lowercase();
         let args = match self.next_char_or('\0') {
             '(' => {
-                let Some(end) = self.input[self.pos..].find(')') else {
+                // Balanced: `:not(:nth-child(2))` closes on the second paren.
+                let Some((end, _)) = scan_top_level(&self.input[self.pos + 1..], &[')']) else {
                     self.pos = start;
                     return false;
                 };
-                let args = self.input[self.pos + 1..self.pos + end].trim().to_string();
-                self.pos += end + 1;
+                let args = self.input[self.pos + 1..self.pos + 1 + end]
+                    .trim()
+                    .to_string();
+                self.pos += end + 2;
                 Some(args)
             }
             _ => None,
@@ -2270,18 +2434,22 @@ impl Parser {
                 Some((a, b)) => Pseudo::NthLastOfType(a, b),
                 None => Pseudo::Never,
             },
+            // `:is()` and `:where()` take a forgiving list: an argument we
+            // cannot read is dropped, not the rule (and an empty list matches
+            // nothing). `:not()` is unforgiving, as the spec says.
+            ("is" | "where" | "matches" | "-webkit-any", Some(inner)) => {
+                let list = selector_list_arg(inner).into_iter().flatten().collect();
+                match name.as_str() {
+                    "where" => Pseudo::Where(list),
+                    _ => Pseudo::Is(list),
+                }
+            }
             ("not", Some(inner)) => {
-                let mut sub = Parser {
-                    pos: 0,
-                    input: inner.to_string(),
-                };
-                let inner = sub.parse_simple_selector();
-                // `:not(a, b)` and `:not(div p)` need more than one compound.
-                if inner.is_empty() || sub.pos < sub.input.len() {
+                let Some(list) = selector_list_arg(inner).into_iter().collect::<Option<_>>() else {
                     self.pos = start;
                     return false;
-                }
-                Pseudo::Not(Box::new(inner))
+                };
+                Pseudo::Not(list)
             }
             ("checked", None) => Pseudo::AttrPresent("checked"),
             ("disabled", None) => Pseudo::AttrPresent("disabled"),
@@ -2569,12 +2737,15 @@ mod tests {
             ".a { width: 50%; padding: 1.5em; margin: 2rem; flex-grow: 2; line-height: 1.4; }"
                 .to_string(),
         );
-        let d = &s.rules[0].declarations;
-        assert_eq!(d[0].value, Value::Length(50.0, Unit::Percent));
-        assert_eq!(d[1].value, Value::Length(1.5, Unit::Em));
-        assert_eq!(d[2].value, Value::Length(2.0, Unit::Rem));
-        assert_eq!(d[3].value, Value::Number(2.0));
-        assert_eq!(d[4].value, Value::Number(1.4));
+        let value = |name: &str| {
+            let d = &s.rules[0].declarations;
+            d.iter().find(|d| d.name == name).map(|d| d.value.clone())
+        };
+        assert_eq!(value("width"), Some(Value::Length(50.0, Unit::Percent)));
+        assert_eq!(value("padding-top"), Some(Value::Length(1.5, Unit::Em)));
+        assert_eq!(value("margin-left"), Some(Value::Length(2.0, Unit::Rem)));
+        assert_eq!(value("flex-grow"), Some(Value::Number(2.0)));
+        assert_eq!(value("line-height"), Some(Value::Number(1.4)));
     }
 
     #[test]
@@ -2619,13 +2790,16 @@ mod tests {
 
         let s = parse(".a { border: 1px solid #cccccc; }".to_string());
         let d = &s.rules[0].declarations;
-        assert_eq!(find(d, "border-width"), Some(Value::Length(1.0, Unit::Px)));
         assert_eq!(
-            find(d, "border-style"),
+            find(d, "border-top-width"),
+            Some(Value::Length(1.0, Unit::Px))
+        );
+        assert_eq!(
+            find(d, "border-left-style"),
             Some(Value::Keyword("solid".to_string()))
         );
         assert_eq!(
-            find(d, "border-color"),
+            find(d, "border-bottom-color"),
             Some(Value::ColorValue(Color {
                 r: 0xcc,
                 g: 0xcc,
@@ -2708,11 +2882,51 @@ mod tests {
             }))
         );
 
-        // A single-token shorthand is untouched by expansion.
-        let s = parse(".a { padding: 10px; }".to_string());
+        // One value expands too, so `padding: 0` outranks an earlier
+        // `padding-left` rather than only setting the name it falls back to.
+        let s = parse(".a { padding: 0; margin: auto; }".to_string());
+        let d = &s.rules[0].declarations;
+        assert_eq!(find(d, "padding-left"), Some(Value::Number(0.0)));
         assert_eq!(
-            s.rules[0].declarations[0].value,
-            Value::Length(10.0, Unit::Px)
+            find(d, "margin-right"),
+            Some(Value::Keyword("auto".to_string()))
+        );
+        assert_eq!(find(d, "padding"), None);
+
+        // Per-side borders, in any order, `none` included, with a colour
+        // function kept whole. What a side leaves out is reset.
+        let s = parse(
+            ".a { border-left: rgba(0, 0, 0, 0.5) 2px dashed; border-bottom: none;                   border-width: 0 thin; }"
+                .to_string(),
+        );
+        let d = &s.rules[0].declarations;
+        assert_eq!(
+            find(d, "border-left-color"),
+            Some(Value::ColorValue(Color {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 128
+            }))
+        );
+        assert_eq!(
+            find(d, "border-left-style"),
+            Some(Value::Keyword("dashed".to_string()))
+        );
+        assert_eq!(
+            find(d, "border-bottom-style"),
+            Some(Value::Keyword("none".to_string()))
+        );
+        assert_eq!(
+            find(d, "border-bottom-color"),
+            Some(Value::Keyword("currentcolor".to_string()))
+        );
+        assert_eq!(find(d, "border-top-style"), None);
+        let widths: Vec<_> = d.iter().filter(|d| d.name.ends_with("-width")).collect();
+        assert_eq!(widths.len(), 6); // left 2px, bottom medium, then four from border-width
+        assert_eq!(
+            find(d, "border-right-width"),
+            Some(Value::Length(1.0, Unit::Px))
         );
 
         // An unknown multi-token property still drops, as before.
@@ -2828,9 +3042,54 @@ mod tests {
         assert_eq!(subject(2).pseudos, vec![Pseudo::AttrPresent("checked")]);
         assert_eq!(subject(3).pseudos, vec![Pseudo::Never]);
         match &subject(1).pseudos[..] {
-            [Pseudo::Not(inner)] => assert_eq!(inner.class, vec!["skip".to_string()]),
+            [Pseudo::Not(list)] => {
+                assert_eq!(list[0].subject().unwrap().class, vec!["skip".to_string()])
+            }
             other => panic!("expected :not(.skip), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn is_where_and_not_take_selector_lists() {
+        let s = parse(
+            ".a :is(.b, #c) { color: red; }              :where(.b, .c) { color: red; }              .x:not(.y, .p .z) { color: red; }              li:is(:nth-child(2), ::marker, .q) { color: red; }              .x:not(::marker) { color: red; }"
+                .to_string(),
+        );
+        // The last rule goes: `:not()` is unforgiving. `:is()` drops only the
+        // argument it cannot read (`::marker`).
+        assert_eq!(s.rules.len(), 4);
+        let subject = |i: usize| s.rules[i].selectors[0].subject().unwrap();
+        match &subject(0).pseudos[..] {
+            [Pseudo::Is(list)] => assert_eq!(list.len(), 2),
+            other => panic!("expected :is(), got {other:?}"),
+        }
+        match &subject(3).pseudos[..] {
+            [Pseudo::Is(list)] => assert_eq!(list.len(), 2),
+            other => panic!("expected :is(), got {other:?}"),
+        }
+        match &subject(2).pseudos[..] {
+            [Pseudo::Not(list)] => assert_eq!(list[1].parts.len(), 2), // `.p .z`
+            other => panic!("expected :not(), got {other:?}"),
+        }
+        // `:is()` weighs as its most specific argument, `:where()` as nothing.
+        assert_eq!(s.rules[0].selectors[0].specificity(), (1, 1, 0));
+        assert_eq!(s.rules[1].selectors[0].specificity(), (0, 0, 0));
+        assert_eq!(s.rules[2].selectors[0].specificity(), (0, 3, 0));
+    }
+
+    #[test]
+    fn layer_blocks_are_parsed_and_layer_statements_skipped() {
+        let s = parse(
+            "@layer reset, base;              @layer base { .a { color: red; } @media screen { .b { color: red; } } }              @layer { .c { color: red; } }              .d { color: red; }"
+                .to_string(),
+        );
+        let classes: Vec<_> = s
+            .rules
+            .iter()
+            .map(|r| r.selectors[0].subject().unwrap().class[0].as_str())
+            .collect();
+        assert_eq!(classes, ["a", "b", "c", "d"]);
+        assert_eq!(s.rules[1].media.as_deref(), Some("screen"));
     }
 
     #[test]
@@ -3138,8 +3397,8 @@ mod tests {
             .iter()
             .find(|r| r.selectors.iter().any(|sel| sel.specificity() == (0, 1, 0)))
             .expect("the .ok rule");
-        // color + width(%) + padding all understood now.
-        assert_eq!(ok.declarations.len(), 3);
+        // color + width(%) + padding (as its four sides) all understood now.
+        assert_eq!(ok.declarations.len(), 6);
     }
 
     #[test]
