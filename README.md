@@ -58,6 +58,7 @@ saved settings.
 | Pose | Effect |
 |------|--------|
 | `menu` | the overflow menu, open |
+| `tabmenu` | a tab's right-click menu, open |
 | `ai` | the assistant panel, open |
 | `hover:star` | a control lit, with its tooltip |
 | `search:wiki` | tab search, filtering |
@@ -77,6 +78,17 @@ saved settings.
 `Ctrl+U` view source · `Ctrl+R` reload · `Ctrl+I` AI panel ·
 `Ctrl+Shift+O` open the page in your other browser ·
 `Ctrl+=`/`Ctrl+-`/`Ctrl+0` zoom (also `Ctrl`+wheel) · `Alt+←/→` back and forward.
+
+Chrome's own shortcuts work the same way here: `Ctrl+1`…`8` / `Ctrl+9` a tab /
+the last tab · `Ctrl+Shift+Tab`, `Ctrl+PgUp/PgDn` previous/next tab ·
+`Ctrl+Shift+PgUp/PgDn` move the tab · `Ctrl+V` paste · `Alt+D`/`F6` address bar ·
+`Ctrl+Enter` complete `www.….com` · `Alt+Enter` open in a new tab · `F5` reload ·
+`F3`/`Ctrl+G` next match (`Shift` for previous) · `F11` full screen ·
+`Alt+Home` new-tab page · `End` bottom of page · `Ctrl+Shift+D` bookmark all tabs ·
+`Ctrl+Shift+Delete` history (with **Clear history**) · `Ctrl+Shift+W` close the window.
+Right-click a tab for its menu (duplicate, pin, close others, close below) or the
+page for back/forward, copy, search the selection and link actions; middle-click
+a tab to close it, and middle-click or `Ctrl`+click a link to open it behind.
 
 **Built-in pages:** `zero://newtab`, `zero://history`, `zero://bookmarks`,
 `zero://downloads`, `zero://settings`.

@@ -1,31 +1,65 @@
-//! The system clipboard, written to as plain text.
+//! The system clipboard, as plain text.
 //!
-//! One call, one platform backend, no dependency: the OS already has this and
-//! every crate that wraps it wraps exactly these three implementations. Reading
-//! the clipboard is not here because nothing asks for it yet — paste into the
-//! address bar is the next thing that will, and it belongs beside `set`.
+//! Two calls, one platform backend, no dependency: the OS already has this and
+//! every crate that wraps it wraps exactly these three implementations.
 //!
 //! Failures are silent by design. A clipboard that will not open (another
 //! process is holding it, or there is no display server at all) is a copy that
 //! did not happen, not a browser that should say anything about it.
+//!
+//! Unit tests drive the same menus the user does, and a test run has no
+//! business overwriting — or reading — whatever the developer last copied, so
+//! both calls are inert under `cfg(test)`.
 
 /// Put `text` on the system clipboard as plain text.
 pub fn set(text: &str) {
-    if text.is_empty() {
+    if text.is_empty() || cfg!(test) {
         return; // nothing selected is not a request to clear what is there
     }
     backend::set(text);
+}
+
+/// The clipboard's text, or empty when it holds none.
+pub fn get() -> String {
+    match cfg!(test) {
+        true => String::new(),
+        false => backend::get(),
+    }
 }
 
 #[cfg(windows)]
 mod backend {
     use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::System::DataExchange::{
-        CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+        CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
     };
     use windows_sys::Win32::System::Memory::{
-        GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE,
+        GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
     };
+
+    pub fn get() -> String {
+        // SAFETY: the clipboard is opened for this thread and closed on every
+        // path out. The block belongs to the clipboard and is only read, never
+        // past `GlobalSize`, so text with no terminator cannot run off its end.
+        unsafe {
+            if OpenClipboard(std::ptr::null_mut()) == 0 {
+                return String::new();
+            }
+            let mut text = String::new();
+            let handle = GetClipboardData(CF_UNICODETEXT);
+            if !handle.is_null() {
+                let src = GlobalLock(handle) as *const u16;
+                if !src.is_null() {
+                    let units = std::slice::from_raw_parts(src, GlobalSize(handle) / 2);
+                    let end = units.iter().position(|u| *u == 0).unwrap_or(units.len());
+                    text = String::from_utf16_lossy(&units[..end]);
+                    GlobalUnlock(handle);
+                }
+            }
+            CloseClipboard();
+            text
+        }
+    }
 
     /// `CF_UNICODETEXT`. Naming it here costs one line and saves pulling in the
     /// whole `Win32_System_Ole` surface for a single `13`.
@@ -83,6 +117,28 @@ mod backend {
                 return;
             }
         }
+    }
+
+    pub fn get() -> String {
+        let helpers: &[(&str, &[&str])] = match cfg!(target_os = "macos") {
+            true => &[("pbpaste", &[])],
+            false => &[
+                ("wl-paste", &["--no-newline"]),
+                ("xclip", &["-selection", "clipboard", "-o"]),
+            ],
+        };
+        helpers
+            .iter()
+            .filter_map(|(program, args)| {
+                Command::new(program)
+                    .args(*args)
+                    .stderr(Stdio::null())
+                    .output()
+                    .ok()
+            })
+            .find(|out| out.status.success())
+            .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+            .unwrap_or_default()
     }
 
     /// Run `program` and write `text` to its stdin. `false` if it is not

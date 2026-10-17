@@ -54,7 +54,7 @@ fn safe_name(site: &str) -> String {
 
 /// Keep a site's data in its own file, with unsafe path characters replaced.
 fn file_for(site: &str) -> Option<PathBuf> {
-    let dir = crate::storage::profile_dir()?.join("localstorage");
+    let dir = crate::storage::trail_dir()?.join("localstorage");
     fs::create_dir_all(&dir).ok()?;
     let safe = safe_name(site);
     if safe.is_empty() {
@@ -80,7 +80,7 @@ fn legacy_host(site: &str) -> Option<&str> {
 /// That host's file, if it is actually still there.
 fn legacy_file(site: &str) -> Option<PathBuf> {
     let host = legacy_host(site)?;
-    let path = crate::storage::profile_dir()?
+    let path = crate::storage::trail_dir()?
         .join("localstorage")
         .join(format!("{}.tsv", safe_name(host)));
     path.exists().then_some(path)
@@ -124,6 +124,15 @@ pub fn site_store(site: &str) -> std::rc::Rc<SiteStore> {
             .or_insert_with(|| std::rc::Rc::new(SiteStore::for_site(site)))
             .clone()
     })
+}
+
+/// Drop every store that lives only in memory, which outside a test is what a
+/// private session wrote — so the next one starts as empty as the first.
+pub fn forget_memory_stores() {
+    OPEN.with(|open| {
+        open.borrow_mut()
+            .retain(|key, _| !key.starts_with("memory:"))
+    });
 }
 
 impl SiteStore {

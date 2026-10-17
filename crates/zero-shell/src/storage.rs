@@ -26,6 +26,35 @@ pub fn profile_dir() -> Option<PathBuf> {
     Some(dir)
 }
 
+/// Whether a private session has the window.
+///
+/// Process-wide rather than a field on the app, because the HTTP cache is read
+/// and written from worker threads that never see the app — and a flag those
+/// threads could miss would be a private session quietly writing to disk.
+static PRIVATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_private(on: bool) {
+    PRIVATE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn is_private() -> bool {
+    PRIVATE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Where what browsing leaves behind goes — cookies, `localStorage`, the HTTP
+/// cache, the downloads list. `None` in a private session, so none of it is
+/// written there, and none of the normal session's is read back into it.
+///
+/// History and the session are the app's to decide, since it knows which
+/// pages count; bookmarks, settings and saved files are things you chose to
+/// keep, so they still use [`profile_dir`].
+pub fn trail_dir() -> Option<PathBuf> {
+    match is_private() {
+        true => None,
+        false => profile_dir(),
+    }
+}
+
 /// Where every space lives. The default space keeps this directory itself, so a
 /// profile written before spaces existed needs no migration.
 pub fn root_dir() -> Option<PathBuf> {
@@ -73,6 +102,14 @@ pub fn load_history() -> Vec<Visit> {
     profile_dir()
         .map(|dir| read_history(&dir))
         .unwrap_or_default()
+}
+
+/// Forget every visit in this space. Bookmarks, downloads and the session are
+/// things you chose to keep, so they stay.
+pub fn clear_history() {
+    if let Some(dir) = profile_dir() {
+        let _ = fs::remove_file(dir.join("history.tsv"));
+    }
 }
 
 fn append_visit(dir: &Path, url: &str, title: &str) {
@@ -233,9 +270,12 @@ pub fn save_page(url: &str, title: &str, body: &str) -> Option<String> {
         sanitize(url),
         sanitize(&dir.join(&name).to_string_lossy())
     );
-    let file = profile_dir()?.join("downloads.tsv");
-    let existing = crate::crypto::read_file(&file).unwrap_or_default();
-    crate::crypto::write_file(&file, &(existing + &line));
+    // The file is yours either way; only the record of it is private.
+    if let Some(dir) = trail_dir() {
+        let file = dir.join("downloads.tsv");
+        let existing = crate::crypto::read_file(&file).unwrap_or_default();
+        crate::crypto::write_file(&file, &(existing + &line));
+    }
     Some(name)
 }
 

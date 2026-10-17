@@ -65,8 +65,37 @@ thread_local! {
             .map(|dir| CookieJar::load(&dir))
             .unwrap_or_default(),
     );
+    /// The normal jar, set aside while a private session uses an empty one.
+    static KEPT: RefCell<Option<CookieJar>> = const { RefCell::new(None) };
     /// The site being visited, which partitions every cookie for this page.
     static PARTITION: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+/// Give a private session an empty jar, or end one by putting the normal jar
+/// back. Set aside rather than reloaded from disk, so the session cookies that
+/// keep you signed in — which never reach disk — survive the detour.
+pub fn set_private_jar(on: bool) {
+    JAR.with(|jar| {
+        KEPT.with(|kept| {
+            let mut kept = kept.borrow_mut();
+            match (on, kept.take()) {
+                (true, None) => *kept = Some(jar.replace(CookieJar::default())),
+                (false, Some(normal)) => drop(jar.replace(normal)),
+                (_, already) => *kept = already, // asked for the state it is in
+            }
+        })
+    });
+}
+
+/// Load the jar of the space now in use. Each space owns its cookies, so after
+/// a switch the old space's jar must neither be sent nor saved over the new
+/// one's `cookies.tsv`.
+pub fn reload_jar() {
+    reload_jar_from(crate::storage::trail_dir().as_deref());
+}
+
+fn reload_jar_from(dir: Option<&std::path::Path>) {
+    JAR.set(dir.map(CookieJar::load).unwrap_or_default());
 }
 
 /// Set the top-level site that subsequent requests belong to.
@@ -115,7 +144,7 @@ fn store_cookies(url: &str, headers: Vec<String>) {
         for header in headers {
             jar.store(&site, url, &header);
         }
-        if let Some(dir) = crate::storage::profile_dir() {
+        if let Some(dir) = crate::storage::trail_dir() {
             jar.save(&dir);
         }
     });
@@ -741,5 +770,29 @@ mod tests {
             resolve_url(base, "https://x.com/i.png"),
             "https://x.com/i.png"
         );
+    }
+
+    #[test]
+    fn switching_spaces_swaps_the_jar() {
+        // The bug this guards: the jar was loaded once, so after a switch the
+        // old space's cookies were sent, then saved over the new space's.
+        let root = std::env::temp_dir().join("zero-net-jar-test");
+        let _ = std::fs::remove_dir_all(&root);
+        let url = "https://s.test/";
+        for space in ["personal", "work"] {
+            let dir = root.join(space);
+            std::fs::create_dir_all(&dir).expect("scratch dir");
+            let mut jar = CookieJar::default();
+            jar.store(&site_of(url), url, &format!("who={space}; Max-Age=3600"));
+            jar.save(&dir);
+        }
+        set_partition(url);
+
+        reload_jar_from(Some(&root.join("personal")));
+        assert_eq!(cookie_header(url), Some("who=personal".into()));
+        reload_jar_from(Some(&root.join("work")));
+        assert_eq!(cookie_header(url), Some("who=work".into()));
+        reload_jar_from(None); // a space with no profile starts empty
+        assert_eq!(cookie_header(url), None);
     }
 }

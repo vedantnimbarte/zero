@@ -160,7 +160,7 @@ pub fn refresh(url: &str, entry: &Entry, policy: &Policy) {
 }
 
 fn dir() -> Option<PathBuf> {
-    let dir = crate::storage::profile_dir()?.join("cache");
+    let dir = crate::storage::trail_dir()?.join("cache");
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir)
 }

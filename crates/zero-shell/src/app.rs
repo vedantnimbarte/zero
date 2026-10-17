@@ -41,7 +41,7 @@ use winit::dpi::LogicalSize;
 use winit::event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
-use winit::window::{CursorIcon, Window, WindowId};
+use winit::window::{CursorIcon, Fullscreen, Window, WindowId};
 use zero_engine::{Canvas, Cursor, ElementRect, Engine, TextRun};
 
 const RAIL_W: u32 = 236;
@@ -226,9 +226,13 @@ pub mod theme {
     }
 
     /// The active tab and the space dot, in the current space's colour — which
-    /// is how you can tell at a glance which profile you are typing into.
+    /// is how you can tell at a glance which profile you are typing into — or
+    /// that you are in a private session, which keeps nothing.
     pub fn accent() -> &'static str {
-        crate::spaces::accent_of(&crate::spaces::current())
+        match crate::storage::is_private() {
+            true => crate::spaces::PRIVATE_ACCENT,
+            false => crate::spaces::accent_of(&crate::spaces::current()),
+        }
     }
 
     /// `ratio` of `over` blended onto `onto`. Both must be `#rrggbb`.
@@ -457,11 +461,15 @@ pub const TIPS: &[(&str, &str)] = &[
 const MENU_ITEMS: &[(&str, &str, &str)] = &[
     ("menu:new", "New tab", "Ctrl+T"),
     ("menu:reopen", "Reopen closed tab", "Ctrl+Shift+T"),
+    ("menu:private", "New private session", "Ctrl+Shift+N"),
     ("menu:pin", "Pin this tab", ""),
+    ("menu:dup", "Duplicate tab", ""),
     ("", "", ""), // a rule
     ("menu:zoom", "Zoom", ""),
+    ("menu:fullscreen", "Full screen", "F11"),
     ("", "", ""),
     ("menu:split", "Split view", ""),
+    ("menu:copylink", "Copy link", ""),
     ("menu:find", "Find on page", "Ctrl+F"),
     ("menu:save", "Save page", "Ctrl+S"),
     ("menu:source", "View source", "Ctrl+U"),
@@ -503,6 +511,34 @@ impl Focus {
             q.pop();
         }
     }
+}
+
+/// A right-click menu: where it opened and what it offers, as `(id, label,
+/// shortcut)` with an empty id for a rule. The link and the selected text are
+/// held here rather than in the entry ids, because ids end up in markup and a
+/// URL has no business being parsed back out of one.
+struct ContextMenu {
+    at: (u32, u32),
+    items: Vec<(String, String, &'static str)>,
+    link: Option<String>,
+    text: String,
+}
+
+/// The tab a rail or strip control belongs to: its row, or its close button.
+fn tab_index(id: &str) -> Option<usize> {
+    id.strip_prefix("tab:")
+        .or_else(|| id.strip_prefix("close:"))?
+        .parse()
+        .ok()
+}
+
+/// Ctrl+Enter's completion, as Chrome does it: `example` becomes
+/// `https://www.example.com`. Anything that already looks like an address, or
+/// is more than one word, is left to the ordinary rules.
+fn dotcom(typed: &str) -> Option<String> {
+    let word = typed.trim();
+    let bare = !word.is_empty() && word.chars().all(|c| c.is_alphanumeric() || c == '-');
+    bare.then(|| format!("https://www.{word}.com"))
 }
 
 /// A chrome control's painted box, in window coordinates, and what it does.
@@ -1293,7 +1329,7 @@ pub fn screenshot(
             // Down the page, so a long article can be reviewed past its first
             // screenful — which is also the only way to see a band boundary.
             ("scroll", px) => app.tab_mut().scroll_y = px.parse().unwrap_or(0.0),
-            ("railpx", _) => {} // applied after the loop, once settings are known
+            ("railpx", _) | ("tabmenu", _) => {} // applied after the loop
             ("search", query) => app.focus = Focus::TabSearch(query.to_string()),
             ("find", query) => {
                 // Run the search rather than only opening the bar, so the shot
@@ -1303,6 +1339,12 @@ pub fn screenshot(
             }
             ("split", _) => app.toggle_split(),
             ("space", name) => app.switch_space(name),
+            // The flag alone, not `toggle_private`: that saves the normal
+            // session first, and a screenshot must not overwrite yours.
+            ("private", _) => {
+                app.private = true;
+                storage::set_private(true);
+            }
             ("tabs", n) => {
                 // Extra tabs, so the rail and the strip can be seen carrying more
                 // than one thing.
@@ -1349,6 +1391,16 @@ pub fn screenshot(
     } else {
         app.rail_px = rail_target(app.settings) as f32;
     }
+    // A right-click menu opens over a control, and where the controls are is
+    // only known once a frame has been drawn — so draw one, then right-click
+    // the last tab in it.
+    if poses.iter().any(|p| p == "tabmenu") {
+        app.frame(width, height);
+        if let Some(hit) = app.hits.iter().rev().find(|h| h.id.starts_with("tab:")) {
+            app.cursor = (hit.x + 24.0, hit.y + hit.height / 2.0);
+        }
+        app.open_context();
+    }
     (app.frame(width, height), width, height)
 }
 
@@ -1390,8 +1442,20 @@ struct App {
     ai_open: bool,
     ai_text: String,
     menu_open: bool,
+    /// The right-click menu, while one is up.
+    context: Option<ContextMenu>,
+    /// Which find match was last jumped to, so Enter steps on from it rather
+    /// than from wherever the scroll position happens to land.
+    find_at: Option<usize>,
+    /// Set by a shortcut that closes the window; the event loop acts on it.
+    quit: bool,
     /// Addresses of recently closed tabs, most recent last.
     closed: Vec<String>,
+    /// Whether this is a private session: nothing it does is kept.
+    private: bool,
+    /// The normal session's tabs, which tab was in front and its closed tabs,
+    /// set aside while a private session has the window.
+    normal: Option<(Vec<Tab>, usize, Vec<String>)>,
     /// What typed characters go to.
     focus: Focus,
     /// Every chrome control's box from the last frame, in paint order — so the
@@ -1454,7 +1518,12 @@ impl App {
             ai_open: false,
             ai_text: String::new(),
             menu_open: false,
+            context: None,
+            find_at: None,
+            quit: false,
             closed: Vec::new(),
+            private: false,
+            normal: None,
             focus: Focus::Address,
             hits: Vec::new(),
             hovered: None,
@@ -1511,6 +1580,9 @@ impl ApplicationHandler for App {
             WindowEvent::RedrawRequested => self.render(),
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 self.handle_key(event);
+                if self.quit {
+                    event_loop.exit();
+                }
                 self.request_redraw();
             }
             // A finished composition is exactly typing, however many keys it
@@ -1584,6 +1656,8 @@ impl ApplicationHandler for App {
             } => {
                 match button {
                     MouseButton::Left => self.handle_click(),
+                    MouseButton::Middle => self.middle_click(),
+                    MouseButton::Right => self.open_context(),
                     MouseButton::Back => self.back(),
                     MouseButton::Forward => self.forward(),
                     _ => {}
@@ -1774,10 +1848,14 @@ impl App {
         if name == crate::spaces::current() {
             return;
         }
+        if self.private {
+            self.toggle_private(); // a private session belongs to no space
+        }
         self.save_session(); // the space being left keeps its tabs
         let Some(_) = crate::spaces::switch(name) else {
             return;
         };
+        crate::net::reload_jar();
         settings::reload();
         self.settings = settings::current();
         renderer::set_motion(self.settings.motion);
@@ -1788,6 +1866,62 @@ impl App {
         self.closed.clear();
         self.rail_px = rail_target(self.settings) as f32;
         self.request_redraw();
+    }
+
+    /// Start a private session, or end the one running — Chrome's Incognito
+    /// window, in a browser that has one window.
+    ///
+    /// While it runs the window holds only its own tabs, and nothing it does
+    /// reaches disk: no history, no session, cookies and `localStorage` in
+    /// memory, no HTTP cache. Ending it, or closing the browser, throws all of
+    /// that away and puts the normal tabs back exactly as they were left.
+    fn toggle_private(&mut self) {
+        if self.private {
+            // The private tabs, and the renderers behind them, end here.
+            let (tabs, active, closed) = self
+                .normal
+                .take()
+                .unwrap_or_else(|| (vec![Tab::blank()], 0, Vec::new()));
+            self.tabs = tabs;
+            self.active = active;
+            self.closed = closed;
+        } else {
+            self.save_session(); // the normal session, as it is left
+            self.normal = Some((
+                std::mem::replace(&mut self.tabs, vec![Tab::blank()]),
+                std::mem::replace(&mut self.active, 0),
+                std::mem::take(&mut self.closed),
+            ));
+        }
+        self.private = !self.private;
+        storage::set_private(self.private);
+        crate::net::set_private_jar(self.private);
+        crate::localstore::forget_memory_stores();
+        self.split = None;
+        self.focus = Focus::Address;
+        self.invalidate_panes();
+        self.show_title();
+        self.request_redraw();
+    }
+
+    /// Name the window after the page in front, and say when the session is
+    /// private — the one place that shows even with the window minimised.
+    fn show_title(&self) {
+        let Some(window) = &self.window else { return };
+        let tab = self.tab();
+        let shown = if tab.title.is_empty() {
+            &tab.address
+        } else {
+            &tab.title
+        };
+        let name = match self.private {
+            true => format!("Zero Browser ({})", t("Private")),
+            false => "Zero Browser".to_string(),
+        };
+        window.set_title(&match shown.is_empty() {
+            true => name,
+            false => format!("{name} — {shown}"),
+        });
     }
 
     /// Show `index` beside the active tab, or close the split if it is already
@@ -1841,13 +1975,32 @@ impl App {
 
     /// Write the open tabs to disk so the next launch can restore them.
     fn save_session(&self) {
+        if let Some((tabs, active)) = self.session_to_save() {
+            storage::save_session(&tabs, active);
+        }
+    }
+
+    /// The open tabs (address and whether pinned) and which is in front — or
+    /// nothing in a private session, whose tabs must not be there to reopen.
+    fn session_to_save(&self) -> Option<(Vec<(String, bool)>, usize)> {
+        if self.private {
+            return None;
+        }
         let tabs: Vec<(String, bool)> = self
             .tabs
             .iter()
             .filter(|t| !t.address.is_empty())
             .map(|t| (t.address.clone(), t.pinned))
             .collect();
-        storage::save_session(&tabs, self.active.min(tabs.len().saturating_sub(1)));
+        let active = self.active.min(tabs.len().saturating_sub(1));
+        Some((tabs, active))
+    }
+
+    /// Whether a page just shown belongs in history. Built-in pages are the
+    /// browser's own furniture, not places you visited, and a private session
+    /// keeps nothing at all.
+    fn keeps_visit(&self, address: &str) -> bool {
+        !self.private && !crate::internal::is_internal(address)
     }
 
     fn new_tab(&mut self) {
@@ -1894,8 +2047,149 @@ impl App {
         self.go_to(address);
     }
 
-    fn next_tab(&mut self) {
-        self.active = (self.active + 1) % self.tabs.len();
+    /// Ctrl+Tab and Ctrl+Shift+Tab, counting the way the rail draws the tabs —
+    /// pinned first — so the next tab is the one you can see below this one.
+    fn step_tab(&mut self, delta: isize) {
+        let order = self.rail_order();
+        let Some(at) = order.iter().position(|i| *i == self.active) else {
+            return; // filtered out of a tab search; nothing to step from
+        };
+        let n = order.len() as isize;
+        self.active = order[(at as isize + delta).rem_euclid(n) as usize];
+    }
+
+    /// Ctrl+1…8 go to that tab, Ctrl+9 to the last one.
+    fn select_nth(&mut self, n: usize) {
+        let order = self.rail_order();
+        let pick = match n {
+            9 => order.last(),
+            n => order.get(n - 1),
+        };
+        if let Some(&index) = pick {
+            self.active = index;
+        }
+    }
+
+    /// Ctrl+Shift+PageUp/PageDown: swap the active tab with its neighbour. A
+    /// pinned tab stays among the pinned, as it would in Chrome's strip.
+    fn move_tab(&mut self, delta: isize) {
+        let order = self.rail_order();
+        let Some(at) = order.iter().position(|i| *i == self.active) else {
+            return;
+        };
+        let Some(&other) = usize::try_from(at as isize + delta)
+            .ok()
+            .and_then(|to| order.get(to))
+        else {
+            return;
+        };
+        if self.tabs[other].pinned != self.tabs[self.active].pinned {
+            return;
+        }
+        let here = self.active;
+        self.tabs.swap(here, other);
+        self.split = self.split.map(|i| match i {
+            i if i == other => here,
+            i if i == here => other,
+            i => i,
+        });
+        self.active = other;
+        self.save_session();
+    }
+
+    /// Put `tab` at `index` and bring it to the front, keeping the split on the
+    /// tab it was showing as the indices after it shift.
+    fn insert_tab(&mut self, index: usize, tab: Tab) {
+        let index = index.min(self.tabs.len());
+        self.tabs.insert(index, tab);
+        self.split = self.split.map(|i| if i >= index { i + 1 } else { i });
+        self.active = index;
+        self.focus = Focus::Address;
+        self.save_session();
+    }
+
+    /// Open `target` in a new tab beside this one: in front, or behind it the
+    /// way a middle-click or Ctrl+click does in Chrome.
+    fn open_in_new_tab(&mut self, target: String, foreground: bool) {
+        let opener = self.active;
+        // The new tab starts on a browser page, which `go_to` trusts to act on
+        // a `zero://` query (a preference, clearing history). A website's link
+        // must not borrow that trust, so it only opens the page.
+        let from_web = !crate::internal::is_internal(&self.tab().address);
+        let target = match from_web && crate::internal::is_internal(&target) {
+            true => target.split('?').next().unwrap_or_default().to_string(),
+            false => target,
+        };
+        self.insert_tab(opener + 1, Tab::blank());
+        self.go_to(target);
+        if !foreground {
+            self.active = opener; // the new tab sits after it, so its index held
+        }
+    }
+
+    /// A copy of the tab at `index`, back-and-forward list included, right after it.
+    fn duplicate_tab(&mut self, index: usize) {
+        let source = &self.tabs[index];
+        let (address, history, at, zoom) = (
+            source.address.clone(),
+            source.history.clone(),
+            source.history_index,
+            source.zoom,
+        );
+        self.insert_tab(index + 1, Tab::blank());
+        self.load(address);
+        let tab = self.tab_mut();
+        (tab.history, tab.history_index, tab.zoom) = (history, at, zoom);
+    }
+
+    /// Close every other tab. Pinned tabs survive, as they do in Chrome — that
+    /// is what pinning one is for.
+    fn close_others(&mut self, keep: usize) {
+        self.close_where(keep, |i, tab| i != keep && !tab.pinned);
+    }
+
+    /// Close the tabs after `index` in rail order — below it, or to its right
+    /// in the strip — pinned ones excepted.
+    fn close_after(&mut self, index: usize) {
+        let order = self.rail_order();
+        let after: Vec<usize> = order
+            .iter()
+            .skip_while(|i| **i != index)
+            .skip(1)
+            .copied()
+            .collect();
+        self.close_where(index, |i, tab| after.contains(&i) && !tab.pinned);
+    }
+
+    /// Close the tabs `doomed` picks, leaving `keep` in front. Each goes through
+    /// [`close_tab_at`](Self::close_tab_at), so every one can be reopened.
+    fn close_where(&mut self, keep: usize, doomed: impl Fn(usize, &Tab) -> bool) {
+        let doomed: Vec<usize> = (0..self.tabs.len())
+            .filter(|i| doomed(*i, &self.tabs[*i]))
+            .collect();
+        self.active = keep; // close_tab_at keeps the active tab in front
+        for index in doomed.into_iter().rev() {
+            self.close_tab_at(index);
+        }
+    }
+
+    /// Bookmark every open tab that is not one of the browser's own pages.
+    fn bookmark_all(&mut self) {
+        for tab in &self.tabs {
+            if !crate::internal::is_internal(&tab.address) && !storage::is_bookmarked(&tab.address)
+            {
+                storage::add_bookmark(&tab.address, &tab.label());
+            }
+        }
+    }
+
+    fn toggle_fullscreen(&self) {
+        if let Some(window) = &self.window {
+            window.set_fullscreen(match window.fullscreen() {
+                Some(_) => None,
+                None => Some(Fullscreen::Borderless(None)),
+            });
+        }
     }
 
     fn toggle_pin(&mut self) {
@@ -1989,13 +2283,43 @@ impl App {
         true
     }
 
+    /// Ctrl+V: the clipboard goes wherever typing would. Every field here holds
+    /// one line, so a pasted paragraph arrives as one line too.
+    fn paste(&mut self) {
+        let text = crate::clipboard::get();
+        self.type_text(&text.lines().collect::<Vec<_>>().join(" "));
+    }
+
+    /// Ctrl+L, Alt+D and F6: an empty address bar, ready for a new address,
+    /// with typing taken back from whatever page field had it.
+    fn focus_address(&mut self) {
+        self.tab_mut().address.clear();
+        self.focus = Focus::Address;
+        let frame = self.tab_mut().renderer.blur();
+        self.adopt(frame);
+    }
+
+    /// Alt+Enter: what was typed opens in a new tab, and this one goes back to
+    /// showing where it already is.
+    fn navigate_in_new_tab(&mut self) {
+        let tab = self.tab_mut();
+        let typed = std::mem::replace(&mut tab.address, tab.history[tab.history_index].clone());
+        self.open_in_new_tab(normalize_target(&typed), true);
+    }
+
     fn handle_key(&mut self, event: KeyEvent) {
         let ctrl = self.modifiers.control_key();
         let shift = self.modifiers.shift_key();
+        let alt = self.modifiers.alt_key();
+        // Any key dismisses a right-click menu; Escape does nothing else.
+        if self.context.take().is_some() && event.logical_key == Key::Named(NamedKey::Escape) {
+            return;
+        }
         // A chrome field owns typing while it is open, like a page field does.
         if !ctrl && self.focus.query().is_some() {
             match event.logical_key {
                 Key::Named(NamedKey::Escape) => self.close_chrome_field(),
+                Key::Named(NamedKey::F3) => self.jump_to_match(!shift),
                 Key::Named(NamedKey::Backspace) => {
                     self.focus.pop();
                     self.apply_chrome_field();
@@ -2014,7 +2338,7 @@ impl App {
             return;
         }
         // A focused page field owns plain typing; chords still reach the browser.
-        if !ctrl && self.tab().is_focused {
+        if !ctrl && !alt && self.tab().is_focused {
             let handled = match event.logical_key {
                 Key::Named(NamedKey::Backspace) => {
                     let frame = self.tab_mut().renderer.backspace();
@@ -2045,23 +2369,25 @@ impl App {
             Key::Character(ref c) if ctrl => match (lower(c).as_str(), shift) {
                 ("t", false) => self.new_tab(),
                 ("t", true) => self.reopen_closed(),
+                ("n", true) => self.toggle_private(),
                 ("a", true) => self.open_tab_search(),
                 ("a", false) => self.tab_mut().selection = Some(Selection::All),
                 ("c", _) => self.copy_selection(),
-                ("w", _) => {
+                ("v", _) => self.paste(),
+                ("w", true) => self.quit = true, // the window, as Chrome's Ctrl+Shift+W
+                ("w", false) => {
                     let active = self.active;
                     self.close_tab_at(active);
                 }
                 ("i", _) => self.toggle_assistant(),
-                ("d", _) => self.toggle_bookmark(),
+                ("d", true) => self.bookmark_all(),
+                ("d", false) => self.toggle_bookmark(),
                 ("f", _) => self.open_find(),
+                ("g", _) => self.find_next(!shift),
                 ("u", _) => self.view_source(),
                 ("r", _) => self.reload(),
                 ("s", _) => self.save_page(),
-                ("l", _) => {
-                    self.tab_mut().address.clear(); // ready for a new address
-                    self.focus = Focus::Address;
-                }
+                ("l", _) => self.focus_address(),
                 ("h", _) => self.go_to("zero://history".into()),
                 ("b", _) => self.go_to("zero://bookmarks".into()),
                 ("j", _) => self.go_to("zero://downloads".into()),
@@ -2070,12 +2396,36 @@ impl App {
                 ("=", _) | ("+", _) => self.zoom_by(1),
                 ("-", _) => self.zoom_by(-1),
                 ("0", _) => self.zoom_reset(),
+                (digit, false) => {
+                    if let Ok(n @ 1..=9) = digit.parse::<usize>() {
+                        self.select_nth(n);
+                    }
+                }
                 _ => {}
             },
-            Key::Named(NamedKey::Tab) if ctrl => self.next_tab(),
+            Key::Character(ref c) if alt && lower(c) == "d" => self.focus_address(),
+            Key::Named(NamedKey::Tab) if ctrl => self.step_tab(if shift { -1 } else { 1 }),
+            Key::Named(NamedKey::PageUp) if ctrl && shift => self.move_tab(-1),
+            Key::Named(NamedKey::PageDown) if ctrl && shift => self.move_tab(1),
+            Key::Named(NamedKey::PageUp) if ctrl => self.step_tab(-1),
+            Key::Named(NamedKey::PageDown) if ctrl => self.step_tab(1),
+            Key::Named(NamedKey::F3) => self.find_next(!shift),
+            Key::Named(NamedKey::F5) => self.reload(),
+            Key::Named(NamedKey::F6) => self.focus_address(),
+            Key::Named(NamedKey::F11) => self.toggle_fullscreen(),
+            Key::Named(NamedKey::Delete) if ctrl && shift => {
+                self.go_to("zero://history".into()) // where "Clear history" lives
+            }
             Key::Named(NamedKey::Escape) => self.menu_open = false,
-            Key::Named(NamedKey::ArrowLeft) if self.modifiers.alt_key() => self.back(),
-            Key::Named(NamedKey::ArrowRight) if self.modifiers.alt_key() => self.forward(),
+            Key::Named(NamedKey::ArrowLeft) if alt => self.back(),
+            Key::Named(NamedKey::ArrowRight) if alt => self.forward(),
+            Key::Named(NamedKey::Home) if alt => self.go_to("zero://newtab".into()),
+            Key::Named(NamedKey::Enter) if alt => self.navigate_in_new_tab(),
+            Key::Named(NamedKey::Enter) if ctrl => {
+                if let Some(target) = dotcom(&self.tab().address) {
+                    self.go_to(target);
+                }
+            }
             Key::Named(NamedKey::Enter) => self.navigate(),
             Key::Named(NamedKey::Backspace) => {
                 self.tab_mut().address.pop();
@@ -2091,6 +2441,10 @@ impl App {
                 t.scroll_y = (t.scroll_y - 400.0).max(0.0);
             }
             Key::Named(NamedKey::Home) => self.tab_mut().scroll_y = 0.0,
+            Key::Named(NamedKey::End) => {
+                let t = self.tab_mut();
+                t.scroll_y = t.doc_height * t.zoom_factor(); // clamped to the page in redraw
+            }
             _ => {
                 if let Some(text) = &event.text {
                     let chars: Vec<char> = text.chars().filter(|c| !c.is_control()).collect();
@@ -2107,7 +2461,7 @@ impl App {
 
         // Topmost surface first, so a menu covering the page wins the click.
         if let Some(id) = self.hit_at(cx, cy).map(str::to_string) {
-            if self.act_on_menu(&id) || self.act_on(&id) {
+            if self.act_on_context(&id) || self.act_on_menu(&id) || self.act_on(&id) {
                 // Acting on a menu entry closes the menu, so the two can never
                 // disagree about whether it is still up. Zoom is the exception:
                 // it is a value you nudge, so the stepper stays under the cursor.
@@ -2116,11 +2470,12 @@ impl App {
                 }
                 self.request_redraw();
             }
+            self.context = None; // a right-click menu is gone after any click
             return;
         }
         // A click anywhere else dismisses the menu rather than reaching the page:
         // the first click closes, the second acts, which is what a menu should do.
-        if self.menu_open {
+        if self.menu_open || self.context.take().is_some() {
             self.menu_open = false;
             self.request_redraw();
             return;
@@ -2256,12 +2611,7 @@ impl App {
             .filter(|r| px >= r.x && px <= r.x + r.width && py >= r.y && py <= r.y + r.height)
             .map(|r| r.node_id)
             .next_back();
-        let href = self
-            .tab()
-            .links
-            .iter()
-            .find(|l| px >= l.x && px <= l.x + l.width && py >= l.y && py <= l.y + l.height)
-            .map(|l| l.href.clone());
+        let href = self.link_at((px, py));
         // A link on one of the browser's own screens can be followed straight
         // away. Those pages run no scripts, so nothing there can intercept a
         // click — and asking the renderer first would draw the whole page again
@@ -2271,7 +2621,7 @@ impl App {
         if let Some(href) = href.clone() {
             if crate::internal::is_internal(&self.tab().address) {
                 let target = resolve_url(&self.tab().address, &href);
-                self.go_to(target);
+                self.follow(target);
                 self.request_redraw();
                 return;
             }
@@ -2293,9 +2643,173 @@ impl App {
 
         if let Some(href) = href {
             let target = resolve_url(&self.tab().address, &href);
-            self.go_to(target);
+            self.follow(target);
             self.request_redraw();
         }
+    }
+
+    /// The link under a point on the page, as the page wrote it.
+    fn link_at(&self, (px, py): (f32, f32)) -> Option<String> {
+        self.tab()
+            .links
+            .iter()
+            .find(|l| px >= l.x && px <= l.x + l.width && py >= l.y && py <= l.y + l.height)
+            .map(|l| l.href.clone())
+    }
+
+    /// Follow a clicked link as Chrome does: Ctrl opens it in a tab behind
+    /// this one, Ctrl+Shift in a tab in front.
+    fn follow(&mut self, target: String) {
+        match self.modifiers.control_key() {
+            true => self.open_in_new_tab(target, self.modifiers.shift_key()),
+            false => self.go_to(target),
+        }
+    }
+
+    /// Middle-click: closes a tab, or opens a link in a tab behind this one
+    /// (in front with Shift).
+    fn middle_click(&mut self) {
+        let (cx, cy) = self.cursor;
+        if let Some(index) = self.hit_at(cx, cy).and_then(tab_index) {
+            self.close_tab_at(index);
+            return;
+        }
+        let regions = self.regions();
+        let link = self
+            .page_coords((cx, cy), &regions)
+            .and_then(|point| self.link_at(point));
+        if let Some(href) = link {
+            let target = resolve_url(&self.tab().address, &href);
+            self.open_in_new_tab(target, self.modifiers.shift_key());
+        }
+    }
+
+    /// Right-click: a tab's menu over a tab, the page's menu over the page.
+    /// Entries follow Chrome's own menus, minus what this browser cannot do.
+    fn open_context(&mut self) {
+        self.menu_open = false;
+        self.context = None;
+        let (cx, cy) = self.cursor;
+        let at = (cx.max(0.0) as u32, cy.max(0.0) as u32);
+        let entry = |id: String, label: &str, key: &'static str| (id, t(label), key);
+        let rule = || (String::new(), String::new(), "");
+        if let Some(i) = self.hit_at(cx, cy).and_then(tab_index) {
+            let (newer, after) = match self.settings.layout {
+                TabLayout::Vertical => ("New tab below", "Close tabs below"),
+                TabLayout::Horizontal => ("New tab to the right", "Close tabs to the right"),
+            };
+            let pin = match self.tabs[i].pinned {
+                true => "Unpin this tab",
+                false => "Pin this tab",
+            };
+            let items = vec![
+                entry(format!("ctx:newafter:{i}"), newer, ""),
+                rule(),
+                entry(format!("ctx:reload:{i}"), "Reload", "Ctrl+R"),
+                entry(format!("ctx:dup:{i}"), "Duplicate tab", ""),
+                entry(format!("ctx:pin:{i}"), pin, ""),
+                rule(),
+                entry(format!("close:{i}"), "Close tab", "Ctrl+W"),
+                entry(format!("ctx:others:{i}"), "Close other tabs", ""),
+                entry(format!("ctx:after:{i}"), after, ""),
+            ];
+            self.context = Some(ContextMenu {
+                at,
+                items,
+                link: None,
+                text: String::new(),
+            });
+            return;
+        }
+        let regions = self.regions();
+        let Some(point) = self.page_coords((cx, cy), &regions) else {
+            return;
+        };
+        let tab = self.tab();
+        let link = self
+            .link_at(point)
+            .map(|href| resolve_url(&tab.address, &href));
+        let text = tab
+            .selection
+            .map(|s| selection_text(&selected_runs(&tab.text_runs, s)))
+            .unwrap_or_default();
+        let mut items = Vec::new();
+        if link.is_some() {
+            items.push(entry("ctx:openlink".into(), "Open link in new tab", ""));
+            items.push(entry("ctx:copylink".into(), "Copy link address", ""));
+            items.push(rule());
+        }
+        if !text.trim().is_empty() {
+            let mut shown: String = text.trim().chars().take(24).collect();
+            if text.trim().chars().count() > 24 {
+                shown.push('…');
+            }
+            items.push(entry("ctx:copy".into(), "Copy", "Ctrl+C"));
+            items.push((
+                "ctx:search".into(),
+                format!("{} “{shown}”", t("Search the web for")),
+                "",
+            ));
+            items.push(rule());
+        }
+        items.extend([
+            entry("back".into(), "Back", "Alt+←"),
+            entry("fwd".into(), "Forward", "Alt+→"),
+            entry("reload".into(), "Reload", "Ctrl+R"),
+            rule(),
+            entry("ctx:selectall".into(), "Select all", "Ctrl+A"),
+            entry("menu:save".into(), "Save page", "Ctrl+S"),
+            entry("menu:source".into(), "View source", "Ctrl+U"),
+        ]);
+        self.context = Some(ContextMenu {
+            at,
+            items,
+            link,
+            text,
+        });
+    }
+
+    /// Perform a right-click menu entry. Tab entries name their tab by index;
+    /// page entries read the link and text the menu was opened over.
+    fn act_on_context(&mut self, id: &str) -> bool {
+        let Some(rest) = id.strip_prefix("ctx:") else {
+            return false;
+        };
+        let (verb, arg) = rest.split_once(':').unwrap_or((rest, ""));
+        let tab = arg.parse::<usize>().ok().filter(|i| *i < self.tabs.len());
+        let (link, text) = match &self.context {
+            Some(menu) => (menu.link.clone(), menu.text.clone()),
+            None => (None, String::new()),
+        };
+        match (verb, tab) {
+            ("newafter", Some(i)) => self.insert_tab(i + 1, Tab::blank()),
+            ("reload", Some(i)) => {
+                let keep = self.active;
+                self.active = i;
+                self.reload();
+                self.active = keep;
+            }
+            ("dup", Some(i)) => self.duplicate_tab(i),
+            ("pin", Some(i)) => {
+                self.tabs[i].pinned = !self.tabs[i].pinned;
+                self.save_session();
+            }
+            ("others", Some(i)) => self.close_others(i),
+            ("after", Some(i)) => self.close_after(i),
+            ("openlink", _) => {
+                if let Some(link) = link {
+                    self.open_in_new_tab(link, false);
+                }
+            }
+            ("copylink", _) => crate::clipboard::set(link.as_deref().unwrap_or("")),
+            ("copy", _) => self.copy_selection(),
+            ("search", _) if !text.trim().is_empty() => {
+                self.open_in_new_tab(normalize_target(&text), true)
+            }
+            ("selectall", _) => self.tab_mut().selection = Some(Selection::All),
+            _ => return false,
+        }
+        true
     }
 
     /// The chrome control under a window position, topmost and innermost first.
@@ -2349,7 +2863,11 @@ impl App {
         match id {
             "menu:new" => self.new_tab(),
             "menu:reopen" => self.reopen_closed(),
+            "menu:private" => self.toggle_private(),
             "menu:pin" => self.toggle_pin(),
+            "menu:dup" => self.duplicate_tab(self.active),
+            "menu:fullscreen" => self.toggle_fullscreen(),
+            "menu:copylink" => crate::clipboard::set(&self.tab().address),
             "menu:find" => self.open_find(),
             "menu:save" => self.save_page(),
             "menu:source" => self.view_source(),
@@ -2375,7 +2893,15 @@ impl App {
     fn go_to(&mut self, target: String) {
         // A settings link carries its new value in the query; applying it here
         // keeps the address that lands in history clean.
-        let target = self.apply_setting_link(target);
+        let mut target = self.apply_setting_link(target);
+        // Deleting history is only ever the history page's own link: a website
+        // linking here gets the page, not the deletion.
+        if target == crate::internal::CLEAR_HISTORY {
+            if crate::internal::is_internal(&self.tab().address) {
+                storage::clear_history();
+            }
+            target = "zero://history".to_string();
+        }
         {
             let tab = self.tab_mut();
             tab.history.truncate(tab.history_index + 1);
@@ -2392,6 +2918,11 @@ impl App {
         let Some(query) = target.strip_prefix("zero://settings?") else {
             return target;
         };
+        // Only the browser's own pages change preferences: a website linking
+        // here gets the settings page, not the change.
+        if !crate::internal::is_internal(&self.tab().address) {
+            return "zero://settings".to_string();
+        }
         // A space is not a preference — it decides which preferences file the
         // rest of this query would even be written to, so it goes first and
         // alone.
@@ -2503,15 +3034,11 @@ impl App {
         tab.apply_frame(frame, w as u32, h as u32);
         let address = tab.address.clone();
         let title = tab.title.clone();
-        // Built-in pages are the browser's own furniture, not places you visited.
-        if !crate::internal::is_internal(&address) {
+        if self.keeps_visit(&address) {
             // History has room for a full title, unlike a tab.
             storage::record_visit(&address, &label_for(&title, &address, 120));
         }
-        if let Some(window) = &self.window {
-            let shown = if title.is_empty() { address } else { title };
-            window.set_title(&format!("Zero Browser — {shown}"));
-        }
+        self.show_title();
         self.save_session();
         if self.ai_open {
             self.run_assistant(); // keep the panel in sync with the new page
@@ -2666,6 +3193,7 @@ impl App {
 
     fn open_find(&mut self) {
         self.focus = Focus::Find(String::new());
+        self.find_at = None;
         self.menu_open = false;
         let frame = self.tab_mut().renderer.blur(); // typing belongs to the find bar now
         self.adopt(frame);
@@ -2701,6 +3229,7 @@ impl App {
     fn apply_chrome_field(&mut self) {
         if let Focus::Find(query) = &self.focus {
             let query = query.clone();
+            self.find_at = None; // a new query has new matches to count from
             let frame = self.tab_mut().renderer.find(Some(&query)); // highlights are painted, so re-render
             self.adopt(frame);
         }
@@ -2710,7 +3239,7 @@ impl App {
     /// Enter: the next match for find, the first matching tab for tab search.
     fn accept_chrome_field(&mut self) {
         match self.focus {
-            Focus::Find(_) => self.jump_to_match(),
+            Focus::Find(_) => self.jump_to_match(!self.modifiers.shift_key()),
             Focus::TabSearch(_) => {
                 if let Some(index) = self.rail_order().first().copied() {
                     self.active = index;
@@ -2721,24 +3250,41 @@ impl App {
         }
     }
 
-    /// Scroll to the first match below the current position, wrapping at the end.
-    fn jump_to_match(&mut self) {
-        let regions = self.regions();
-        let viewport = regions.content_h as f32;
-        let tab = self.tab_mut();
-        // Matches are in document order, so "next" is the first one past the top
-        // of the viewport; a small margin stops the current match re-matching.
-        let top = tab.scroll_y / tab.zoom_factor();
-        let next = tab
-            .matches
-            .iter()
-            .find(|r| r.y > top + 4.0)
-            .or_else(|| tab.matches.first())
-            .copied();
-        if let Some(rect) = next {
-            // Land the match a third of the way down rather than at the very top.
-            tab.scroll_y = (rect.y * tab.zoom_factor() - viewport / 3.0).max(0.0);
+    /// F3 and Ctrl+G (Shift for previous): step through the matches, or open
+    /// the find bar if it is not up yet.
+    fn find_next(&mut self, forward: bool) {
+        match self.focus {
+            Focus::Find(_) => self.jump_to_match(forward),
+            _ => self.open_find(),
         }
+    }
+
+    /// Scroll to the next match (or the previous one), wrapping at either end.
+    ///
+    /// Steps from the last match jumped to, not from the scroll position: that
+    /// match lands a third of the way down the screen, so judging "next" by
+    /// what is on screen would find the same one again. The first step starts
+    /// from the top of the viewport.
+    fn jump_to_match(&mut self, forward: bool) {
+        let viewport = self.regions().content_h as f32;
+        let n = self.tab().matches.len();
+        if n == 0 {
+            return;
+        }
+        let tab = &self.tabs[self.active];
+        let top = tab.scroll_y / tab.zoom_factor();
+        // Matches are in document order.
+        let at = match (self.find_at.filter(|i| *i < n), forward) {
+            (Some(i), true) => (i + 1) % n,
+            (Some(i), false) => (i + n - 1) % n,
+            (None, true) => tab.matches.iter().position(|r| r.y >= top).unwrap_or(0),
+            (None, false) => tab.matches.iter().rposition(|r| r.y < top).unwrap_or(n - 1),
+        };
+        self.find_at = Some(at);
+        let tab = self.tab_mut();
+        let rect = tab.matches[at];
+        // Land the match a third of the way down rather than at the very top.
+        tab.scroll_y = (rect.y * tab.zoom_factor() - viewport / 3.0).max(0.0);
     }
 
     /// Save the current page, or unsave it if it is already bookmarked.
@@ -2796,10 +3342,13 @@ impl App {
         // With the find bar open it replaces the address, since it owns typing.
         if let Focus::Find(query) = &self.focus {
             let count = tab.matches.len();
-            let hits = match (query.is_empty(), count) {
-                (true, _) => "type to search this page".to_string(),
-                (false, 0) => "no matches".to_string(),
-                (false, n) => format!("{n} matches — Enter for next, Esc to close"),
+            let hits = match (query.is_empty(), count, self.find_at) {
+                (true, _, _) => "type to search this page".to_string(),
+                (false, 0, _) => "no matches".to_string(),
+                (false, n, Some(i)) if i < n => {
+                    format!("{} of {n} — Shift+Enter for previous", i + 1)
+                }
+                (false, n, _) => format!("{n} matches — Enter for next, Esc to close"),
             };
             return format!(
                 "<html><body><div id=\"bar\"><div class=\"omni\">\
@@ -3134,8 +3683,11 @@ impl App {
             icon::download(self.ink("go:downloads", theme::faint())),
         );
         // The space's name and colour, which is what tells you whose history and
-        // cookies the next click lands in.
-        let space = crate::spaces::current();
+        // cookies the next click lands in — or that nobody's will.
+        let space = match self.private {
+            true => t("Private"),
+            false => crate::spaces::current(),
+        };
         format!(
             "<html><body><div id=\"row\">\
              <span class=\"space\"><span class=\"dot\">{}</span>{}</span>\
@@ -3276,18 +3828,37 @@ impl App {
                 let label = match *id {
                     "menu:split" if self.focused_pane().is_some() => "Close split view",
                     "menu:pin" if self.tab().pinned => "Unpin this tab",
+                    "menu:private" if self.private => "Leave private session",
                     "menu:reopen" if self.closed.is_empty() => return String::new(),
                     _ => label,
                 };
-                let label = escape(&t(label));
-                format!(
-                    "<div id=\"{id}\" class=\"{}\"><span class=\"label\">{label}</span>\
-                     <span class=\"key\">{key}</span></div>",
-                    self.lit(id, "row item"),
-                )
+                self.menu_row(id, &t(label), key)
             })
             .collect();
         format!("<html><body>{items}</body></html>")
+    }
+
+    /// One entry of a menu, or a rule when `id` is empty. Shared by the
+    /// overflow menu and the right-click ones, so they read as one design.
+    fn menu_row(&self, id: &str, label: &str, key: &str) -> String {
+        if id.is_empty() {
+            return "<div class=\"rule\"></div>".to_string();
+        }
+        format!(
+            "<div id=\"{id}\" class=\"{}\"><span class=\"label\">{}</span>\
+             <span class=\"key\">{key}</span></div>",
+            self.lit(id, "row item"),
+            escape(label),
+        )
+    }
+
+    fn context_html(&self, menu: &ContextMenu) -> String {
+        let rows: String = menu
+            .items
+            .iter()
+            .map(|(id, label, key)| self.menu_row(id, label, key))
+            .collect();
+        format!("<html><body>{rows}</body></html>")
     }
 
     fn menu_css() -> String {
@@ -3334,7 +3905,7 @@ impl App {
     /// What the cursor is resting on, if it has something to say. Tab rows
     /// describe themselves, which is the whole point of the icon rail.
     fn tooltip_text(&self) -> Option<String> {
-        if self.menu_open {
+        if self.menu_open || self.context.is_some() {
             return None; // an open menu already names everything it offers
         }
         let id = self.hovered.as_deref()?;
@@ -3796,6 +4367,30 @@ impl App {
                 (MENU_W, 1), // height comes from the content
                 true,
             );
+            blit_rounded(&mut buffer, w, h, &menu, x, y, POPOVER_RADIUS);
+        }
+        if let Some(context) = &self.context {
+            let x = context.at.0.min(regions.width.saturating_sub(MENU_W + 6));
+            // Laid out first so its height is known: opened near the bottom of
+            // the window it rises from the cursor instead of running off it.
+            let mut own = Vec::new();
+            let menu = Self::chrome(
+                engine,
+                &mut own,
+                &self.context_html(context),
+                &Self::menu_css(),
+                (x, 0),
+                (MENU_W, 1),
+                true,
+            );
+            let y = match context.at.1 + menu.height as u32 + 6 > regions.height {
+                true => context.at.1.saturating_sub(menu.height as u32),
+                false => context.at.1,
+            };
+            hits.extend(own.into_iter().map(|hit| Hit {
+                y: hit.y + y as f32,
+                ..hit
+            }));
             blit_rounded(&mut buffer, w, h, &menu, x, y, POPOVER_RADIUS);
         }
         if let Some(text) = self.tooltip_text() {
@@ -4608,6 +5203,202 @@ mod tests {
         assert_eq!(app.closed, vec!["https://a.com".to_string()]);
     }
 
+    /// Tabs named by address, so a test can say which one is where.
+    fn tabs_at(addresses: &[&str]) -> App {
+        let tabs = addresses
+            .iter()
+            .map(|a| Tab::new(a.to_string(), String::new(), String::new()))
+            .collect();
+        App::new(Engine::shapes_only(), tabs, 0)
+    }
+
+    fn addresses(app: &App) -> Vec<&str> {
+        app.tabs.iter().map(|t| t.address.as_str()).collect()
+    }
+
+    #[test]
+    fn ctrl_enter_completes_a_bare_word_and_nothing_else() {
+        assert_eq!(
+            dotcom("example").as_deref(),
+            Some("https://www.example.com")
+        );
+        assert_eq!(
+            dotcom(" my-site ").as_deref(),
+            Some("https://www.my-site.com")
+        );
+        for left in ["", "example.org", "two words", "https://a.com"] {
+            assert_eq!(dotcom(left), None, "{left:?}");
+        }
+    }
+
+    #[test]
+    fn tab_shortcuts_count_in_the_order_the_rail_draws() {
+        let mut app = tabs_at(&["https://a.com", "https://b.com", "https://c.com"]);
+        app.tabs[2].pinned = true; // drawn first
+        app.select_nth(1);
+        assert_eq!(app.active, 2);
+        app.select_nth(9); // the last, however many there are
+        assert_eq!(app.active, 1);
+        app.select_nth(8); // past the end: nothing happens
+        assert_eq!(app.active, 1);
+        app.step_tab(1); // wraps from the bottom of the rail to the top
+        assert_eq!(app.active, 2);
+        app.step_tab(-1);
+        assert_eq!(app.active, 1);
+    }
+
+    #[test]
+    fn moving_a_tab_swaps_it_with_its_neighbour_but_not_past_the_pinned() {
+        let mut app = tabs_at(&["https://p.com", "https://a.com", "https://b.com"]);
+        app.tabs[0].pinned = true;
+        app.active = 1;
+        app.move_tab(1);
+        assert_eq!(
+            addresses(&app),
+            ["https://p.com", "https://b.com", "https://a.com"]
+        );
+        assert_eq!(app.active, 2, "the moved tab stays in front");
+        app.move_tab(-1);
+        app.move_tab(-1); // would cross into the pinned tabs
+        assert_eq!(
+            addresses(&app),
+            ["https://p.com", "https://a.com", "https://b.com"]
+        );
+        assert_eq!(app.active, 1);
+    }
+
+    #[test]
+    fn closing_others_or_those_after_spares_pinned_tabs_and_can_be_undone() {
+        let mut app = tabs_at(&[
+            "https://p.com",
+            "https://a.com",
+            "https://b.com",
+            "https://c.com",
+        ]);
+        app.tabs[0].pinned = true;
+        app.close_after(1);
+        assert_eq!(addresses(&app), ["https://p.com", "https://a.com"]);
+        assert_eq!(app.closed.len(), 2, "each closed tab can be reopened");
+        app.close_others(1);
+        assert_eq!(
+            addresses(&app),
+            ["https://p.com", "https://a.com"],
+            "the pinned tab stays"
+        );
+        assert_eq!(app.tab().address, "https://a.com");
+        app.close_others(0);
+        assert_eq!(addresses(&app), ["https://p.com"]);
+    }
+
+    #[test]
+    fn a_link_opened_in_the_background_leaves_this_tab_in_front() {
+        let mut app = tabs_at(&["https://a.com", "https://b.com"]);
+        app.split = Some(1);
+        app.open_in_new_tab("zero://history".into(), false);
+        assert_eq!(
+            addresses(&app),
+            ["https://a.com", "zero://history", "https://b.com"]
+        );
+        assert_eq!(app.active, 0);
+        assert_eq!(app.split, Some(2), "the split still shows the tab it did");
+        app.open_in_new_tab("zero://bookmarks".into(), true);
+        assert_eq!(app.active, 1);
+        assert_eq!(app.tab().address, "zero://bookmarks");
+    }
+
+    #[test]
+    fn a_duplicate_keeps_its_back_and_forward_list() {
+        let mut app = App::new(Engine::shapes_only(), vec![Tab::blank()], 0);
+        app.go_to("zero://history".into());
+        app.go_to("zero://bookmarks".into());
+        app.back();
+        app.duplicate_tab(0);
+        assert_eq!(app.active, 1);
+        let (original, copy) = (&app.tabs[0], &app.tabs[1]);
+        assert_eq!(copy.address, original.address);
+        assert_eq!(copy.history, original.history);
+        assert_eq!(copy.history_index, original.history_index);
+    }
+
+    #[test]
+    fn find_steps_through_every_match_both_ways_and_wraps() {
+        let mut app = App::new(Engine::shapes_only(), vec![Tab::blank()], 0);
+        app.focus = Focus::Find("x".into());
+        app.tab_mut().matches = [100.0, 900.0, 2000.0]
+            .map(|y| zero_engine::layout::Rect {
+                y,
+                ..Default::default()
+            })
+            .to_vec();
+        let seen: Vec<usize> = (0..4)
+            .map(|_| {
+                app.jump_to_match(true);
+                app.find_at.unwrap()
+            })
+            .collect();
+        assert_eq!(seen, [0, 1, 2, 0], "Enter never sticks on one match");
+        app.jump_to_match(false);
+        assert_eq!(app.find_at, Some(2), "Shift+Enter goes back, wrapping");
+    }
+
+    #[test]
+    fn every_entry_of_a_tabs_right_click_menu_does_something() {
+        let fresh = || {
+            let mut app = tabs_at(&["zero://history", "zero://bookmarks", "zero://downloads"]);
+            app.hits = vec![Hit {
+                id: "tab:1".into(),
+                x: 0.0,
+                y: 0.0,
+                width: 10.0,
+                height: 10.0,
+            }];
+            app.cursor = (5.0, 5.0);
+            app.open_context();
+            app
+        };
+        let ids: Vec<String> = fresh()
+            .context
+            .expect("right-clicking a tab opens its menu")
+            .items
+            .into_iter()
+            .map(|(id, ..)| id)
+            .filter(|id| !id.is_empty())
+            .collect();
+        assert_eq!(ids.len(), 7);
+        for id in ids {
+            let mut app = fresh();
+            assert!(
+                app.act_on_context(&id) || app.act_on(&id),
+                "{id} is in the tab menu but nothing happens when clicked"
+            );
+        }
+    }
+
+    #[test]
+    fn a_right_clicked_link_opens_behind_this_tab() {
+        let mut app = App::new(Engine::shapes_only(), vec![Tab::blank()], 0);
+        app.context = Some(ContextMenu {
+            at: (0, 0),
+            items: Vec::new(),
+            link: Some("zero://history".into()),
+            text: String::new(),
+        });
+        assert!(app.act_on_context("ctx:openlink"));
+        assert_eq!(addresses(&app), ["zero://newtab", "zero://history"]);
+        assert_eq!(app.active, 0);
+        assert!(
+            !app.act_on_context("ctx:search"),
+            "searching for nothing is not a search"
+        );
+    }
+
+    #[test]
+    fn clearing_history_lands_on_a_clean_history_address() {
+        let mut app = tabs_at(&["https://a.com"]);
+        app.go_to(crate::internal::CLEAR_HISTORY.into());
+        assert_eq!(app.tab().address, "zero://history");
+    }
+
     #[test]
     fn the_collapse_control_brings_the_rail_back_from_horizontal_layout() {
         let mut app = App::new(Engine::shapes_only(), vec![Tab::blank()], 0);
@@ -4697,6 +5488,23 @@ mod tests {
     }
 
     #[test]
+    fn a_website_cannot_change_a_setting_by_linking_to_it() {
+        // Followed in place, and opened in a new tab — which starts on a
+        // browser page, so it must not lend the link that page's trust.
+        let mut app = tabs_at(&["https://a.com"]);
+        app.settings.blocking = true;
+        app.go_to("zero://settings?blocking=off".into());
+        assert!(app.settings.blocking, "a website turned blocking off");
+        assert_eq!(app.tab().address, "zero://settings");
+
+        let mut app = tabs_at(&["https://a.com"]);
+        app.settings.blocking = true;
+        app.open_in_new_tab("zero://settings?blocking=off".into(), true);
+        assert!(app.settings.blocking, "a website turned blocking off");
+        assert_eq!(app.tab().address, "zero://settings");
+    }
+
+    #[test]
     fn a_settings_link_is_applied_and_then_forgotten() {
         let mut app = App::new(Engine::shapes_only(), vec![Tab::blank()], 0);
         let landed = app.apply_setting_link("zero://settings?rail=hidden".into());
@@ -4744,6 +5552,21 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Storage is inert under test, so this checks the two decisions that
+    /// stand in front of it. If either flips, a private session starts
+    /// leaving its pages in history or its tabs in the next launch.
+    #[test]
+    fn a_private_session_records_no_history_and_saves_no_session() {
+        let mut app = App::new(Engine::shapes_only(), vec![Tab::blank()], 0);
+        app.tab_mut().address = "https://example.org/".into();
+        assert!(app.keeps_visit("https://example.org/"));
+        assert!(app.session_to_save().is_some());
+
+        app.private = true;
+        assert!(!app.keeps_visit("https://example.org/"));
+        assert_eq!(app.session_to_save(), None);
     }
 
     #[test]

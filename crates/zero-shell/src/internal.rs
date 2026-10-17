@@ -80,6 +80,10 @@ fn escape(text: &str) -> String {
         .replace('>', "&gt;")
 }
 
+/// The history page's "Clear history" link. The shell acts on it only when the
+/// click comes from one of these pages, so a website cannot link to it.
+pub const CLEAR_HISTORY: &str = "zero://history?clear";
+
 /// True for addresses this module serves.
 pub fn is_internal(target: &str) -> bool {
     target.starts_with("zero://")
@@ -528,8 +532,9 @@ fn history_page() -> String {
     wrap(
         &t("History"),
         &format!(
-            "<div class=\"lede\">{}</div>{rows}",
-            t("Most recent first.")
+            "<div class=\"lede\">{} <a href=\"{CLEAR_HISTORY}\">{}</a></div>{rows}",
+            t("Most recent first."),
+            t("Clear history"),
         ),
     )
 }

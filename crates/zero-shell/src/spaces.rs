@@ -28,6 +28,10 @@ const ACCENTS: &[&str] = &[
     "#0d9488", // teal
 ];
 
+/// The accent of a private session: one no space can take, so it can never be
+/// mistaken for a profile that keeps what you do.
+pub const PRIVATE_ACCENT: &str = "#d6409f"; // pink
+
 thread_local! {
     /// The current space, once it has been read.
     ///
@@ -170,5 +174,6 @@ mod tests {
         for name in ["work", "study", "banking", "side project", "x"] {
             assert_ne!(accent_of(name), ACCENTS[0], "{name} looks like the default");
         }
+        assert!(!ACCENTS.contains(&PRIVATE_ACCENT), "a space looks private");
     }
 }
