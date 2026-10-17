@@ -827,6 +827,19 @@ fn renderer_exe() -> Option<std::path::PathBuf> {
         .or_else(|| std::env::current_exe().ok())
 }
 
+/// Where a worker's stderr goes. A real renderer's panic belongs on the
+/// browser's console. Under `cargo test` the "worker" is usually the test
+/// harness re-invoked (see [`renderer_exe`]), and all it can say is
+/// `error: Unrecognized option: 'render-worker'`. That exit is how the unit
+/// tests fake a dead renderer on purpose, but printed in a passing run it
+/// reads like a failure.
+fn worker_stderr() -> Stdio {
+    match cfg!(test) {
+        true => Stdio::null(),
+        false => Stdio::inherit(),
+    }
+}
+
 thread_local! {
     /// One renderer process, started before anything needs it.
     ///
@@ -882,6 +895,7 @@ pub fn render_in_child(
         .arg("--render-worker")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
+        .stderr(worker_stderr())
         .spawn()
         .ok()?;
     let mut to_child = child.stdin.take()?;
@@ -1007,6 +1021,7 @@ impl TabRenderer {
             .arg("--render-worker")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
+            .stderr(worker_stderr())
             .spawn()
             .ok()?;
         let stdin = child.stdin.take()?;
