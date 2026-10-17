@@ -335,16 +335,6 @@ fn fetch_detached(url: &str, cookies: &Option<String>) -> Option<(Vec<u8>, Vec<S
         };
         let response = match send() {
             Ok(response) => response,
-            // `304 Not Modified`: what is stored still stands, and the server
-            // told us so in a few hundred bytes instead of the whole file.
-            Err(ureq::Error::Status(304, response)) => {
-                if let Some(entry) = stored.as_ref() {
-                    let policy = cache_policy(304, &response);
-                    crate::httpcache::refresh(url, entry, &policy);
-                    return Some((entry.body.clone(), header_list(&response, "set-cookie")));
-                }
-                continue;
-            }
             // Fetching a page's images at once can trip a host's rate limit.
             // Backing off once and retrying is what the status asks for, and it
             // is the difference between a page with images and one without.
@@ -358,14 +348,35 @@ fn fetch_detached(url: &str, cookies: &Option<String>) -> Option<(Vec<u8>, Vec<S
             Err(_) => continue,
         };
         let set_cookie = header_list(&response, "set-cookie");
-        let policy = cache_policy(response.status(), &response);
-        let mut buf = Vec::new();
-        if response.into_reader().read_to_end(&mut buf).is_ok() {
-            crate::httpcache::put(url, &buf, &policy);
-            return Some((buf, set_cookie));
+        if let Some(body) = body_of(url, response, stored.as_ref()) {
+            return Some((body, set_cookie));
         }
     }
     None
+}
+
+/// The bytes a response stands for, kept on disk as its headers allow.
+///
+/// ureq 2 returns every status below 400 as `Ok`, so `304 Not Modified` lands
+/// here with no body: what is stored still stands, and the server said so in a
+/// few hundred bytes instead of the whole file. Reading the empty body instead
+/// served every revalidated stylesheet as an empty file, which is why a second
+/// visit to docs.python.org or Wikipedia came up with no styles at all.
+fn body_of(
+    url: &str,
+    response: ureq::Response,
+    stored: Option<&crate::httpcache::Entry>,
+) -> Option<Vec<u8>> {
+    let policy = cache_policy(response.status(), &response);
+    if response.status() == 304 {
+        let entry = stored?;
+        crate::httpcache::refresh(url, entry, &policy);
+        return Some(entry.body.clone());
+    }
+    let mut buf = Vec::new();
+    response.into_reader().read_to_end(&mut buf).ok()?;
+    crate::httpcache::put(url, &buf, &policy);
+    Some(buf)
 }
 
 /// What this response's headers say about storing it.
@@ -752,6 +763,31 @@ mod tests {
         assert_eq!(loader.load("missing.css"), None);
         fs::write(dir.join("missing.css"), "p{}").expect("write");
         assert_eq!(loader.load("missing.css"), None);
+    }
+
+    #[test]
+    fn not_modified_serves_the_stored_body() {
+        // The bug this guards: ureq hands a 304 back as `Ok`, and its empty
+        // body was served as the stylesheet, so revisits rendered unstyled.
+        let url = "https://a.test/site.css";
+        let stored = crate::httpcache::Entry {
+            body: b"p{color:red}".to_vec(),
+            fresh: false,
+            etag: Some("\"v1\"".into()),
+            last_modified: None,
+        };
+        let reply = |status, text, body| ureq::Response::new(status, text, body).expect("response");
+        assert_eq!(
+            body_of(url, reply(304, "Not Modified", ""), Some(&stored)).as_deref(),
+            Some(&b"p{color:red}"[..])
+        );
+        // A 304 with nothing stored vouches for nothing.
+        assert_eq!(body_of(url, reply(304, "Not Modified", ""), None), None);
+        // A 200 is the new body, whatever was stored.
+        assert_eq!(
+            body_of(url, reply(200, "OK", "p{}"), Some(&stored)).as_deref(),
+            Some(&b"p{}"[..])
+        );
     }
 
     #[test]
